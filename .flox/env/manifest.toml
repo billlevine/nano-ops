@@ -15,8 +15,33 @@ schema-version = "1.13.0"
 
 
 ## Install Packages --------------------------------------------------
+## Everything the hub needs to run from a clean `flox activate` — no separate
+## install step. The ported services shell out only to python3 + agent-deck;
+## the rest is agent-deck's own session toolchain plus the operations toolchain.
 [install]
+# Runtime interpreter for every ported service (all bin/* are python3; 3.11+
+# for the stdlib `tomllib` they parse loops.toml with).
 python3.pkg-path = "python3"
+
+# Agent runtime (flox catalog org). agent-deck is the session manager the
+# services drive — bin/doorbell and bin/dashboard shell out to `agent-deck`.
+# It hosts sessions in tmux and launches the claude/codex CLIs, so both ship
+# alongside it. Kept in their own pkg-group so they upgrade independently of
+# the nixpkgs base tools below.
+agent-deck.pkg-path = "flox/agent-deck"
+agent-deck.pkg-group = "agents"
+claude-code.pkg-path = "flox/claude-code"
+claude-code.pkg-group = "agents"
+codex.pkg-path = "flox/codex"
+codex.pkg-group = "agents"
+
+# Hub toolchain (nixpkgs). tmux is agent-deck's session backend (it creates its
+# own `agentdeck_*` tmux sessions); git backs its `worktree` command. gh + jq
+# complete the operations toolchain the hub relies on for PR/JSON work.
+tmux.pkg-path = "tmux"
+git.pkg-path = "git"
+gh.pkg-path = "gh"
+jq.pkg-path = "jq"
 
 
 ## Environment Variables ---------------------------------------------
