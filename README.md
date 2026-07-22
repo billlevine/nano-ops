@@ -1,6 +1,6 @@
-# nano-ops-core (prototype)
+# nano-ops (prototype)
 
-Working **seed of the eventual public `nano-ops-core` release repo**. It carries
+Working **seed of the eventual public `nano-ops` release repo**. It carries
 the always-on pieces of Bill's `nano-bill` operations hub — the doorbell poller,
 the local dashboard, and the usage signal — ported from hand-installed systemd
 `--user` units to Flox **`[services]`** so the whole set is declarative, in-repo,
@@ -15,19 +15,19 @@ candidate public core — **not** a disposable experiment.
 Per the 2026-07-22 operations-repo sharing/layering research (Codex, recorded at
 `operations/state/hub/ephemeral-share-ops-research.out`), the decisive shape is:
 
-- **A brand-new public `nano-ops-core` core repo, built from an allowlist** —
+- **A brand-new public `nano-ops` core repo, built from an allowlist** —
   never by flipping the visibility of the live `operations` repo (its git history
   would retain personal state/secrets). **This directory is the seed of that
   public core.**
 - **Bill's live `~/github/billlevine/operations` stays a private fork** that adds
-  `upstream → nano-ops-core` and pulls improvements via `git fetch upstream` +
+  `upstream → nano-ops` and pulls improvements via `git fetch upstream` +
   `git rebase upstream/main`. It will later fork/rebase onto whatever this
   becomes once it's a real public repo.
 - **Installation-specific bits are gitignored, not committed:** `state/` (runtime,
   always ignored) and `loops.toml` (per-install registry; a committed
   `loops.example.toml` documents it and the `[hook]` seeds `loops.toml` from it on
   first activation).
-- **FloxHub composition** delivers the shared toolchain later (a `flox/nano-ops-core`
+- **FloxHub composition** delivers the shared toolchain later (a `flox/nano-ops`
   environment both the public core and the private fork `[include]`), keeping
   execution substrate and orchestration source cleanly separated.
 

@@ -1,4 +1,4 @@
-# loops.example.toml — committed sample registry for nano-ops-core.
+# loops.example.toml — committed sample registry for nano-ops.
 #
 # Per the extraction plan (2026-07-22 sharing/layering research), the real
 # per-installation registry lives in `loops.toml`, which is gitignored

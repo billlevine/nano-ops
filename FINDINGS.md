@@ -1,7 +1,7 @@
 # Spike: Flox `[services]` vs systemd `--user` for nano-bill's always-on pieces
 
 **Date:** 2026-07-22 · **Flox:** 1.13.2 · **process-compose:** 1.94.0 (bundled)
-**Scope:** non-invasive prototype in `~/github/billlevine/nano-ops-core-prototype`.
+**Scope:** non-invasive prototype in `~/github/billlevine/nano-ops`.
 The live `~/github/billlevine/operations` repo, its `loops.toml`, and its systemd
 `--user` services were **not touched** (verified read-only: `doorbell.service`
 stayed `active/running`, MainPID 3036451, continuously up since 2026-07-21 00:20).
@@ -9,7 +9,7 @@ stayed `active/running`, MainPID 3036451, continuously up since 2026-07-21 00:20
 ## Update — promoted from spike to the real seed (2026-07-22)
 
 This directory is no longer a throwaway. It is now the **working seed of the
-public `nano-ops-core` release repo**, and the **real** services port lives here
+public `nano-ops` release repo**, and the **real** services port lives here
 first (guiding architecture: private fork + public upstream — see `README.md`
 and the 2026-07-22 operations sharing/layering research).
 
@@ -152,7 +152,7 @@ entirely — it's still needed for boot + top-level supervision.
 ## Reproduce (real port)
 
 ```bash
-cd ~/github/billlevine/nano-ops-core-prototype
+cd ~/github/billlevine/nano-ops
 flox activate --start-services -- bash -c '
   sleep 8
   flox services status                     # all four Running

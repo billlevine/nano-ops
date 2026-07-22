@@ -1,6 +1,6 @@
 schema-version = "1.13.0"
 
-## nano-ops-core — always-on services, ported from the operations hub.
+## nano-ops — always-on services, ported from the operations hub.
 ##
 ## The four always-on pieces of nano-bill's estate run here as Flox-managed
 ## [services] instead of hand-installed systemd --user units. Each is the REAL
