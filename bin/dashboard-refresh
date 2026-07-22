@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# dashboard-refresh — keep state/dashboard.json fresh for the live dashboard.
+#
+# Runs the deterministic, token-free `bin/dashboard --json` ONLY (no shell/
+# fragment rewrite, no model, no agent, no loop-state writes) every REFRESH_S
+# seconds. This is the regenerator half of the Tier-1 local dashboard; the
+# server half is bin/dashboard-server. Install/start both with:
+#     bin/ops dashboard up
+set -uo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REFRESH_S="${DASHBOARD_REFRESH_S:-45}"
+
+echo "dashboard-refresh: bin/dashboard --json every ${REFRESH_S}s" >&2
+while :; do
+  if ! "$REPO/bin/dashboard" --json >/dev/null 2>&1; then
+    echo "dashboard-refresh: regen failed (transient) — retrying" >&2
+  fi
+  sleep "$REFRESH_S"
+done

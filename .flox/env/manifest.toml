@@ -1,0 +1,121 @@
+schema-version = "1.13.0"
+
+## nano-ops-core — always-on services, ported from the operations hub.
+##
+## The four always-on pieces of nano-bill's estate run here as Flox-managed
+## [services] instead of hand-installed systemd --user units. Each is the REAL
+## script from the operations repo (bin/doorbell, bin/dashboard-refresh,
+## bin/dashboard-server, bin/usage-fetch — plus their bin/dashboard dependency),
+## wrapped in the while-true supervisor proven in FINDINGS.md so a hard crash is
+## auto-restarted (process-compose has no native Restart=always).
+##
+## Boot-autostart and top-level supervision are still expected to come from ONE
+## systemd --user unit holding a persistent activation open (see FINDINGS.md's
+## recommendation); that unit is not part of this repo.
+
+
+## Install Packages --------------------------------------------------
+[install]
+python3.pkg-path = "python3"
+
+
+## Environment Variables ---------------------------------------------
+[vars]
+# Backoff before the supervisor restarts a service whose process exited
+# (crash, or a clean exit like doorbell's missing-token path).
+RESTART_BACKOFF_S = "5"
+# Cadence for the usage-fetch one-shot (mirrors bin/usage-refresh's default).
+USAGE_REFRESH_S = "300"
+
+
+## Activation Hook ---------------------------------------------------
+[hook]
+on-activate = '''
+  # Runtime state + the per-installation registry are gitignored
+  # (installation-specific, per the extraction plan). Create state/ so the
+  # services have somewhere to write, and seed loops.toml from the committed
+  # example if absent so dashboard-server reads a non-colliding port.
+  mkdir -p "$FLOX_ENV_PROJECT/state"
+  if [ ! -f "$FLOX_ENV_PROJECT/loops.toml" ]; then
+    cp "$FLOX_ENV_PROJECT/loops.example.toml" "$FLOX_ENV_PROJECT/loops.toml"
+  fi
+  # Render the static dashboard shell once (token-free, ~3s). The
+  # dashboard-refresh service then keeps state/dashboard.json fresh and the
+  # shell re-polls it in place. Guarded on the shell's existence (runs once)
+  # and best-effort so it never blocks or fails activation.
+  if [ ! -f "$FLOX_ENV_PROJECT/state/dashboard.html" ]; then
+    python3 "$FLOX_ENV_PROJECT/bin/dashboard" >/dev/null 2>&1 || true
+  fi
+'''
+
+
+## Profile script ----------------------------------------------------
+[profile]
+
+
+## Services ---------------------------------------------------------
+##  $ flox activate --start-services  <- activate & start all four
+##  $ flox services status            <- NAME / STATUS / PID
+##  $ flox services logs <name>       <- live stdout+stderr
+##  $ flox services restart <name>    <- SIGTERM old, fresh PID
+## ------------------------------------------------------------------
+[services]
+
+# doorbell — zero-token Slack self-DM poller. In THIS repo there is no
+# state/secrets/slack-user-token, so bin/doorbell exits cleanly on the
+# missing-token path every cycle: safe by construction, does nothing here.
+# The supervisor is the in-manifest Restart=always substitute — it also covers
+# a real crash once a token exists (bin/doorbell already loops through transient
+# Slack errors internally, so only a hard exit needs the wrapper).
+doorbell.command = '''
+  while true; do
+    python3 "$FLOX_ENV_PROJECT/bin/doorbell" || true
+    echo "doorbell: process exited — supervisor restart in ${RESTART_BACKOFF_S}s" >&2
+    sleep "${RESTART_BACKOFF_S}"
+  done
+'''
+
+# dashboard-refresh — regenerates state/dashboard.json via the token-free,
+# deterministic `bin/dashboard --json`. The script already loops internally on
+# DASHBOARD_REFRESH_S (default 45s); the outer while-true restarts the whole
+# refresher if it dies.
+dashboard-refresh.command = '''
+  while true; do
+    bash "$FLOX_ENV_PROJECT/bin/dashboard-refresh" || true
+    echo "dashboard-refresh: process exited — supervisor restart in ${RESTART_BACKOFF_S}s" >&2
+    sleep "${RESTART_BACKOFF_S}"
+  done
+'''
+
+# dashboard-server — localhost-only static server for state/dashboard.{html,json}.
+# Reads host/port from loops.toml [dashboard]; the seeded loops.toml uses
+# 127.0.0.1:8522 so this coexists with a live operations dashboard-server
+# (default :8422) on the same host. Wrapped so a bind error or crash restarts.
+dashboard-server.command = '''
+  while true; do
+    python3 "$FLOX_ENV_PROJECT/bin/dashboard-server" || true
+    echo "dashboard-server: process exited — supervisor restart in ${RESTART_BACKOFF_S}s" >&2
+    sleep "${RESTART_BACKOFF_S}"
+  done
+'''
+
+# usage-fetch — one-shot: writes state/usage/budget.json from Anthropic's
+# read-only /api/oauth/usage (using Claude Code's own cached OAuth token) or a
+# token-free local estimate. The supervisor doubles as the periodic scheduler:
+# run, sleep USAGE_REFRESH_S, repeat — mirroring bin/usage-refresh.
+usage-fetch.command = '''
+  while true; do
+    python3 "$FLOX_ENV_PROJECT/bin/usage-fetch" || true
+    sleep "${USAGE_REFRESH_S}"
+  done
+'''
+
+
+## Other Environment Options -----------------------------------------
+[options]
+# systems = [
+#   "aarch64-darwin",
+#   "aarch64-linux",
+#   "x86_64-darwin",
+#   "x86_64-linux",
+# ]

@@ -1,0 +1,160 @@
+{
+  "lockfile-version": 1,
+  "manifest": {
+    "schema-version": "1.13.0",
+    "install": {
+      "python3": {
+        "pkg-path": "python3"
+      }
+    },
+    "vars": {
+      "RESTART_BACKOFF_S": "5",
+      "USAGE_REFRESH_S": "300"
+    },
+    "hook": {
+      "on-activate": "  # Runtime state + the per-installation registry are gitignored\n  # (installation-specific, per the extraction plan). Create state/ so the\n  # services have somewhere to write, and seed loops.toml from the committed\n  # example if absent so dashboard-server reads a non-colliding port.\n  mkdir -p \"$FLOX_ENV_PROJECT/state\"\n  if [ ! -f \"$FLOX_ENV_PROJECT/loops.toml\" ]; then\n    cp \"$FLOX_ENV_PROJECT/loops.example.toml\" \"$FLOX_ENV_PROJECT/loops.toml\"\n  fi\n  # Render the static dashboard shell once (token-free, ~3s). The\n  # dashboard-refresh service then keeps state/dashboard.json fresh and the\n  # shell re-polls it in place. Guarded on the shell's existence (runs once)\n  # and best-effort so it never blocks or fails activation.\n  if [ ! -f \"$FLOX_ENV_PROJECT/state/dashboard.html\" ]; then\n    python3 \"$FLOX_ENV_PROJECT/bin/dashboard\" >/dev/null 2>&1 || true\n  fi\n"
+    },
+    "profile": {},
+    "options": {},
+    "services": {
+      "dashboard-refresh": {
+        "command": "  while true; do\n    bash \"$FLOX_ENV_PROJECT/bin/dashboard-refresh\" || true\n    echo \"dashboard-refresh: process exited — supervisor restart in ${RESTART_BACKOFF_S}s\" >&2\n    sleep \"${RESTART_BACKOFF_S}\"\n  done\n"
+      },
+      "dashboard-server": {
+        "command": "  while true; do\n    python3 \"$FLOX_ENV_PROJECT/bin/dashboard-server\" || true\n    echo \"dashboard-server: process exited — supervisor restart in ${RESTART_BACKOFF_S}s\" >&2\n    sleep \"${RESTART_BACKOFF_S}\"\n  done\n"
+      },
+      "doorbell": {
+        "command": "  while true; do\n    python3 \"$FLOX_ENV_PROJECT/bin/doorbell\" || true\n    echo \"doorbell: process exited — supervisor restart in ${RESTART_BACKOFF_S}s\" >&2\n    sleep \"${RESTART_BACKOFF_S}\"\n  done\n"
+      },
+      "usage-fetch": {
+        "command": "  while true; do\n    python3 \"$FLOX_ENV_PROJECT/bin/usage-fetch\" || true\n    sleep \"${USAGE_REFRESH_S}\"\n  done\n"
+      }
+    }
+  },
+  "packages": [
+    {
+      "attr_path": "python3",
+      "broken": false,
+      "derivation": "/nix/store/ffz1bwjdzglryqx0pn3jngal4bz66xfh-python3-3.13.13.drv",
+      "description": "High-level dynamically-typed programming language",
+      "install_id": "python3",
+      "license": "Python-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "python3-3.13.13",
+      "pname": "python3",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T03:13:37.148341Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "3.13.13",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/mfkdmplffnbc0av8r6pknl796a6b1r2n-python3-3.13.13"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python3",
+      "broken": false,
+      "derivation": "/nix/store/v13czlpngkramf29nnn8qa0l4svfflwm-python3-3.13.13.drv",
+      "description": "High-level dynamically-typed programming language",
+      "install_id": "python3",
+      "license": "Python-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "python3-3.13.13",
+      "pname": "python3",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T03:42:22.923986Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "3.13.13",
+      "outputs_to_install": [
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/qfb6yj603w8qxd86j0cj7w54l1pv3rkz-python3-3.13.13-debug",
+        "out": "/nix/store/smwd56pl54f0pcjdspgh5vnf20c8xwsc-python3-3.13.13"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python3",
+      "broken": false,
+      "derivation": "/nix/store/5vh9qfs54q47jybcd5zhxmap7lgk2dhg-python3-3.13.13.drv",
+      "description": "High-level dynamically-typed programming language",
+      "install_id": "python3",
+      "license": "Python-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "python3-3.13.13",
+      "pname": "python3",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:09:53.021160Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "3.13.13",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/1137mc2md1ip5pdslybxl05kysjyh4rg-python3-3.13.13"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python3",
+      "broken": false,
+      "derivation": "/nix/store/d8rrzn9gg475brqyfpdaa3w76gzwmvx4-python3-3.13.13.drv",
+      "description": "High-level dynamically-typed programming language",
+      "install_id": "python3",
+      "license": "Python-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=d407951447dcd00442e97087bf374aad70c04cea",
+      "name": "python3-3.13.13",
+      "pname": "python3",
+      "rev": "d407951447dcd00442e97087bf374aad70c04cea",
+      "rev_count": 1027867,
+      "rev_date": "2026-07-05T04:06:12Z",
+      "scrape_date": "2026-07-06T04:41:29.489145Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "3.13.13",
+      "outputs_to_install": [
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/g2pg1an3v5pm2fmwg1g7dw77ddpqirg7-python3-3.13.13-debug",
+        "out": "/nix/store/l9k0anq0z7zz81zcwy035jfwap9ga6rl-python3-3.13.13"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    }
+  ]
+}

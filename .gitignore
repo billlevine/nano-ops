@@ -1,0 +1,16 @@
+# Installation-specific + runtime state — never committed to the public core.
+# (Per the 2026-07-22 sharing/layering extraction plan: state/ is always
+# ignored; loops.toml is the per-installation registry, private-fork-only.)
+/state/
+/loops.toml
+
+# Python bytecode (bin/dashboard is imported as a module by bin/usage-fetch)
+__pycache__/
+*.py[cod]
+
+# Flox writes its own .flox/.gitignore for run/cache/lib/log; these are belt-and-
+# suspenders in case this repo is opened without that file present.
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/

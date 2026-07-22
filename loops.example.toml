@@ -1,0 +1,29 @@
+# loops.example.toml — committed sample registry for nano-ops-core.
+#
+# Per the extraction plan (2026-07-22 sharing/layering research), the real
+# per-installation registry lives in `loops.toml`, which is gitignored
+# (private-fork-only). Copy this file to loops.toml and edit for your install:
+#
+#     cp loops.example.toml loops.toml
+#
+# The Flox [hook] does this automatically on first `flox activate` if loops.toml
+# is absent, so the bundled services have a config to read out of the box.
+#
+# Only the blocks the ported services actually read are shown. The live
+# operations repo has a much richer loops.toml (full loop registry, hub channel,
+# model/interval per loop); that lives in the private fork, not the public core.
+
+[dashboard]
+# bin/dashboard-server binds here; bin/dashboard links to it in its output.
+# Port 8522 (not the operations default 8422) so this prototype can run
+# ALONGSIDE a live operations dashboard-server on the same host without a
+# bind conflict. Loopback only by design — Tier-1 local dashboard.
+host = "127.0.0.1"
+port = 8522
+
+# [hub] — read by bin/doorbell (the Slack self-DM poller). Left commented on
+# purpose: with no [hub].slack_channel_id AND no state/secrets/slack-user-token
+# in this repo, bin/doorbell exits cleanly on the missing-token path and does
+# nothing — safe by construction. Uncomment and fill in on a real install.
+# [hub]
+# slack_channel_id = "REPLACE_WITH_YOUR_SELF_DM_CHANNEL_ID"

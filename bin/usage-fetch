@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""usage-fetch — populate state/usage/budget.json: the usage-%/spend signal
+review.py's budget guard reads (see BUDGET in
+loops/pr-reviewer/.claude/skills/pr-reviewer/scripts/review.py). Until this
+script ran, nothing wrote that file and the guard was an inert no-op.
+
+PRIMARY SOURCE (real account-wide %): an authenticated GET to
+https://api.anthropic.com/api/oauth/usage using the OAuth access token Claude
+Code itself keeps refreshed in ~/.claude/.credentials.json
+(claudeAiOauth.accessToken). This is the same request the CLI's `/usage`
+command makes (confirmed by reading the installed Claude Code binary's
+strings: `fetchUtilization: GET /api/oauth/usage`) and returns the same
+five_hour/seven_day utilization the CLI displays, plus overage/spend status.
+Read-only — never writes to the credentials file, never attempts the OAuth
+refresh flow itself (that already happens naturally whenever any Claude Code
+session runs; reimplementing it here would be reverse-engineering a token
+exchange outside this script's scope).
+
+FALLBACK (local proxy): if the cached token is absent, expired, or the
+request fails for any reason, this degrades to bin/dashboard's local
+host-only Claude Code token estimate against a configured soft budget
+(loops.toml [dashboard].usage_soft_budget_output_tokens) — token-free, but
+NOT the real account-wide %. The signal's "source" field always says which
+one produced it.
+
+Run on a schedule via bin/usage-refresh (systemd unit:
+infra/usage-refresh.service, installed with `bin/ops usage up`).
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "state"
+BUDGET_FILE = STATE / "usage" / "budget.json"
+CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
+USAGE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/") + "/api/oauth/usage"
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def fetch_api_usage() -> dict | None:
+    """GET /api/oauth/usage with the cached OAuth token. None on any
+    failure (missing/expired token, network error, bad response) — the
+    caller falls back to the local estimate; this never raises."""
+    creds = read_json(CREDS_FILE)
+    if not creds:
+        return None
+    oauth = creds.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    expires_at = oauth.get("expiresAt")
+    if not token:
+        return None
+    if isinstance(expires_at, (int, float)) and expires_at < time.time() * 1000:
+        return None  # expired; don't reimplement the refresh flow here
+
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            ValueError, OSError):
+        return None
+
+
+def signal_from_api(data: dict) -> dict:
+    five_hour = data.get("five_hour") or {}
+    seven_day = data.get("seven_day") or {}
+    spend = data.get("spend") or {}
+    spend_pct = spend.get("percent")
+    spend_blocked = bool(
+        isinstance(spend_pct, (int, float)) and spend_pct >= 100
+        and spend.get("enabled") is False
+    )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": "api",
+        "session_pct": five_hour.get("utilization"),
+        "session_resets_at": five_hour.get("resets_at"),
+        "weekly_pct": seven_day.get("utilization"),
+        "weekly_resets_at": seven_day.get("resets_at"),
+        "spend_pct": spend_pct,
+        "spend_severity": spend.get("severity"),
+        "spend_blocked": spend_blocked,
+        "spend_disabled_reason": spend.get("disabled_reason"),
+        "note": "real account-wide %-of-limit from GET /api/oauth/usage "
+                "(what `/usage` shows), using Claude Code's own cached OAuth token",
+    }
+
+
+def signal_from_local_estimate() -> dict:
+    """Fallback: bin/dashboard's local host-only token estimate vs a
+    configured soft budget. Imported rather than reimplemented so the
+    estimate logic lives in exactly one place."""
+    spec = importlib.util.spec_from_file_location("_dashboard", ROOT / "bin" / "dashboard")
+    dashboard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dashboard)
+
+    try:
+        registry = tomllib.loads((ROOT / "loops.toml").read_text(encoding="utf-8"))
+    except OSError:
+        registry = {}
+    now = datetime.now(timezone.utc)
+    u = dashboard.build_usage(now, registry)
+    return {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "source": "local_estimate" if u.get("available") else "unavailable",
+        "session_pct": u.get("pct_of_budget"),
+        "weekly_pct": None,
+        "note": "no usable API token — falling back to this host's local "
+                "Claude Code token estimate vs a configured soft budget "
+                "(loops.toml [dashboard].usage_soft_budget_output_tokens); "
+                "NOT the real account-wide %",
+    }
+
+
+def main() -> int:
+    api = fetch_api_usage()
+    signal = signal_from_api(api) if api is not None else signal_from_local_estimate()
+
+    BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BUDGET_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(signal, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(BUDGET_FILE)
+
+    print(f"wrote {BUDGET_FILE} (source={signal['source']}, "
+          f"session={signal.get('session_pct')}, weekly={signal.get('weekly_pct')}, "
+          f"spend={signal.get('spend_pct')})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

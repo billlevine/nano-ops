@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""dashboard-server — tiny localhost static server for the estate dashboard.
+
+Tier-1, LOCAL ONLY. Binds 127.0.0.1 and serves exactly two files from state/:
+dashboard.html (the live shell) and dashboard.json (the data model the shell
+polls). GET/HEAD only, strict allowlist — no directory listing, no traversal,
+no other paths — so nothing else under state/ (ledger, secrets, per-loop state)
+is ever exposed over HTTP. Pure reader: it only reads its own generated files.
+
+Host/port come from loops.toml [dashboard] (default 127.0.0.1:8422).
+
+Tier-2 (serve from a second machine / remotely) is later JUST a config change
+here plus a reverse proxy + auth in front: flip [dashboard].host and put the
+authenticating proxy ahead of this process. The shell fetches dashboard.json
+with a *relative* URL, so nothing in the page changes. No auth/remote/tunnel
+lives here on purpose — this stays loopback-only for now.
+"""
+from __future__ import annotations
+
+import http.server
+import os
+import socketserver
+import sys
+import tomllib
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE = os.path.join(REPO, "state")
+
+# Path -> (filename under state/, content-type). Nothing else is served.
+ALLOW = {
+    "/": ("dashboard.html", "text/html; charset=utf-8"),
+    "/dashboard.html": ("dashboard.html", "text/html; charset=utf-8"),
+    "/dashboard.json": ("dashboard.json", "application/json; charset=utf-8"),
+}
+
+
+def config() -> tuple[str, int]:
+    try:
+        with open(os.path.join(REPO, "loops.toml"), "rb") as f:
+            d = tomllib.load(f).get("dashboard", {})
+    except OSError:
+        d = {}
+    host = d.get("host", "127.0.0.1")
+    port = int(d.get("port", 8422))
+    return host, port
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "ops-dashboard/1"
+
+    def _send(self, code: int, body: bytes = b"",
+              ctype: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        entry = ALLOW.get(path)
+        if entry is None:
+            self._send(404, b"not found\n")
+            return
+        name, ctype = entry
+        try:
+            with open(os.path.join(STATE, name), "rb") as f:
+                body = f.read()
+        except OSError:
+            self._send(503, b"dashboard not generated yet - run bin/dashboard\n")
+            return
+        self._send(200, body, ctype)
+
+    do_HEAD = do_GET
+
+    def log_message(self, *_a) -> None:  # keep the service log quiet
+        pass
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main() -> int:
+    host, port = config()
+    try:
+        with Server((host, port), Handler) as srv:
+            print(f"dashboard-server: serving state/ (allowlist) at "
+                  f"http://{host}:{port}/dashboard.html", flush=True)
+            srv.serve_forever()
+    except OSError as exc:
+        sys.exit(f"dashboard-server: cannot bind {host}:{port}: {exc}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
