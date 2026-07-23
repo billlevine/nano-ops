@@ -1,0 +1,43 @@
+# nano-ops always-on supervisor — TEMPLATE, not an installable unit.
+#
+# The ONE systemd --user unit this estate needs. It holds a single Flox
+# activation open so the [services] declared in .flox/env/manifest.toml survive
+# logout and reboot; process-compose supervises the individual services inside
+# it, and each service command carries its own while-true restart wrapper.
+#
+# Placeholders are deliberate — a committed absolute path would be one machine's
+# and would be personal data besides. Render, then enable:
+#
+#   sed -e "s|@REPO@|$(pwd)|g" -e "s|@FLOX@|$(command -v flox)|g" \
+#       infra/nano-ops-services.service.example \
+#       > ~/.config/systemd/user/nano-ops-services.service
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now nano-ops-services
+#
+# Full runbook: docs/always-on.md
+#
+#   @REPO@  absolute path to this repository
+#   @FLOX@  absolute path to the flox binary (a --user unit inherits no login
+#           shell PATH, so it must be named in full)
+
+[Unit]
+Description=nano-ops always-on services (one persistent Flox activation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+# Hold the activation open forever; the services run for its lifetime.
+ExecStart=@FLOX@ activate -d @REPO@ --start-services -- sleep infinity
+# systemd supplies what process-compose cannot: restart the whole group if the
+# activation dies, and start it at boot (with lingering enabled).
+Restart=always
+RestartSec=10
+# Give process-compose time to stop its children before SIGKILL.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
