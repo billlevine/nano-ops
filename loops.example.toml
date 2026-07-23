@@ -9,9 +9,37 @@
 # The Flox [hook] does this automatically on first `flox activate` if loops.toml
 # is absent, so the bundled services have a config to read out of the box.
 #
-# Only the blocks the ported services actually read are shown. The live
-# operations repo has a much richer loops.toml (full loop registry, hub channel,
-# model/interval per loop); that lives in the private fork, not the public core.
+# Only the blocks the ported components actually read are shown. A real install
+# adds a [loops.*] entry per loop (dir/skill/interval/autostart/persona/model);
+# those, and the hub's real channel id, live in the private fork's loops.toml.
+
+[hub]
+# WHO THIS INSTALLATION'S HUB IS. The public core bakes in no operator identity
+# — bin/doorbell, bin/dashboard and bin/ops all read it from here, so a fresh
+# clone is anonymous until you name it.
+#
+# persona  display name. The agent-deck session title convention is
+#          "<persona> (<loop name>)", and the hub's loop name is "hub", so
+#          persona = "ops" means the hub session is titled "ops (hub)".
+#          Override the whole title with session_title if you prefer.
+# group    agent-deck group every hub-launched session lands in (the loop
+#          sessions and the "ephemeral - <slug>" workers). Defaults to persona.
+# estate   label for this estate, shown in the dashboard header.
+# deck_profile  agent-deck profile to address. Pinned explicitly because a
+#          service or cron context has a different ambient default profile and
+#          would otherwise resolve titles against the wrong session store.
+persona = "ops"
+group = "ops"
+estate = "ops"
+deck_profile = "work"
+# session_title = "ops (hub)"
+
+# Slack self-DM channel ID — read by bin/doorbell (the control-channel poller).
+# Left unset on purpose: with no slack_channel_id AND no
+# state/secrets/slack-user-token in this repo, bin/doorbell exits cleanly on the
+# missing-config path and does nothing. Safe by construction. Fill it in on a
+# real install; the token is a file, never a value in this registry.
+# slack_channel_id = "REPLACE_WITH_YOUR_SELF_DM_CHANNEL_ID"
 
 [dashboard]
 # bin/dashboard-server binds here; bin/dashboard links to it in its output.
@@ -21,9 +49,9 @@
 host = "127.0.0.1"
 port = 8522
 
-# [hub] — read by bin/doorbell (the Slack self-DM poller). Left commented on
-# purpose: with no [hub].slack_channel_id AND no state/secrets/slack-user-token
-# in this repo, bin/doorbell exits cleanly on the missing-token path and does
-# nothing — safe by construction. Uncomment and fill in on a real install.
-# [hub]
-# slack_channel_id = "REPLACE_WITH_YOUR_SELF_DM_CHANNEL_ID"
+[usage]
+# Cadence (seconds) for bin/usage-fetch, which populates state/usage/budget.json
+# — the account %-of-limit signal bin/dashboard renders as the header "cap" line
+# and a budget guard can gate on. 900s (15m) keeps it fresh enough while holding
+# the authenticated /usage calls to ~96/day.
+refresh_seconds = 900

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""doorbell — zero-token fast poller for nano-bill's control channel.
+"""doorbell — zero-token fast poller for the hub's control channel.
 
 Polls the Slack self-DM every POLL_S seconds using a personal Slack user
 token (stdlib only, no model calls). When a message newer than the hub's
-cursor appears that isn't a hub post (⚙️ prefix), it kicks nano-bill via
-`agent-deck session send` so the hub ticks immediately instead of waiting
+cursor appears that isn't a hub post (⚙️ prefix), it kicks the hub session
+via `agent-deck session send` so the hub ticks immediately instead of waiting
 out its idle backoff. Read-only by design: never advances the cursor,
 never replies — the hub stays the single writer.
+
+Operator identity (which agent-deck session to kick, under which profile) is
+NOT baked in: it comes from loops.toml [hub] — see loops.example.toml.
 """
 import json
 import os
@@ -26,8 +29,6 @@ STATE_DIR = os.path.join(REPO, "state", "doorbell")
 LAST_KICK = os.path.join(STATE_DIR, "last_kick")
 POLL_S = 30
 KICK_COOLDOWN_S = 120
-HUB_SESSION = "nano-bill (hub)"
-DECK_PROFILE = os.environ.get("DOORBELL_DECK_PROFILE", "work")
 KICK_MSG = "doorbell: new control-channel activity — run one hub tick now"
 
 
@@ -39,9 +40,30 @@ def read_file(path, default=""):
         return default
 
 
+def hub_config() -> dict:
+    """loops.toml [hub] — the per-installation operator identity. Never raises:
+    a missing/unparseable registry degrades to defaults, and main() then exits
+    on the missing channel id with a readable message."""
+    try:
+        with open(os.path.join(REPO, "loops.toml"), "rb") as f:
+            hub = tomllib.load(f).get("hub", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return hub if isinstance(hub, dict) else {}
+
+
+HUB = hub_config()
+# Persona is the display half of the agent-deck title convention
+# "<persona> (<loop name>)"; the hub's loop name is "hub". Public default is the
+# neutral "ops" — a real install sets its own in loops.toml.
+HUB_PERSONA = HUB.get("persona") or "ops"
+HUB_SESSION = HUB.get("session_title") or f"{HUB_PERSONA} (hub)"
+DECK_PROFILE = (os.environ.get("DOORBELL_DECK_PROFILE")
+                or HUB.get("deck_profile") or "work")
+
+
 def channel_id():
-    with open(os.path.join(REPO, "loops.toml"), "rb") as f:
-        return tomllib.load(f)["hub"]["slack_channel_id"]
+    return HUB.get("slack_channel_id")
 
 
 def fetch_messages(token, channel):
@@ -95,9 +117,12 @@ def main():
     if not token:
         sys.exit(f"doorbell: no token at {TOKEN_FILE}")
     channel = channel_id()
+    if not channel:
+        sys.exit("doorbell: no [hub].slack_channel_id in loops.toml")
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(HUB_DIR, exist_ok=True)
-    print(f"doorbell: watching {channel} every {POLL_S}s", flush=True)
+    print(f"doorbell: watching {channel} every {POLL_S}s, "
+          f"kicking {HUB_SESSION!r} (profile {DECK_PROFILE})", flush=True)
     while True:
         mark_alive()
         try:
