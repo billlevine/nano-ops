@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""followups — durable standing-action-item list.
+
+The estate-wide exit destination for work items that reach a terminal
+state (done/needs-you) with no external object — a PR, an issue, a ticket
+— to hang a note on: internal work like "provision the OIDC role" or
+"raise the org spend cap." A loop's own queue is transient (items exit it,
+they don't live on there) and a tracker's state is keyed to the object it
+tracks; this is the durable home for everything else, standing until a
+human resolves it. Loops are the producers: a loop that retires an item
+with nowhere to put it files a follow-up here, tagged with --source.
+
+DATA (state/followups/, override with $FOLLOWUPS_STATE_DIR — tests use
+this to run against a tempdir instead of real state)
+-------------------------------------------------------------------------
+  followups.json   source of truth: one entry per follow-up, open|resolved
+  ledger.jsonl      append-only audit trail (added/resolved events)
+
+SUBCOMMANDS
+-----------
+  followups add "<description>" --source SRC [--ref REF] [--context "..."]
+                                  file a new standing item, keyed followup:N;
+                                  prints the created item as JSON
+  followups resolve <id> ["note"]
+                                  mark resolved (kept, not deleted)
+  followups list                  open items only, compact one-line-each
+  followups show                  every item, open then resolved, with context
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.environ.get("FOLLOWUPS_STATE_DIR") or os.path.join(REPO_ROOT, "state", "followups")
+STORE_FILE = os.path.join(DATA_DIR, "followups.json")
+LEDGER_FILE = os.path.join(DATA_DIR, "ledger.jsonl")
+
+NOW = dt.datetime.now(dt.timezone.utc)
+
+
+# --------------------------------------------------------------------------- #
+# store I/O
+# --------------------------------------------------------------------------- #
+def load_store() -> dict:
+    try:
+        with open(STORE_FILE) as f:
+            s = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        s = {}
+    s.setdefault("items", {})
+    return s
+
+
+def save_store(s: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    s["updated_at"] = NOW.isoformat()
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, sort_keys=True)
+    os.replace(tmp, STORE_FILE)
+
+
+def append_ledger(event: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    event.setdefault("ts", NOW.isoformat())
+    with open(LEDGER_FILE, "a") as f:
+        f.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# subcommands
+# --------------------------------------------------------------------------- #
+def cmd_add(args) -> int:
+    desc = (args.description or "").strip()
+    if not desc:
+        print("[error] description must be non-empty", file=sys.stderr)
+        return 2
+    s = load_store()
+    n = 1 + max((int(m.group(1)) for k in s["items"]
+                 if (m := re.match(r"^followup:(\d+)$", k))), default=0)
+    key = f"followup:{n}"
+    item = {
+        "id": key,
+        "description": desc,
+        "source": (args.source or "").strip(),
+        "ref": (args.ref or "").strip() or None,
+        "context": (args.context or "").strip(),
+        "status": "open",
+        "created_at": NOW.isoformat(),
+        "resolved_at": None,
+        "resolution": None,
+    }
+    s["items"][key] = item
+    save_store(s)
+    append_ledger({"id": key, "event": "added", "source": item["source"],
+                   "ref": item["ref"], "description": desc})
+    print(json.dumps(item, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    s = load_store()
+    item = s["items"].get(args.id)
+    if not item:
+        print(f"[error] no follow-up matches '{args.id}'. "
+              f"Run `followups list` to see ids.", file=sys.stderr)
+        return 2
+    item["status"] = "resolved"
+    item["resolved_at"] = NOW.isoformat()
+    item["resolution"] = args.note or ""
+    save_store(s)
+    append_ledger({"id": args.id, "event": "resolved", "note": args.note or ""})
+    print(f"resolved: {args.id}")
+    return 0
+
+
+def _line(item: dict) -> str:
+    ref = f" [{item['ref']}]" if item.get("ref") else ""
+    src = f" ({item['source']})" if item.get("source") else ""
+    return f"{item['id']:>12}{ref}{src}  {item.get('description', '')[:70]}"
+
+
+def cmd_list(args) -> int:
+    s = load_store()
+    open_items = [it for it in s["items"].values() if it.get("status") == "open"]
+    if not open_items:
+        print("no open follow-ups")
+        return 0
+    open_items.sort(key=lambda it: it.get("created_at") or "")
+    for it in open_items:
+        print(_line(it))
+    return 0
+
+
+def cmd_show(args) -> int:
+    s = load_store()
+    items = list(s["items"].values())
+    if not items:
+        print("no follow-ups on file")
+        return 0
+    items.sort(key=lambda it: (it.get("status") != "open", it.get("created_at") or ""))
+    for it in items:
+        tag = "open" if it.get("status") == "open" else "resolved"
+        print(f"[{tag}] {_line(it)}")
+        if it.get("context"):
+            print(f"             {it['context'][:120]}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="followups — durable standing action items")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("add")
+    p.add_argument("description")
+    p.add_argument("--source", default="", help="who filed this (e.g. pr-reviewer)")
+    p.add_argument("--ref", default="", help="originating key, e.g. task:7 or a PR ref")
+    p.add_argument("--context", default="", help="extra detail — findings, links, etc.")
+
+    p = sub.add_parser("resolve")
+    p.add_argument("id")
+    p.add_argument("note", nargs="?", default="")
+
+    sub.add_parser("list")
+    sub.add_parser("show")
+
+    args = ap.parse_args(argv)
+    if args.cmd == "add":
+        return cmd_add(args)
+    if args.cmd == "resolve":
+        return cmd_resolve(args)
+    if args.cmd == "list":
+        return cmd_list(args)
+    if args.cmd == "show":
+        return cmd_show(args)
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
