@@ -1,22 +1,23 @@
-# Spike: Flox `[services]` vs systemd `--user` for nano-bill's always-on pieces
+# Spike: Flox `[services]` vs systemd `--user` for the always-on pieces
 
 **Date:** 2026-07-22 · **Flox:** 1.13.2 · **process-compose:** 1.94.0 (bundled)
-**Scope:** non-invasive prototype in `~/github/billlevine/nano-ops`.
-The live `~/github/billlevine/operations` repo, its `loops.toml`, and its systemd
-`--user` services were **not touched** (verified read-only: `doorbell.service`
-stayed `active/running`, MainPID 3036451, continuously up since 2026-07-21 00:20).
+**Scope:** a non-invasive prototype in its own directory. The live
+installation this was measured against — its repo, its `loops.toml`, and its
+systemd `--user` services — was **not touched** (verified read-only: its
+`doorbell.service` stayed `active/running` on the same PID throughout, up
+continuously since the day before).
 
 ## Update — promoted from spike to the real seed (2026-07-22)
 
 This directory is no longer a throwaway. It is now the **working seed of the
 public `nano-ops` release repo**, and the **real** services port lives here
 first (guiding architecture: private fork + public upstream — see `README.md`
-and the 2026-07-22 operations sharing/layering research).
+and the 2026-07-22 sharing/layering research).
 
 What changed since the original spike below:
 
 - The sim stand-ins (`bin/doorbell-sim`, `bin/doorbell.real`) are gone. The
-  **real** operations scripts were copied in verbatim: `bin/doorbell`,
+  **real** hub scripts were ported in: `bin/doorbell`,
   `bin/dashboard`, `bin/dashboard-refresh`, `bin/dashboard-server`,
   `bin/usage-fetch`.
 - `[services]` now defines the four real always-on services, each wrapped in the
@@ -28,10 +29,10 @@ What changed since the original spike below:
   `doorbell` exits cleanly on the missing-token path and the supervisor restarts
   it (safe by construction — no token in this repo); `dashboard-server` serves
   `http://127.0.0.1:8522/dashboard.{html,json}` (alt port so it coexists with a
-  live operations dashboard on `:8422`); `usage-fetch` wrote
+  live installation's dashboard on `:8422`); `usage-fetch` wrote
   `state/usage/budget.json` from the read-only usage API; restart rotated the PID;
-  stop left all `Completed` with **no surviving processes**. The live operations
-  services were not touched.
+  stop left all `Completed` with **no surviving processes**. The live
+  installation's services were not touched.
 
 The capability findings below (from the original spike) still stand and remain
 the evidence base for the port.
@@ -48,7 +49,7 @@ _(Original spike — superseded by the real port described in the Update above.
 The sim files no longer exist; kept here as the record of how the findings were
 obtained.)_
 
-- `bin/doorbell.real` — verbatim copy of `operations/bin/doorbell` (reference only).
+- `bin/doorbell.real` — verbatim copy of the hub's `bin/doorbell` (reference only).
 - `bin/doorbell-sim` — a **faithful, side-effect-free** stand-in: same runtime
   shape (infinite poll loop, per-iteration heartbeat file, stdout logging) but
   **no Slack API calls, no `agent-deck` kicks, no reads of live `state/`**. This
@@ -130,12 +131,13 @@ A real port would be a one-liner per unit, e.g.:
 systemd unit as the supervisor.** Best of both:
 
 - Move `doorbell`, `dashboard-refresh`, `dashboard-server`, `usage-fetch` into
-  `[services]` in the operations manifest. Win: declarative, in-repo, versioned,
+  `[services]` in the hub's manifest. Win: declarative, in-repo, versioned,
   reproducible, one `flox services` UX instead of N hand-installed unit files.
-- Replace the N per-service systemd units with **one** `nano-bill-services.service`
-  (systemd `--user`, `Restart=always`, lingering enabled) whose ExecStart holds a
-  persistent activation: `flox activate --start-services -- tail -f /dev/null`
-  (or a `sleep infinity` block). systemd then supplies **boot-autostart** and
+- Replace the N per-service systemd units with **one** supervisor unit (systemd
+  `--user`, `Restart=always`, lingering enabled) whose ExecStart holds a
+  persistent activation: `flox activate --start-services -- sleep infinity`.
+  Templated at `infra/nano-ops-services.service.example`; runbook in
+  `docs/always-on.md`. systemd then supplies **boot-autostart** and
   restarts the whole process-compose group if it dies; process-compose supervises
   the individual services within.
 - For per-service crash-restart (the one thing process-compose won't do
@@ -152,7 +154,7 @@ entirely — it's still needed for boot + top-level supervision.
 ## Reproduce (real port)
 
 ```bash
-cd ~/github/billlevine/nano-ops
+cd <this repo>
 flox activate --start-services -- bash -c '
   sleep 8
   flox services status                     # all four Running

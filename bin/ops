@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# ops — the operator CLI for this estate.
+#
+#   ops up                     ensure the hub session is alive and ticking
+#   ops status                 agent-deck sessions + this repo's Flox services
+#   ops health                 READ-ONLY registry sweep; prints only anomalies
+#   ops doctor                 preflight: toolchain, config, invariants
+#   ops services {up|down|status|logs [name]}
+#                              the always-on set (doorbell, dashboard, usage)
+#   ops dashboard {url|status} the local dashboard's address and reachability
+#   ops compact {run|auto}     reset the hub's context by restarting it fresh
+#
+# Nothing here is installation-specific: the operator's identity comes from
+# loops.toml [hub] (persona/group/deck_profile), the registry from [loops.*],
+# and the always-on services from this repo's Flox manifest. See
+# loops.example.toml.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ── configuration ────────────────────────────────────────────────────────────
+
+hub_field() {  # hub_field <key> <default> — one scalar from loops.toml [hub]
+  python3 - "$REPO/loops.toml" "$1" "$2" <<'PY'
+import sys, tomllib
+try:
+    hub = tomllib.load(open(sys.argv[1], "rb")).get("hub", {})
+except Exception:
+    hub = {}
+print(str(hub.get(sys.argv[2]) or sys.argv[3]))
+PY
+}
+
+PERSONA="$(hub_field persona ops)"
+HUB_TITLE="$(hub_field session_title "$PERSONA (hub)")"
+DECK_GROUP="$(hub_field group "$PERSONA")"
+# Pin the profile for every agent-deck call below, so title resolution is
+# unambiguous regardless of the invoking shell's ambient AGENTDECK_PROFILE. An
+# unset or different ambient profile otherwise resolves a hub title against the
+# wrong profile's session store — which has, in practice, launched a live
+# duplicate hub.
+AGENTDECK_PROFILE="$(hub_field deck_profile work)"
+export AGENTDECK_PROFILE
+
+dash_hostport() {  # echo "<host> <port>" from loops.toml [dashboard]
+  python3 - "$REPO/loops.toml" <<'PY'
+import sys, tomllib
+try:
+    d = tomllib.load(open(sys.argv[1], "rb")).get("dashboard", {})
+except Exception:
+    d = {}
+print(d.get("host", "127.0.0.1"), int(d.get("port", 8422)))
+PY
+}
+
+registry_autostart() {  # emit "<title>\t<name>\t<secs>\t<interval>" per autostart loop
+  # One row for each [loops.*] with autostart=true, tab-separated: the session
+  # TITLE ("<persona> (<name>)", matching the hub skill §5), the loop name, the
+  # interval in seconds (-1 if unparseable, e.g. "on-demand"), and the raw
+  # interval string.
+  python3 - "$REPO/loops.toml" <<'PY'
+import sys, tomllib
+UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+def secs(iv):
+    iv = (iv or "").strip()
+    if iv[-1:] in UNITS and iv[:-1].isdigit():
+        return int(iv[:-1]) * UNITS[iv[-1]]
+    return -1
+try:
+    loops = tomllib.load(open(sys.argv[1], "rb")).get("loops", {})
+except Exception:
+    loops = {}
+for name, c in loops.items():
+    if not c.get("autostart"):
+        continue
+    persona = (c.get("persona") or "").strip()
+    title = f"{persona} ({name})" if persona else name
+    iv = c.get("interval", "")
+    print("\t".join([title, name, str(secs(iv)), iv]))
+PY
+}
+
+# ── doctor ───────────────────────────────────────────────────────────────────
+
+cmd_doctor() {
+  local rc=0
+  check() {  # check <label> <command...>
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "ok   $label"; else echo "FAIL $label"; rc=1; fi
+  }
+  check "python3 on PATH"           command -v python3
+  check "claude on PATH"            command -v claude
+  check "agent-deck on PATH"        command -v agent-deck
+  check "tmux on PATH"              command -v tmux
+  check "gh on PATH"                command -v gh
+  check "jq on PATH"                command -v jq
+  check "flox on PATH"              command -v flox
+  # Subscription-only invariant: recurring work runs in interactive sessions.
+  # A set key would silently meter every tick.
+  check "ANTHROPIC_API_KEY unset"   test -z "${ANTHROPIC_API_KEY:-}"
+  check "loops.toml present"        test -f "$REPO/loops.toml"
+  check "state/ writable"           bash -c "mkdir -p '$REPO/state/hub' && touch '$REPO/state/.w' && rm '$REPO/state/.w'"
+  # Config that is expected to be absent in a fresh clone is reported, not failed:
+  # the repo is usable (and safe) without a control channel or a token.
+  if [ "$(hub_field slack_channel_id "")" = "" ]; then
+    echo "skip control channel ([hub].slack_channel_id unset — doorbell idle)"
+  else
+    echo "ok   control channel configured"
+  fi
+  if [ -f "$REPO/state/secrets/slack-user-token" ]; then
+    echo "ok   control-channel token present"
+  else
+    echo "skip control-channel token (none at state/secrets/slack-user-token)"
+  fi
+  echo "---"
+  echo "operator: $PERSONA · hub session: \"$HUB_TITLE\" · group: $DECK_GROUP · profile: $AGENTDECK_PROFILE"
+  exit "$rc"
+}
+
+# ── hub lifecycle ────────────────────────────────────────────────────────────
+
+cmd_up() {
+  mkdir -p "$REPO/state/hub"
+  # Existence check via `session show` (non-zero only if absent). NOT
+  # `ls | awk '{print $1}'` — that truncates a multi-word title like
+  # "ops (hub)" to "ops", so an exact match always misses and this would try to
+  # launch a duplicate, leaving the registered branch below unreachable.
+  if ! agent-deck session show "$HUB_TITLE" >/dev/null 2>&1; then
+    # The hub routes, dispatches, and relays; heavy work is offloaded to other
+    # sessions, and it is stateless per tick (it reloads cursor/ledger/skill from
+    # disk), so a cheaper model plus aggressive compaction costs nothing
+    # functional. Override with $HUB_MODEL.
+    agent-deck launch "$REPO/hub" -c claude -model "${HUB_MODEL:-claude-sonnet-5}" \
+      -t "$HUB_TITLE" -g "$DECK_GROUP" -m "/loop /hub"
+    return
+  fi
+  local st
+  st=$(agent-deck session show "$HUB_TITLE" 2>/dev/null | awk -F': *' '/^Status:/{print $2}')
+  case "$st" in
+    *running*|*waiting*)
+      # Process is alive; a scheduled /loop wakeup may be pending. Kick only if
+      # ticks are stale (2x pace + slack) to avoid starting a second loop.
+      local now last age pace thresh
+      now=$(date +%s); last=$(cat "$REPO/state/hub/last_tick" 2>/dev/null || echo 0)
+      age=$((now - last)); pace=$(cat "$REPO/state/hub/pace" 2>/dev/null || echo 600)
+      thresh=$((pace * 2 + 120))
+      if [ "$age" -gt "$thresh" ]; then
+        agent-deck session send "$HUB_TITLE" "/loop /hub"
+        echo "hub alive but stale (last tick ${age}s ago) — loop kicked"
+      else
+        echo "hub up ($st), last tick ${age}s ago"
+      fi
+      ;;
+    *)
+      # Stopped/errored: /loop wakeups died with the process — start, then kick.
+      agent-deck session start "$HUB_TITLE"
+      sleep 10
+      agent-deck session send "$HUB_TITLE" "/loop /hub"
+      echo "hub started; loop kicked"
+      ;;
+  esac
+  agent-deck session show "$HUB_TITLE" || true
+}
+
+cmd_status() {
+  agent-deck status || true
+  agent-deck ls || true
+  echo "--- flox services ($REPO)"
+  flox services status -d "$REPO" 2>&1 || echo "(no activation running — start with: flox activate --start-services)"
+}
+
+# READ-ONLY health pass across the registry. Runs the exact classification
+# cmd_up already runs for the hub's own session — staleness threshold
+# 2*interval+120s; no live session or a stopped/errored one -> needs-start,
+# alive+stale -> needs-kick, alive+fresh -> ok — for every [loops.*] with
+# autostart=true, and prints ONLY the anomalies (a clean pass prints one "ok"
+# line). It NEVER starts, kicks, or mutates anything: this is the diagnostic
+# half of cmd_up, and the hub tick (skill §5) is the operator that acts on the
+# needs-start/needs-kick lines it emits (still applying its own crash-loop
+# breaker before restarting). Session TITLE is "<persona> (<name>)"; heartbeat
+# is state/<name>/last_tick (epoch seconds).
+cmd_health() {
+  local now anomalies=0 loops=0
+  local title name secs interval thresh st last age t
+  now=$(date +%s)
+  # ONE structured read for the whole sweep — `ls --json` carries the same
+  # Status a per-session `show` prints, with untruncated titles, so we index by
+  # title instead of spawning a show per autostart loop.
+  local deck_json
+  deck_json="$(agent-deck ls --json 2>/dev/null || echo '[]')"
+  declare -A DECK_STATUS
+  # Program from the heredoc, deck JSON via a /dev/fd file arg — piping the JSON
+  # into `python3 -` would collide with the heredoc, which is python's stdin.
+  while IFS=$'\t' read -r t st; do
+    [ -n "$t" ] || continue
+    DECK_STATUS["$t"]="$st"
+  done < <(python3 - <(printf '%s' "$deck_json") <<'PY'
+import json, sys
+try:
+    data = json.loads(open(sys.argv[1]).read() or "[]")
+except Exception:
+    data = []
+seen = set()
+for s in (data if isinstance(data, list) else []):
+    if not isinstance(s, dict):
+        continue
+    t = s.get("title")
+    if not t or t in seen:
+        continue
+    seen.add(t)
+    st = str(s.get("status") or "")
+    print(t.replace("\t", " ").replace("\n", " ") + "\t" + st.replace("\t", " "))
+PY
+)
+  while IFS=$'\t' read -r title name secs interval; do
+    [ -n "$name" ] || continue
+    loops=$((loops + 1))
+    if [ "$secs" -le 0 ]; then
+      echo "needs-attn   $title — unparseable interval '${interval}' in loops.toml"
+      anomalies=$((anomalies + 1)); continue
+    fi
+    thresh=$((secs * 2 + 120))
+    # Absent from the ls --json read = no such session (never launched, or
+    # removed) — that's a `launch`, not a `start`, so keep it distinct from a
+    # registered-but-stopped session below.
+    if [ -z "${DECK_STATUS[$title]+x}" ]; then
+      echo "needs-start  $title — unregistered (no agent-deck session) → launch"
+      anomalies=$((anomalies + 1)); continue
+    fi
+    st="${DECK_STATUS[$title]}"
+    case "$st" in
+      *running*|*waiting*)
+        # Process is alive; a scheduled /loop wakeup may be pending. Only stale
+        # (2x interval + 120s) ticks are an anomaly — a fresh one is left alone.
+        last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
+        age=$((now - last))
+        if [ "$age" -gt "$thresh" ]; then
+          echo "needs-kick   $title — alive but stale (last tick ${age}s ago > ${thresh}s = 2*${interval}+120)"
+          anomalies=$((anomalies + 1))
+        fi
+        ;;
+      *)
+        # Registered but stopped/errored (or no Status line): the /loop wakeup
+        # died with the process — revive with `session start` + kick.
+        echo "needs-start  $title — session ${st:-unknown} (stopped/errored) → start + kick"
+        anomalies=$((anomalies + 1))
+        ;;
+    esac
+  done < <(registry_autostart)
+  if [ "$anomalies" -eq 0 ]; then
+    echo "ok  all ${loops} autostart loops healthy (alive + fresh heartbeat)"
+  fi
+}
+
+# ── always-on services ───────────────────────────────────────────────────────
+#
+# The always-on set (doorbell, dashboard-refresh, dashboard-server, usage-fetch)
+# is declared in this repo's Flox manifest [services], not as N hand-installed
+# systemd units — see FINDINGS.md. Services live only for the duration of an
+# activation, so `up` here starts them inside a NEW activation held open in the
+# background; boot-autostart and top-level supervision are a separate, opt-in
+# systemd unit (see docs/always-on.md), deliberately not installed by this CLI.
+
+cmd_services() {
+  local sub="${1:-status}"
+  case "$sub" in
+    up|start)
+      if flox services status -d "$REPO" >/dev/null 2>&1; then
+        echo "services already running in an existing activation:"
+        flox services start -d "$REPO" 2>&1 || true
+      else
+        echo "no activation is holding these services open."
+        echo "start them in the foreground with:"
+        echo "    flox activate -d $REPO --start-services"
+        echo "for an always-on deployment see docs/always-on.md"
+        return 1
+      fi
+      ;;
+    down|stop)
+      flox services stop -d "$REPO"
+      # `stop` returns while the process is still Terminating (it honors the
+      # SIGTERM grace period); an immediate `start` races and fails with
+      # "process is already running". `restart` is the safe verb for a bounce.
+      echo "(stop is asynchronous — wait for Completed before starting again)"
+      ;;
+    status|"")
+      flox services status -d "$REPO" 2>&1 \
+        || echo "(no activation running — start with: flox activate -d $REPO --start-services)"
+      ;;
+    logs)
+      shift || true
+      flox services logs -d "$REPO" ${1:+"$1"}
+      ;;
+    *) echo "usage: ops services {up|down|status|logs [name]}" >&2; exit 2 ;;
+  esac
+}
+
+# Tier-1 LOCAL live dashboard: the loopback static server (bin/dashboard-server)
+# plus the token-free JSON regenerator (bin/dashboard-refresh), both Flox
+# services. Loopback only — no auth; tier-2 remote serving adds a reverse proxy
+# with auth in front and flips [dashboard].host in loops.toml.
+cmd_dashboard() {
+  local sub="${1:-url}" host port url
+  read -r host port < <(dash_hostport)
+  url="http://${host}:${port}/dashboard.html"
+  case "$sub" in
+    url|"") echo "$url" ;;
+    status)
+      flox services status -d "$REPO" 2>/dev/null \
+        | grep -E 'NAME|dashboard-(server|refresh)' || echo "(services not running)"
+      echo "url: $url"
+      curl -sS -m 5 -o /dev/null -w "  GET dashboard.json -> HTTP %{http_code}\n" \
+        "http://${host}:${port}/dashboard.json" 2>/dev/null || echo "  (server not reachable)"
+      ;;
+    *) echo "usage: ops dashboard {url|status}" >&2; exit 2 ;;
+  esac
+}
+
+# ── hub compaction ───────────────────────────────────────────────────────────
+#
+# Claude Code exposes NO context-threshold knob (auto-compact is on-by-default,
+# near-limit only), but the hub is stateless per tick — every tick reloads
+# cursor/ledger/registry/skill from disk, nothing functional lives in the
+# conversation — so a periodic FRESH RESTART resets its context to ~zero with
+# zero state loss. That fresh start also re-pins the hub's model. `run` forces
+# it now; `auto` (a scheduler's entrypoint) skips when the hub ticked recently,
+# so it never yanks context mid-conversation.
+cmd_compact() {
+  local sub="${1:-run}" now last age
+  restart_fresh() {
+    # `agent-deck session set … claude-session-id ""` alone does NOT stop the
+    # resume: that field is agent-deck's own display cache, populated by
+    # detection AFTER start. On `session start`, agent-deck independently
+    # rediscovers "the most recent session for this path" by scanning
+    # ~/.claude/projects/<path-with-/-replaced-by-->/*.jsonl and launches
+    # `claude --resume <found-id>` regardless of what the cleared field says.
+    # So the fix is to archive those transcripts out of the way — not delete
+    # them — before start.
+    local ts ts_iso hub_path hub_hist archive ledger rc=0
+    ts=$(date +%s)
+    ts_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)  # ledger convention: ISO-8601 UTC
+    ledger="$REPO/state/ledger.jsonl"
+    mkdir -p "$(dirname "$ledger")"
+
+    hub_path=$(agent-deck session show "$HUB_TITLE" --json 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin)['path'])") || rc=1
+
+    agent-deck session set "$HUB_TITLE" model "${HUB_MODEL:-claude-sonnet-5}" || rc=1
+    agent-deck session set "$HUB_TITLE" claude-session-id ""  || rc=1
+    agent-deck session stop "$HUB_TITLE" >/dev/null 2>&1 || true  # ok if stopped
+    sleep 3
+
+    if [ "$rc" -eq 0 ]; then
+      hub_hist="$HOME/.claude/projects/${hub_path//\//-}"
+      archive="$REPO/state/hub/claude-history-archive/$ts"
+      if [ -d "$hub_hist" ]; then
+        shopt -s nullglob
+        local jsonl_files=("$hub_hist"/*.jsonl)
+        shopt -u nullglob
+        if [ "${#jsonl_files[@]}" -gt 0 ]; then
+          mkdir -p "$archive" && mv "${jsonl_files[@]}" "$archive"/ || rc=1
+        fi
+      fi
+    fi
+
+    [ "$rc" -eq 0 ] && { cmd_up || rc=1; }  # stopped -> start + kick, fresh
+
+    if [ "$rc" -eq 0 ]; then
+      python3 -c "
+import json
+print(json.dumps({'ts': '$ts_iso', 'actor': 'ops', 'kind': 'activity',
+  'summary': 'hub compact: fresh restart succeeded',
+  'detail': 'archived prior transcript(s) to state/hub/claude-history-archive/$ts; hub restarted with a new claude session id'}))
+" >> "$ledger"
+      echo "compact: fresh restart complete"
+    else
+      python3 -c "
+import json
+print(json.dumps({'ts': '$ts_iso', 'actor': 'ops', 'kind': 'error',
+  'summary': 'hub compact: fresh restart FAILED',
+  'detail': 'one or more steps in restart_fresh failed; hub may be stopped or on stale context — check manually'}))
+" >> "$ledger"
+      echo "compact: fresh restart FAILED — see output above" >&2
+      return 1
+    fi
+  }
+  case "$sub" in
+    run)  # forced ("compact now")
+      echo "compacting hub: fresh restart (context reset)…"
+      restart_fresh
+      ;;
+    auto) # scheduler entrypoint: only when idle, so no back-and-forth is cut
+      now=$(date +%s); last=$(cat "$REPO/state/hub/last_tick" 2>/dev/null || echo 0)
+      age=$((now - last))
+      if [ "$age" -lt 900 ]; then
+        echo "hub active (last tick ${age}s ago) — skipping compaction restart"
+        exit 0
+      fi
+      echo "hub idle (last tick ${age}s ago) — compacting: fresh restart…"
+      restart_fresh
+      ;;
+    *) echo "usage: ops compact {run|auto}" >&2; exit 2 ;;
+  esac
+}
+
+usage() {
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  up)        cmd_up ;;
+  status)    cmd_status ;;
+  health)    cmd_health ;;
+  doctor)    cmd_doctor ;;
+  services)  shift; cmd_services "$@" ;;
+  dashboard) cmd_dashboard "${2:-}" ;;
+  compact)   cmd_compact "${2:-}" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

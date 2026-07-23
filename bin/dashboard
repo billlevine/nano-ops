@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""operations estate dashboard — Tier-1 local live-update renderer.
+"""estate dashboard — Tier-1 local live-update renderer.
 
 PURE READER. Aggregates real on-disk loop state + live agent-deck session
 status into one data model, then emits it as JSON plus the HTML that renders
@@ -31,7 +31,8 @@ Reads:
                                         hub itself has been idle a while)
     agent-deck session show "<title>"   live status (running/idle/waiting) + model
     agent-deck ls --json                hub ephemeral sessions in flight NOW
-                                        (group nano-bill, title "ephemeral - …")
+                                        (loops.toml [hub].group, title
+                                        "ephemeral - …")
     ~/.claude/projects/*/*.jsonl        local Claude Code token usage, current
                                         rolling window (read-only, token-free;
                                         approximate — this host only, NOT the
@@ -69,10 +70,10 @@ E = html.escape
 LEDGER_TAIL = 14          # ledger lines to surface
 ACTFIRST_CAP = 12         # PR act-first rows before "+N more"
 
-# Self-contained favicon so Bill can spot the dashboard's browser tab — a cat
-# emoji (a nod to Bill-the-Cat, which is too detailed to read at 16px) rendered
-# as an inline SVG data-URI. Base64-encoded so the multibyte emoji + markup need
-# no attribute escaping; deterministic (fixed string) and external-file-free.
+# Self-contained favicon so the operator can spot the dashboard's browser tab —
+# a cat emoji rendered as an inline SVG data-URI. Base64-encoded so the
+# multibyte emoji + markup need no attribute escaping; deterministic (fixed
+# string) and external-file-free.
 _FAVICON_SVG = (
     "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
     "<text x='50' y='54' font-size='82' text-anchor='middle' "
@@ -234,13 +235,40 @@ def _cwd_to_loop(cwd: str | None) -> str:
     return "hub"
 
 
+# ── operator identity (loops.toml [hub]) ─────────────────────────────────────
+# Who this installation's hub IS — persona, session title, agent-deck group and
+# profile. Never baked into the code: the public core ships neutral defaults and
+# every install names itself in its own (gitignored) loops.toml. See
+# loops.example.toml.
+
+def hub_config() -> dict:
+    """loops.toml [hub]. Never raises — a missing/unparseable registry degrades
+    to the neutral defaults below, which is exactly what a fresh clone has."""
+    try:
+        hub = tomllib.loads(read_text(ROOT / "loops.toml") or "").get("hub", {})
+    except tomllib.TOMLDecodeError:
+        return {}
+    return hub if isinstance(hub, dict) else {}
+
+
+HUB = hub_config()
+# agent-deck title convention is "<persona> (<loop name>)"; the hub's name is "hub".
+HUB_PERSONA = HUB.get("persona") or "ops"
+HUB_SESSION = HUB.get("session_title") or f"{HUB_PERSONA} (hub)"
+# Group every hub-launched session (loops + "ephemeral - …" workers) lands in.
+HUB_GROUP = HUB.get("group") or HUB_PERSONA
+# Label for this estate, shown in the dashboard header and carried in the JSON.
+ESTATE = HUB.get("estate") or "ops"
+
+
 # ── agent-deck (live session status) ─────────────────────────────────────────
 
-# The loop sessions live under agent-deck profile `work` (same as the doorbell's
+# The loop sessions live under one agent-deck profile (same as the doorbell's
 # DOORBELL_DECK_PROFILE). Pass it explicitly so the read works regardless of the
-# ambient default profile — in particular under the dashboard-refresh systemd
-# service, whose default profile is `default` and would otherwise see nothing.
-DECK_PROFILE = os.environ.get("DASHBOARD_DECK_PROFILE", "work")
+# ambient default profile — in particular under a supervised service whose
+# default profile is `default` and would otherwise see nothing.
+DECK_PROFILE = (os.environ.get("DASHBOARD_DECK_PROFILE")
+                or HUB.get("deck_profile") or "work")
 
 
 def deck_session(title: str) -> dict:
@@ -267,7 +295,7 @@ def deck_session(title: str) -> dict:
 # ── ephemeral queue (hub sessions dispatched RIGHT NOW) ──────────────────────
 # What is in flight this moment — distinct from the night-shift queue (which is
 # QUEUED PR/task work). The hub names each dispatched worker "ephemeral - <slug>"
-# under group `nano-bill`; one `agent-deck ls --json` read surfaces them all.
+# under HUB_GROUP; one `agent-deck ls --json` read surfaces them all.
 # Read-only; never mutates a session.
 
 EPH_PREFIX = "ephemeral - "
@@ -295,7 +323,7 @@ def build_ephemeral(now: datetime) -> list[dict]:
         if not isinstance(s, dict):
             continue
         title = s.get("title") or ""
-        if s.get("group") != "nano-bill" or not title.startswith(EPH_PREFIX):
+        if s.get("group") != HUB_GROUP or not title.startswith(EPH_PREFIX):
             continue
         slug = title[len(EPH_PREFIX):].strip() or title
         ca = s.get("created_at")
@@ -329,12 +357,12 @@ def build_loops(registry: dict, now: float) -> list[dict]:
 
     # hub — the operator; not in [loops.*]
     tick, age = heartbeat("hub")
-    hub_sess = deck_session("nano-bill (hub)")
+    hub_sess = deck_session(HUB_SESSION)
     db_raw = read_text(STATE / "hub" / "doorbell_alive")
     db_tick = int(db_raw.strip()) if db_raw and db_raw.strip().isdigit() else None
     db_age = max(0.0, now - db_tick) if db_tick is not None else None
     loops.append({
-        "name": "hub", "persona": "nano-bill", "interval": "≈30s poll",
+        "name": "hub", "persona": HUB_PERSONA, "interval": "≈30s poll",
         "interval_seconds": 90, "model": None, "model_pretty": "operator",
         "autostart": True, "is_hub": True,
         "last_tick": tick, "heartbeat_age": age,
@@ -350,13 +378,9 @@ def build_loops(registry: dict, now: float) -> list[dict]:
         "doorbell_alive": db_age is not None and db_age < 90,
     })
 
-    ROLE = {
-        "pr-tracker": "scans PRs, keeps the live work queue",
-        "pr-reviewer": "overnight review + rework + task drain",
-        "mechanic": "nightly self-optimization proposals",
-        "eng-health": "engineering-health gauges (on-demand)",
-        "morning-brief": "06:00 morning brief composer",
-    }
+    # A loop's one-line role is registry data, not code: [loops.<name>].role in
+    # loops.toml. A table of hardcoded descriptions here would be one
+    # installation's loop set baked into a shared renderer.
     for name, cfg in (registry.get("loops") or {}).items():
         persona = cfg.get("persona", name)
         interval = cfg.get("interval", "")
@@ -371,7 +395,7 @@ def build_loops(registry: dict, now: float) -> list[dict]:
             "last_tick": tick, "heartbeat_age": age,
             "freshness": freshness(age, isec),
             "session_present": sess["present"], "session_status": sess["status"],
-            "live_model": sess["model"], "role": ROLE.get(name, ""),
+            "live_model": sess["model"], "role": cfg.get("role", ""),
         })
     return loops
 
@@ -408,7 +432,7 @@ def build_pr_board() -> dict:
             buckets[BUCKET_OF[wait]] += 1
         pr = e.get("pr") or {}
         lin = e.get("linear") or {}
-        # Bill's memory-trail note — the last manual action recorded per PR.
+        # The operator's memory-trail note — last manual action recorded per PR.
         note = (e.get("manual") or {}).get("note") or None
         title = pr.get("title") or lin.get("title") or eid
         url = pr.get("url") or lin.get("url") or ""
@@ -480,8 +504,9 @@ def build_night() -> dict:
 
 def build_focus() -> dict:
     """Read the focus-projects engine's data model (state/focus/focus.json).
-    Pure consumer — focus_projects.py owns all Linear access + scoring; the
-    dashboard only renders. Absent/empty file => not available."""
+    Pure consumer — that loop owns all tracker access and scoring; the dashboard
+    only renders. Absent/empty file (the case with no such loop registered)
+    => not available."""
     model = read_json(STATE / "focus" / "focus.json")
     if not model or not model.get("projects"):
         return {"available": False, "projects": []}
@@ -750,8 +775,8 @@ def build_snapshot() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "generated_epoch": int(now),
         "host": socket.gethostname(),
-        "estate": "operations",
-        "operator": "nano-bill",
+        "estate": ESTATE,
+        "operator": HUB_PERSONA,
         "loops": loops,
         "ephemeral": ephemeral,
         "usage": usage,
@@ -963,7 +988,7 @@ a{color:inherit;text-decoration:none}
 .tag.draft{color:var(--dim)} .tag.blocked{color:var(--crit)}
 .idle-d{font-variant-numeric:tabular-nums}
 .idle-d.hot{color:var(--crit)} .idle-d.warm{color:var(--warn)}
-/* Bill's manual last-action note (memory trail) */
+/* the operator's manual last-action note (memory trail) */
 .prnote{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.45;
   padding-left:16px;position:relative;font-family:var(--sans);white-space:normal}
 .prnote::before{content:"✎";position:absolute;left:0;top:0;color:var(--accent);
@@ -1234,7 +1259,7 @@ def render_loops(loops: list[dict]) -> str:
 
 
 def render_note(note: str | None, inline: bool = False) -> str:
-    """Bill's manual last-action note, date emphasized. inline=under-row list."""
+    """The operator's manual last-action note, date emphasized. inline=under-row list."""
     if not note:
         return ""
     d, body = split_note(note)
