@@ -14,7 +14,8 @@ not, and [`README.md`](README.md) for the private-fork/public-upstream shape.
 ## Map
 
 - `hub/` — the hub session's home (CLAUDE.md + hub skill). Start it: `bin/ops up`
-- `loops/<name>/` — one folder per loop: CLAUDE.md + skill + scripts
+- `loops/<name>/` — one folder per loop: CLAUDE.md + skill + scripts.
+  `loops/example/` is the copyable template; no real loop ships in the core
 - `loops.toml` — per-installation registry (gitignored); `loops.example.toml` is
   the committed documented form, and the Flox `[hook]` seeds one from the other
 - `bin/ops` — up | status | health | doctor | services | dashboard | compact

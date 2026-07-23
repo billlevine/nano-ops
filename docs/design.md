@@ -29,7 +29,10 @@ interactive-session subscription — no API billing anywhere in the design.
    loop owns its own state directory and history file and is authoritative over
    it. Loops never post to the control channel themselves — the hub is the
    single writer, and a loop with something to say leaves it on disk behind a
-   marker file for the hub to relay.
+   marker file for the hub to relay. That contract — heartbeat, own-your-state,
+   ledger, relay — is written out as a copyable template in
+   [`../loops/example/`](../loops/example/CLAUDE.md); the core ships that shape
+   and no actual loop, since a loop is where installation policy concentrates.
 
 3. **The repo as source of truth** — the hub skill, the loop definitions, the
    Flox manifest, and the `loops.toml` registry that says which loops exist,

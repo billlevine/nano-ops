@@ -49,10 +49,15 @@ deck_profile = "work"
 host = "127.0.0.1"
 port = 8522
 
-# [loops.<name>] — one block per loop this hub manages. None ship in the public
-# core (a loop is where installation policy concentrates — see
+# [loops.<name>] — one block per loop this hub manages. No REAL loop ships in
+# the public core (a loop is where installation policy concentrates — see
 # docs/allowlist.md); this is the shape `bin/ops health`, the hub skill's health
 # pass, and bin/dashboard all read.
+#
+# The one loop directory that does ship is loops/example/ — the copyable
+# template (CLAUDE.md + skill) documenting the contract every loop owes the
+# estate. Uncomment the block below to run the template itself as a cadence
+# canary; copy the directory and rename it to build a real loop.
 #
 # [loops.example]
 # dir = "loops/example"        # working directory, relative to the repo root

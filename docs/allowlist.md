@@ -43,6 +43,7 @@ just as much one installation's identity as a channel id is.
 | `bin/usage-fetch` | the budget signal. Talks only to the model provider's own read-only usage endpoint. |
 | `bin/followups` | the durable action-item store. Generic add/resolve/list over its own state dir. |
 | `hub/` | the hub session's home and its tick skill — the control-plane mechanism. |
+| `loops/example/` | the loop contract as a copyable template: heartbeat, own-your-state, ledger, relay. No installation's policy in it. |
 | `.flox/env/manifest.toml` | the toolchain and the always-on `[services]` declarations. |
 | `loops.example.toml` | the registry's documented shape, with no real entries. |
 | `docs/` | architecture, this allowlist, and the always-on runbook. |
@@ -54,8 +55,8 @@ just as much one installation's identity as a channel id is.
   watches, which org's conventions it enforces, which reviewers it pings. The
   *shape* of a loop is core (`loops/<name>/` = CLAUDE.md + skill + scripts +
   `state/<name>/`, registered in `loops.toml`); any particular loop is not.
-  A generic example loop belongs here eventually; a working loop from a live
-  estate does not.
+  `loops/example/` is that shape as a copyable template and is core; a working
+  loop from a live estate is not.
 - **Standing orders in the hub skill.** The hub skill carries the tick
   mechanism — classification, ledger, health pass, pacing. It does not carry
   rules like "auto-fix red CI on PRs authored by <username>" or "relay the
