@@ -49,6 +49,20 @@ deck_profile = "work"
 host = "127.0.0.1"
 port = 8522
 
+# [loops.<name>] — one block per loop this hub manages. None ship in the public
+# core (a loop is where installation policy concentrates — see
+# docs/allowlist.md); this is the shape `bin/ops health`, the hub skill's health
+# pass, and bin/dashboard all read.
+#
+# [loops.example]
+# dir = "loops/example"        # working directory, relative to the repo root
+# skill = "example"            # skill name; the session runs /loop <interval> /<skill>
+# interval = "20m"             # tick cadence; "on-demand" for a manual loop
+# autostart = true             # include in the health sweep and autostart it
+# persona = "the example"      # display name; session title is "<persona> (<name>)"
+# model = "claude-sonnet-5"    # per-loop model, so cheap loops stay cheap
+# role = "one line, shown on the dashboard card"
+
 [usage]
 # Cadence (seconds) for bin/usage-fetch, which populates state/usage/budget.json
 # — the account %-of-limit signal bin/dashboard renders as the header "cap" line

@@ -2,16 +2,17 @@ schema-version = "1.13.0"
 
 ## nano-ops — always-on services, ported from the operations hub.
 ##
-## The four always-on pieces of nano-bill's estate run here as Flox-managed
-## [services] instead of hand-installed systemd --user units. Each is the REAL
-## script from the operations repo (bin/doorbell, bin/dashboard-refresh,
-## bin/dashboard-server, bin/usage-fetch — plus their bin/dashboard dependency),
-## wrapped in the while-true supervisor proven in FINDINGS.md so a hard crash is
-## auto-restarted (process-compose has no native Restart=always).
+## The four always-on pieces of the estate run here as Flox-managed [services]
+## instead of hand-installed systemd --user units: bin/doorbell,
+## bin/dashboard-refresh, bin/dashboard-server, bin/usage-fetch (plus their
+## bin/dashboard dependency), each wrapped in the while-true supervisor proven
+## in FINDINGS.md so a hard crash is auto-restarted (process-compose has no
+## native Restart=always).
 ##
-## Boot-autostart and top-level supervision are still expected to come from ONE
-## systemd --user unit holding a persistent activation open (see FINDINGS.md's
-## recommendation); that unit is not part of this repo.
+## Boot-autostart and top-level supervision come from ONE systemd --user unit
+## holding a persistent activation open — templated at
+## infra/nano-ops-services.service.example and never installed from this repo.
+## Runbook: docs/always-on.md.
 
 
 ## Install Packages --------------------------------------------------

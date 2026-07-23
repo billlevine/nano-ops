@@ -378,13 +378,9 @@ def build_loops(registry: dict, now: float) -> list[dict]:
         "doorbell_alive": db_age is not None and db_age < 90,
     })
 
-    ROLE = {
-        "pr-tracker": "scans PRs, keeps the live work queue",
-        "pr-reviewer": "overnight review + rework + task drain",
-        "mechanic": "nightly self-optimization proposals",
-        "eng-health": "engineering-health gauges (on-demand)",
-        "morning-brief": "06:00 morning brief composer",
-    }
+    # A loop's one-line role is registry data, not code: [loops.<name>].role in
+    # loops.toml. A table of hardcoded descriptions here would be one
+    # installation's loop set baked into a shared renderer.
     for name, cfg in (registry.get("loops") or {}).items():
         persona = cfg.get("persona", name)
         interval = cfg.get("interval", "")
@@ -399,7 +395,7 @@ def build_loops(registry: dict, now: float) -> list[dict]:
             "last_tick": tick, "heartbeat_age": age,
             "freshness": freshness(age, isec),
             "session_present": sess["present"], "session_status": sess["status"],
-            "live_model": sess["model"], "role": ROLE.get(name, ""),
+            "live_model": sess["model"], "role": cfg.get("role", ""),
         })
     return loops
 
@@ -508,8 +504,9 @@ def build_night() -> dict:
 
 def build_focus() -> dict:
     """Read the focus-projects engine's data model (state/focus/focus.json).
-    Pure consumer — focus_projects.py owns all Linear access + scoring; the
-    dashboard only renders. Absent/empty file => not available."""
+    Pure consumer — that loop owns all tracker access and scoring; the dashboard
+    only renders. Absent/empty file (the case with no such loop registered)
+    => not available."""
     model = read_json(STATE / "focus" / "focus.json")
     if not model or not model.get("projects"):
         return {"available": False, "projects": []}
