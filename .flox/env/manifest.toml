@@ -42,6 +42,10 @@ tmux.pkg-path = "tmux"
 git.pkg-path = "git"
 gh.pkg-path = "gh"
 jq.pkg-path = "jq"
+skills-flox.pkg-path = "flox/skills-flox"
+skills-flox.pkg-group = "skills-flox"
+flox-ai.pkg-path = "flox/flox-ai"
+flox-ai.pkg-group = "flox-ai"
 
 
 ## Environment Variables ---------------------------------------------
