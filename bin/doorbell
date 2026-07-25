@@ -59,7 +59,7 @@ HUB = hub_config()
 HUB_PERSONA = HUB.get("persona") or "ops"
 HUB_SESSION = HUB.get("session_title") or f"{HUB_PERSONA} (hub)"
 DECK_PROFILE = (os.environ.get("DOORBELL_DECK_PROFILE")
-                or HUB.get("deck_profile") or "work")
+                or HUB.get("deck_profile") or "ops")
 
 
 def channel_id():

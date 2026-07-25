@@ -38,7 +38,7 @@ DECK_GROUP="$(hub_field group "$PERSONA")"
 # unset or different ambient profile otherwise resolves a hub title against the
 # wrong profile's session store — which has, in practice, launched a live
 # duplicate hub.
-AGENTDECK_PROFILE="$(hub_field deck_profile work)"
+AGENTDECK_PROFILE="$(hub_field deck_profile ops)"
 export AGENTDECK_PROFILE
 
 dash_hostport() {  # echo "<host> <port>" from loops.toml [dashboard]

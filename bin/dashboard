@@ -268,7 +268,7 @@ ESTATE = HUB.get("estate") or "ops"
 # ambient default profile — in particular under a supervised service whose
 # default profile is `default` and would otherwise see nothing.
 DECK_PROFILE = (os.environ.get("DASHBOARD_DECK_PROFILE")
-                or HUB.get("deck_profile") or "work")
+                or HUB.get("deck_profile") or "ops")
 
 
 def deck_session(title: str) -> dict:
