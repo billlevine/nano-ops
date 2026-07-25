@@ -57,8 +57,14 @@ def sessions() -> list[dict[str, Any]]:
     result = deck("list", "--json", check=False)
     if result.returncode:
         raise TestError("cannot list the isolated ops agent-deck group")
+    stdout = (result.stdout or "").strip()
+    # agent-deck ignores --json for the empty case and prints a human
+    # message instead of "[]" (confirmed live, 2026-07-25) -- treat that
+    # specific shape as an empty list rather than a parse failure.
+    if not stdout or stdout.startswith("No sessions found"):
+        return []
     try:
-        data = json.loads(result.stdout or "[]")
+        data = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise TestError("agent-deck returned invalid session JSON") from exc
     if not isinstance(data, list):
