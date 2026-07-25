@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Interactive smoke-test harness for a hub in an isolated nano-ops clone.
+# Prerequisites: flox, agent-deck, and the codex CLI must be on PATH.
+# Example: bin/test-interactive-hub --repo "$PWD" --turns 10 --out /tmp/hub-test
+# WARNING: this starts real local processes and agent-deck sessions.
+# Run it from a real terminal with agent-deck access; do not run it in CI.
+
+set -euo pipefail
+
+MAX_TURNS=10
+TURNS=10
+REPO=""
+OUT=""
+SANDBOX=""
+TRANSCRIPT=""
+checks_passed=0
+completed_turns=0
+main_status=1
+
+usage() {
+  cat <<'EOF'
+Usage: bin/test-interactive-hub --repo PATH [--turns N] [--out DIR]
+
+  --repo PATH  nano-ops checkout to clone (required; never modified)
+  --turns N    maximum probing turns (default 10; maximum 10)
+  --out DIR    output directory (default: a new temporary directory)
+EOF
+}
+
+teardown() {
+  local incoming_status=$?
+  local teardown_failed=0
+  trap - EXIT INT TERM
+  set +e
+
+  agent-deck -p ops session stop "ops (hub)" >/dev/null 2>&1
+  if (( $? != 0 )); then
+    teardown_failed=1
+  fi
+
+  if [[ -n "$SANDBOX" && -d "$SANDBOX" ]]; then
+    flox services stop -d "$SANDBOX" >/dev/null 2>&1
+    if (( $? != 0 )); then
+      teardown_failed=1
+    fi
+    rm -rf -- "$SANDBOX"
+    if (( $? != 0 )); then
+      teardown_failed=1
+    fi
+  fi
+
+  local result="INCONCLUSIVE"
+  local final_status=1
+  if (( checks_passed == 1 && completed_turns >= 1 && teardown_failed == 0 && main_status == 0 && incoming_status == 0 )); then
+    result="PASS"
+    final_status=0
+  elif (( checks_passed == 0 || teardown_failed != 0 || main_status != 0 || incoming_status != 0 )); then
+    result="FAIL"
+  fi
+
+  printf '%s\n' "$result"
+  printf 'Teardown complete: stopped agent-deck session ops (hub), stopped sandbox flox services, and removed %s; transcript retained at %s\n' \
+    "${SANDBOX:-<not-created>}" "${TRANSCRIPT:-<not-created>}"
+  exit "$final_status"
+}
+trap teardown EXIT INT TERM
+
+while (( $# > 0 )); do
+  case "$1" in
+    --repo)
+      [[ $# -ge 2 ]] || { echo "--repo requires a path" >&2; usage >&2; exit 2; }
+      REPO=$2
+      shift 2
+      ;;
+    --turns)
+      [[ $# -ge 2 ]] || { echo "--turns requires a number" >&2; usage >&2; exit 2; }
+      TURNS=$2
+      shift 2
+      ;;
+    --out)
+      [[ $# -ge 2 ]] || { echo "--out requires a directory" >&2; usage >&2; exit 2; }
+      OUT=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      main_status=0
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ -n "$REPO" ]] || { echo "--repo is required" >&2; usage >&2; exit 2; }
+[[ -d "$REPO" ]] || { echo "Repository path is not a directory: $REPO" >&2; exit 2; }
+[[ "$TURNS" =~ ^[1-9][0-9]*$ ]] || { echo "--turns must be a positive integer" >&2; exit 2; }
+(( TURNS <= MAX_TURNS )) || { echo "--turns may not exceed $MAX_TURNS" >&2; exit 2; }
+
+if [[ -z "$OUT" ]]; then
+  OUT=$(mktemp -d "${TMPDIR:-/tmp}/nano-ops-hub-test.XXXXXX")
+else
+  mkdir -p -- "$OUT"
+fi
+OUT=$(cd "$OUT" && pwd -P)
+SANDBOX="$OUT/sandbox-clone"
+TRANSCRIPT="$OUT/transcript.log"
+[[ ! -e "$SANDBOX" ]] || { echo "Sandbox path already exists: $SANDBOX" >&2; exit 2; }
+: >"$TRANSCRIPT"
+
+git clone -- "$REPO" "$SANDBOX"
+
+(
+  cd "$SANDBOX"
+  flox activate --start-services -- bin/ops doctor
+  flox activate -- bin/ops health
+  flox activate -- bin/ops status
+)
+checks_passed=1
+
+for (( turn=1; turn<=TURNS; turn++ )); do
+  driver_output=$(
+    {
+      cat <<'EOF'
+You are driving an interactive smoke test of a sandboxed nano-ops hub. Based on
+the transcript below, produce exactly two single lines:
+QUESTION: <one concise probing message to send to the hub>
+VERDICT: CONTINUE|DONE
+Use DONE only when the transcript already demonstrates that the hub can receive,
+understand, and answer control messages coherently. Do not use markdown fences.
+
+TRANSCRIPT:
+EOF
+      cat "$TRANSCRIPT"
+    } | codex exec --dangerously-bypass-approvals-and-sandbox -
+  )
+
+  question=$(printf '%s\n' "$driver_output" | sed -n 's/^QUESTION:[[:space:]]*//p' | head -n 1)
+  verdict=$(printf '%s\n' "$driver_output" | sed -n 's/^VERDICT:[[:space:]]*//p' | head -n 1)
+  [[ -n "$question" ]] || { echo "Codex driver did not produce a QUESTION" >&2; exit 1; }
+  [[ "$verdict" == "CONTINUE" || "$verdict" == "DONE" ]] || { echo "Codex driver produced an invalid VERDICT" >&2; exit 1; }
+
+  agent-deck -p ops session send "ops (hub)" "$question"
+  sleep 5
+  response=$(agent-deck -p ops session output "ops (hub)")
+  [[ -n "$response" ]] || { echo "Hub produced no readable response" >&2; exit 1; }
+
+  {
+    printf '\n=== TURN %d ===\n' "$turn"
+    printf 'QUESTION: %s\n' "$question"
+    printf 'RESPONSE:\n%s\n' "$response"
+    printf 'VERDICT: %s\n' "$verdict"
+  } >>"$TRANSCRIPT"
+  completed_turns=$turn
+
+  [[ "$verdict" != "DONE" ]] || break
+done
+
+main_status=0
+exit 0
