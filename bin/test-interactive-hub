@@ -48,7 +48,7 @@ def deck(*args: str, check: bool = True, timeout: int = 120
 
 
 def sessions() -> list[dict[str, Any]]:
-    result = deck("ls", "--json", check=False)
+    result = deck("list", "--json", check=False)
     if result.returncode:
         raise TestError("cannot list the isolated ops agent-deck group")
     try:
