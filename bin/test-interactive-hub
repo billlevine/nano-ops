@@ -42,8 +42,14 @@ def command(args: list[str], *, cwd: Path | None = None, check: bool = True,
 
 def deck(*args: str, check: bool = True, timeout: int = 120
          ) -> subprocess.CompletedProcess[str]:
-    """Every deck call pins both the dedicated profile and group."""
-    return command(["agent-deck", "-p", PROFILE, "-g", GROUP, *args],
+    """Pin the profile. -g/--group is dropped: confirmed live (2026-07-25)
+    that agent-deck's global -g flag unconditionally triggers its
+    "cannot launch the TUI inside a session" guard, regardless of
+    subcommand, when this harness itself runs nested inside an
+    agent-deck session (the operator's normal environment). The -p
+    pin plus sessions()'s own per-call group-membership assertion
+    are the safety net instead."""
+    return command(["agent-deck", "-p", PROFILE, *args],
                    check=check, timeout=timeout)
 
 
