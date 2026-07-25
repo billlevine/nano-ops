@@ -31,7 +31,7 @@
 persona = "ops"
 group = "ops"
 estate = "ops"
-deck_profile = "work"
+deck_profile = "ops"
 # session_title = "ops (hub)"
 
 # Slack self-DM channel ID — read by bin/doorbell (the control-channel poller).

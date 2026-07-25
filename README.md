@@ -79,6 +79,31 @@ open "$(bin/ops dashboard url)"     # loopback only
 Then name your installation in `loops.toml` (`[hub]` persona, group, estate,
 control channel) and `bin/ops up` launches the hub session for it.
 
+### Interactive hub smoke test
+
+`bin/test-interactive-hub` creates a throwaway clone, starts its foreground
+Flox services and `ops (hub)` session, and lets an ephemeral Codex CLI driver
+probe the hub for up to ten turns. It requires `git`, `flox`, `agent-deck`, and
+an authenticated `codex` CLI:
+
+```bash
+bin/test-interactive-hub /path/to/nano-ops --ref interactive-hub-test-harness
+```
+
+Run it only from a real terminal/session with permission to start local tmux and
+agent-deck processes. It is intentionally not a CI test and should not be run
+from an already sandboxed agent environment. The source can be a local path or
+Git URL; `--work-dir`, `--transcript`, and `--response-timeout` customize the
+run. The durable transcript defaults to the caller's current directory.
+
+`PASS` means the repo's doctor/status/health gate passed and the Codex driver
+saw coherent, non-crashing answers across useful identity and edge-case probes,
+with no claim that the sandbox used the `work` profile. It is a smoke signal,
+not exhaustive correctness proof. `FAIL` identifies a definite gate,
+conversation, or teardown failure; `INCONCLUSIVE` means the evidence was not
+strong enough within the turn/time limit. The harness always stops the
+profile/group `ops` sessions and Flox services it started and removes its clone.
+
 `flox services stop | restart <name>` manage individual services. Services live
 only for the duration of an activation — an always-on deployment needs one
 persistent activation held open by a supervisor

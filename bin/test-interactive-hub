@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Run a Codex-driven hub smoke test in a disposable nano-ops clone."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Callable
+
+PROFILE = GROUP = "ops"
+HUB = "ops (hub)"
+ACTIVE = {"running", "waiting"}
+
+
+class TestError(RuntimeError):
+    pass
+
+
+def command(args: list[str], *, cwd: Path | None = None, check: bool = True,
+            timeout: int = 120, env: dict[str, str] | None = None
+            ) -> subprocess.CompletedProcess[str]:
+    print("+", " ".join(args), flush=True)
+    result = subprocess.run(args, cwd=cwd, env=env, text=True,
+                            capture_output=True, timeout=timeout)
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if check and result.returncode:
+        raise TestError(f"command failed ({result.returncode}): {' '.join(args)}")
+    return result
+
+
+def deck(*args: str, check: bool = True, timeout: int = 120
+         ) -> subprocess.CompletedProcess[str]:
+    """Every deck call pins both the dedicated profile and group."""
+    return command(["agent-deck", "-p", PROFILE, "-g", GROUP, *args],
+                   check=check, timeout=timeout)
+
+
+def sessions() -> list[dict[str, Any]]:
+    result = deck("ls", "--json", check=False)
+    if result.returncode:
+        raise TestError("cannot list the isolated ops agent-deck group")
+    try:
+        data = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise TestError("agent-deck returned invalid session JSON") from exc
+    if not isinstance(data, list):
+        raise TestError("agent-deck session list was not an array")
+    wrong = [item for item in data if isinstance(item, dict)
+             and item.get("group") not in (None, GROUP)]
+    if wrong:
+        raise TestError("-g ops unexpectedly exposed a non-ops session")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def status(title: str) -> str:
+    for item in sessions():
+        if item.get("title") == title:
+            return str(item.get("status") or "").lower()
+    return ""
+
+
+def wait_for(predicate: Callable[[], bool], description: str, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(2)
+    raise TestError(f"timed out waiting for {description}")
+
+
+def output() -> str:
+    result = deck("session", "output", HUB, check=False, timeout=30)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def await_reply(previous: str, timeout: int) -> str:
+    reply = ""
+
+    def ready() -> bool:
+        nonlocal reply
+        reply = output()
+        return bool(reply and reply != previous and status(HUB) in ACTIVE)
+
+    wait_for(ready, "a new hub response", timeout)
+    return reply
+
+
+def stop_sessions() -> list[str]:
+    stopped: list[str] = []
+    try:
+        current = sessions()
+    except Exception as exc:
+        print(f"teardown warning: cannot enumerate ops sessions: {exc}",
+              file=sys.stderr)
+        return stopped
+    for item in current:
+        title = str(item.get("title") or "")
+        if title and str(item.get("status") or "").lower() in ACTIVE:
+            deck("session", "stop", title, check=False, timeout=45)
+            stopped.append(title)
+    return stopped
+
+
+def read_config(clone: Path) -> dict[str, Any]:
+    code = ("import json,tomllib,sys; "
+            "print(json.dumps(tomllib.load(open(sys.argv[1],'rb'))))")
+    result = command(["python3", "-c", code, str(clone / "loops.toml")])
+    return json.loads(result.stdout)
+
+
+def ask_codex(clone: Path, schema: Path, result_file: Path,
+              transcript: list[dict[str, Any]], turn: int) -> dict[str, str]:
+    prompt = f"""You drive a smoke test of a sandboxed nano-ops hub.
+It must identify as persona/estate/profile/group ops, never work. Review the
+transcript. Return PASS if there is enough coherent, non-crashing evidence,
+FAIL for a definite defect, INCONCLUSIVE if useful testing cannot continue, or
+CONTINUE with one short next question. Across turns probe identity/config, role
+boundaries and health, a harmless nonsense/edge case, and recovery/coherence.
+Never request file mutation, Slack contact, worker launches, or session access.
+Do not use tools. This decision follows hub turn {turn}; 10 is the hard maximum.
+PASS is only a smoke signal, not proof of correctness.
+
+Transcript:
+{json.dumps(transcript, indent=2)}
+"""
+    command([
+        "codex", "exec", "--ephemeral", "--ignore-user-config",
+        "--ignore-rules", "--sandbox", "read-only", "--output-schema",
+        str(schema), "--output-last-message", str(result_file),
+        "--cd", str(clone), prompt,
+    ], timeout=300)
+    try:
+        decision = json.loads(result_file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TestError("Codex did not return a structured decision") from exc
+    if decision.get("verdict") not in {
+        "CONTINUE", "PASS", "FAIL", "INCONCLUSIVE"
+    }:
+        raise TestError("Codex returned an unknown verdict")
+    return decision
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo", help="source nano-ops repository path or URL")
+    parser.add_argument("--ref", help="git ref for the throwaway clone")
+    parser.add_argument("--work-dir", type=Path,
+                        help="parent directory for the throwaway clone")
+    parser.add_argument("--transcript", type=Path,
+                        help="durable transcript JSON path")
+    parser.add_argument("--turns", type=int, default=10,
+                        choices=range(1, 11))
+    parser.add_argument("--response-timeout", type=int, default=240)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = arguments()
+    for executable in ("git", "flox", "agent-deck", "codex"):
+        if shutil.which(executable) is None:
+            raise TestError(f"required command not found: {executable}")
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    transcript_path = (args.transcript or
+                       Path.cwd() / f"interactive-hub-{stamp}.json").resolve()
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="nano-ops-hub-test-",
+                                dir=args.work_dir))
+    clone = root / "repo"
+    activation: subprocess.Popen[str] | None = None
+    transcript: list[dict[str, Any]] = []
+    verdict, reason, exit_code = "INCONCLUSIVE", "test did not start", 2
+
+    def save() -> None:
+        transcript_path.write_text(json.dumps({
+            "verdict": verdict, "reason": reason, "turns": transcript,
+        }, indent=2) + "\n")
+
+    try:
+        active = [item.get("title") for item in sessions()
+                  if str(item.get("status") or "").lower() in ACTIVE]
+        if active:
+            raise TestError(f"ops group is not clean before test: {active}")
+
+        clone_args = ["git", "clone", "--no-local"]
+        if args.ref:
+            clone_args += ["--branch", args.ref]
+        clone_args += [args.repo, str(clone)]
+        command(clone_args, timeout=300)
+
+        ready = root / "activation.ready"
+        hold = "touch \"$1\"; trap 'exit 0' TERM INT; while :; do sleep 30; done"
+        activation_env = os.environ.copy()
+        activation_env["AGENTDECK_PROFILE"] = PROFILE
+        activation = subprocess.Popen([
+            "flox", "activate", "-d", str(clone), "--start-services", "--",
+            "bash", "-c", hold, "hold", str(ready),
+        ], cwd=clone, env=activation_env, text=True)
+        wait_for(ready.exists, "Flox activation", 120)
+        if activation.poll() is not None:
+            raise TestError("foreground Flox activation exited during startup")
+
+        hub_config = read_config(clone).get("hub", {})
+        expected = {"persona": "ops", "group": "ops", "estate": "ops",
+                    "deck_profile": "ops"}
+        actual = {key: hub_config.get(key) for key in expected}
+        if actual != expected:
+            raise TestError(f"unsafe [hub] identity: expected {expected}, got {actual}")
+        if (hub_config.get("slack_channel_id") or
+                (clone / "state/secrets/slack-user-token").exists()):
+            raise TestError("sandbox unexpectedly has Slack configuration")
+
+        sandbox_env = os.environ.copy()
+        sandbox_env["AGENTDECK_PROFILE"] = PROFILE
+        command([str(clone / "bin/ops"), "doctor"], cwd=clone,
+                env=sandbox_env)
+        command([str(clone / "bin/ops"), "up"], cwd=clone,
+                env=sandbox_env, timeout=180)
+        wait_for(lambda: status(HUB) in ACTIVE, "ops hub session", 120)
+        status_result = command([str(clone / "bin/ops"), "status"],
+                                cwd=clone, env=sandbox_env)
+        if HUB not in status_result.stdout or "dashboard-server" not in status_result.stdout:
+            raise TestError("bin/ops status did not show hub and services")
+        health = command([str(clone / "bin/ops"), "health"], cwd=clone,
+                         env=sandbox_env)
+        if "needs-" in health.stdout or "FAIL" in health.stdout:
+            raise TestError("bin/ops health reported an anomaly")
+
+        schema = root / "decision-schema.json"
+        schema.write_text(json.dumps({
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "verdict": {"type": "string", "enum": [
+                    "CONTINUE", "PASS", "FAIL", "INCONCLUSIVE"]},
+                "reason": {"type": "string"},
+                "next_question": {"type": "string"},
+            },
+            "required": ["verdict", "reason", "next_question"],
+        }))
+        decision_file = root / "decision.json"
+        question = ("For this smoke test, briefly summarize your configured "
+                    "persona, estate, agent-deck profile and group, then state "
+                    "your role boundary.")
+        previous = output()
+        for turn in range(1, args.turns + 1):
+            deck("session", "send", HUB, question)
+            reply = await_reply(previous, args.response_timeout)
+            transcript.append({"turn": turn, "question": question,
+                               "response": reply})
+            previous = reply
+            verdict, reason = "INCONCLUSIVE", "awaiting Codex assessment"
+            save()
+            decision = ask_codex(clone, schema, decision_file,
+                                 transcript, turn)
+            verdict, reason = decision["verdict"], decision["reason"]
+            if verdict != "CONTINUE":
+                break
+            if turn == args.turns:
+                verdict = "INCONCLUSIVE"
+                reason = "turn limit reached before the driver reached a verdict"
+                break
+            question = str(decision.get("next_question") or "").strip()
+            if not question:
+                raise TestError("Codex requested another turn without a question")
+        exit_code = 0 if verdict == "PASS" else (1 if verdict == "FAIL" else 2)
+    except (TestError, subprocess.SubprocessError, OSError) as exc:
+        verdict, reason, exit_code = "FAIL", str(exc), 1
+        print(f"ERROR: {exc}", file=sys.stderr)
+    finally:
+        save()
+        print(f"teardown: stopped ops sessions: {stop_sessions() or 'none'}")
+        if clone.exists():
+            command(["flox", "services", "stop", "-d", str(clone)],
+                    check=False, timeout=60)
+        if activation is not None and activation.poll() is None:
+            activation.send_signal(signal.SIGTERM)
+            try:
+                activation.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                activation.kill()
+                activation.wait(timeout=10)
+        remaining: list[str] = []
+        try:
+            wait_for(lambda: not [item for item in sessions()
+                                  if str(item.get("status") or "").lower()
+                                  in ACTIVE], "all ops sessions to stop", 45)
+            remaining = [str(item.get("title")) for item in sessions()
+                         if str(item.get("status") or "").lower() in ACTIVE]
+        except Exception as exc:
+            remaining = [f"verification failed: {exc}"]
+        if remaining:
+            verdict, reason, exit_code = (
+                "FAIL", f"teardown left ops sessions: {remaining}", 1)
+            save()
+            print(f"teardown: FAILED: {remaining}", file=sys.stderr)
+        else:
+            print("teardown: confirmed no running session remains in profile/group ops")
+        shutil.rmtree(root, ignore_errors=True)
+        print(f"teardown: removed throwaway clone {root}")
+
+    print(f"{verdict}: {reason}")
+    print(f"transcript: {transcript_path}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except TestError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        raise SystemExit(1)
