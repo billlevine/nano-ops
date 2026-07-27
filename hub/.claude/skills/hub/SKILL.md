@@ -1,6 +1,6 @@
 ---
 name: hub
-description: One tick of the operations hub — read the operator's control channel, act on every new message with full trust, reply, keep loop sessions healthy, and append to the activity ledger. Run via /loop /hub from a session started in hub/. Use when asked to run the hub, tick the hub, or process the control channel.
+description: One tick of the operations hub — read the operator's control channel (optional; with none configured the tick runs channel-less and takes direct agent-deck input), act on every new message with full trust, reply, keep loop sessions healthy, and append to the activity ledger. Run via /loop /hub from a session started in hub/. Use when asked to run the hub, tick the hub, or process the control channel.
 ---
 
 # Hub tick
@@ -40,11 +40,46 @@ session fresh; live reload has watcher lag.
   plus the `[loops.*]` registry (may be empty). Registry entries may carry a
   `persona` display name — use those in chat; technical names stay for
   agent-deck and registry operations.
+- **If `slack_channel_id` is missing, commented out, or empty, CHANNEL is
+  UNSET and this is a channel-less tick.** See the guard below before doing
+  anything else — most of this skill is skipped, and the tick still completes
+  cleanly.
 - Read `REPO/state/hub/cursor` if it exists → CURSOR (a channel message ts).
 - Control-channel tools come from the Slack MCP connector; if not yet loaded,
-  load them with ToolSearch ("slack read channel send message reaction").
+  load them with ToolSearch ("slack read channel send message reaction"). Skip
+  this entirely when CHANNEL is unset — do not load them, do not call them.
+
+**Channel-less mode (CHANNEL unset).** A control channel is optional
+configuration, not a requirement: the hub is usable as a bare interactive
+agent-deck session with Slack never configured. When CHANNEL is unset:
+
+- Skip §1 (first run) and §2 (read messages) outright — there is nothing to
+  post to, nothing to read, and no cursor to keep. Make NO Slack tool call of
+  any kind, read or write. This is a normal, expected state, not an error, and
+  never gets an `error` ledger line (§7 is about a *configured* channel that
+  fails, which is a different thing).
+- The operator's input path is direct interaction with this session:
+  `agent-deck attach "<persona> (hub)"`, or
+  `agent-deck session send "<persona> (hub)" "<request>"`. Handle such a
+  request with the same §3 classification table and the same full trust —
+  the only differences are that there is no message to react 👀 to, no cursor
+  to advance, and every reply §3 would post to CHANNEL goes into this
+  session's own output instead, where the operator reads it.
+- Everything that does not depend on the channel still runs, in order: §4
+  (ledger), §5 (health pass — including launching, starting and kicking loop
+  sessions), §6 (pacing and the `last_tick` heartbeat). A channel-less tick
+  that finds a clean estate does exactly that and ends — that is success.
+- What is genuinely lost is the asynchronous path: nothing polls on the
+  operator's behalf (`bin/doorbell` idles on the same missing config), so the
+  hub acts when it is spoken to directly or when its own self-paced tick comes
+  around. Say so plainly if asked; do not imply messages are being watched.
+- Configuring `slack_channel_id` later needs no other change — the next tick
+  reads it, §1 runs as a genuine first run, and polling starts.
 
 ## 1. First run
+
+Skipped entirely in channel-less mode (CHANNEL unset) — there is nothing to
+announce and no cursor to seed.
 
 If there is no cursor file: post "⚙️ 🟢 `<persona>` online (first run —
 processing messages from now on)" to CHANNEL, write that message's ts to
@@ -52,6 +87,10 @@ processing messages from now on)" to CHANNEL, write that message's ts to
 this moment is deliberately not processed.
 
 ## 2. Read messages
+
+Skipped entirely in channel-less mode (CHANNEL unset) — no Slack call, no
+cursor read or write; go straight to §5 (or to §3 if the operator sent this
+session something directly).
 
 Read CHANNEL (limit 30). The control channel is a self-DM, so every message —
 the operator's and the hub's — comes from the same user; the hub marks its own:
@@ -62,7 +101,10 @@ cursor over ⚙️-prefixed messages without processing them.
 ## 3. Handle each message — full trust, act immediately
 
 React 👀 to the message first, so the operator sees it was picked up. Then
-classify and act. `<dir>`, `<title>`, `<group>` below come from the registry and
+classify and act. (Channel-less: the request arrived as an agent-deck session
+message — there is nothing to react to and no cursor to advance, so classify
+and act directly, and every reply below lands in this session's output rather
+than in CHANNEL.) `<dir>`, `<title>`, `<group>` below come from the registry and
 `[hub]`; `<model>` from the registry entry.
 
 | Looks like | Do |
@@ -80,7 +122,8 @@ classify and act. `<dir>`, `<title>`, `<group>` below come from the registry and
 
 After handling each message: append its ledger entry, THEN advance
 `REPO/state/hub/cursor` to that message's ts. Cursor-after-handling means a
-crash reprocesses, never drops.
+crash reprocesses, never drops. (Channel-less: ledger it the same way; there is
+no ts, so `refs` is omitted and no cursor is written.)
 
 **Ephemeral session hygiene.** Hub-launched ad hoc sessions are transient by
 design — title them `"ephemeral - <slug>"`. When one finishes and its results
@@ -98,8 +141,9 @@ later message) gets swallowed as the "answer", producing a nonsense response.
 This has been observed live: a doorbell notification's own text ended up in an
 `AskUserQuestion` answer field. So NEVER call a blocking question tool during a
 tick. This is about *how* to ask, not whether — the asks this skill already
-allows stay allowed: post the question as a normal ⚙️ channel message, then END
-the tick cleanly (ledger it, advance the cursor, ScheduleWakeup). The answer
+allows stay allowed: post the question as a normal ⚙️ channel message — or, in
+channel-less mode, state it in this session's output — then END the tick
+cleanly (ledger it, advance the cursor, ScheduleWakeup). The answer
 arrives on a LATER tick as an ordinary channel message and you pick the work
 back up there — full trust, same as any other message. The same rule binds
 anything you dispatch: see Dispatch prompt hygiene.
@@ -168,14 +212,18 @@ in §0) for the loop's `<dir>`, `<interval>`, `<skill>`, and `<model>`.
   `agent-deck session send "<title>" "/loop <interval> /<skill>"`.
 - Crash-loop breaker: before acting on any `needs-start`, check the ledger — if
   it shows 3 restarts of the same loop within the last hour, do NOT restart
-  again; post a ⚠️ to CHANNEL instead.
+  again; post a ⚠️ to CHANNEL instead (channel-less: say it in this session's
+  output and ledger it with kind `"error"`).
 - Append a ledger line for every restart or kick you perform.
 
 Loops that produce output for the operator do not post it themselves — the hub
 is the single writer to the control channel. A loop leaves its output on disk
 under `REPO/state/<name>/` with a marker file; relay it verbatim behind the
 "⚙️ " prefix, then clear the marker and ledger the relay. That relay contract is
-per-loop and lives in the loop's own skill, not here.
+per-loop and lives in the loop's own skill, not here. Channel-less: there is no
+channel to relay into — leave the loop's output file on disk, clear the marker,
+and ledger the relay with the output's path, so the dashboard and the ledger
+carry it and the next tick does not re-report it.
 
 ## 6. Pacing and heartbeat
 
@@ -185,11 +233,17 @@ clearly active, 1800s when idle — the doorbell (`bin/doorbell`, polling the
 control channel every 30s) kicks this session the moment new activity lands, so
 idle ticks are only a health-pass backstop, not the responsiveness path.
 
+Channel-less: the same numbers apply, but no doorbell runs (it idles on the same
+missing config), so a tick is only ever woken by the operator talking to this
+session directly or by the delay expiring — use 1800s unless a direct
+conversation is clearly active.
+
 A session message starting `"doorbell:"` is that kick — run the tick
 immediately. It is internal plumbing: never mention or reply to it in the
 channel; just process whatever new messages it heralds.
 
-**Drain before you sleep.** After you post a reply, do NOT end the turn yet —
+**Drain before you sleep.** (Channel-less: nothing to drain — skip to the
+heartbeat.) After you post a reply, do NOT end the turn yet —
 re-read CHANNEL once more. If new non-⚙️ messages arrived while you were
 working, handle them in this same turn and loop again; only ScheduleWakeup once
 a re-read comes back clean. During an active back-and-forth this catches
@@ -202,6 +256,10 @@ liveness signal `bin/ops up` uses to detect a dead loop after a restart —
 scheduled `/loop` wakeups do not survive a process restart.
 
 ## 7. Control channel unreachable
+
+This section is about a channel that is CONFIGURED and failing. An unset
+`slack_channel_id` is not a failure — that is channel-less mode (§0), and it
+never produces an error ledger line or a retry.
 
 If the channel's MCP calls fail: append a ledger entry (kind `"error"`), still
 run the health pass, and let the next tick retry (cap effective backoff at 10m).

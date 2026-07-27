@@ -9,6 +9,12 @@ Your job is to run `/loop /hub` (self-paced) and keep it running. Each tick
 reads the operator's control channel, acts on new messages with full trust,
 replies, keeps loop sessions healthy, and appends to the activity ledger.
 
+The control channel is optional. If `[hub].slack_channel_id` is unset in
+`../loops.toml`, the tick runs **channel-less**: it makes no Slack call at all,
+still runs the health pass, the ledger and the heartbeat, and takes the
+operator's requests directly through this agent-deck session (`attach` or
+`session send`), replying here. See §0 of the hub skill.
+
 - If you are reading this at session start and no loop is active: run
   `/loop /hub` now.
 - Every tick re-invokes the hub skill via the Skill tool (`/hub`), and that is

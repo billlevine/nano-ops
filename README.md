@@ -30,6 +30,21 @@ installation rather than the neutral defaults. Then:
 bin/ops up
 ```
 
+**Slack is optional.** `loops.toml` ships with no `slack_channel_id`, and the
+hub runs that way on purpose: with no channel configured the tick makes no
+Slack call at all — it skips every channel read and write, and still runs the
+health pass, the ledger, and its heartbeat. You drive it directly from the
+terminal instead, and it answers in the session:
+
+```bash
+agent-deck session send "ops (hub)" "status"   # or: agent-deck attach "ops (hub)"
+```
+
+What you give up is the asynchronous path — nothing polls on your behalf
+(`bin/doorbell` idles on the same missing config), so the hub acts when you talk
+to it or when its own self-paced tick comes around. Fill in `slack_channel_id`
+later and the next tick starts polling; nothing else changes.
+
 Once it's up, the everyday handles:
 
 ```bash
@@ -55,7 +70,8 @@ bin/dashboard-refresh  keeps state/dashboard.json fresh via `dashboard --json`
 bin/dashboard-server   loopback-only static server for the dashboard (allowlist)
 bin/usage-fetch        writes state/usage/budget.json from Anthropic's usage API
 bin/followups          durable standing-action-item store
-tests/                 test_dashboard.py, test_followups.py, test-interactive-hub
+tests/                 test_dashboard.py, test_followups.py, test_hub_skill.py,
+                       test-interactive-hub
 .flox/env/manifest.toml  toolchain + [services], each under the supervisor wrapper
 loops.example.toml     committed sample registry (copy → loops.toml)
 infra/nano-ops-services.service.example
@@ -82,11 +98,15 @@ data are not — is what keeps it that way.
 
 `tests/test_dashboard.py` and `tests/test_followups.py` are self-contained
 `unittest` suites over the dashboard renderer and the followups store. Each runs
-against a fresh tempdir and never touches real `state/`:
+against a fresh tempdir and never touches real `state/`. `tests/test_hub_skill.py`
+covers the hub tick's channel-less guard — the invariant behind "Slack is
+optional" — by checking the skill still states it everywhere the tick would
+otherwise touch the channel:
 
 ```bash
 python3 tests/test_dashboard.py
 python3 tests/test_followups.py
+python3 tests/test_hub_skill.py
 ```
 
 ### Interactive hub smoke test
@@ -136,7 +156,9 @@ The services approach is being proven **here first**, then folded back upstream.
 
 - **No Slack token here.** There is no `state/secrets/slack-user-token`, so
   `bin/doorbell` exits cleanly on the missing-token path each cycle and does
-  nothing — the supervisor just restarts it. Nothing is sent to Slack.
+  nothing — the supervisor just restarts it. The hub tick guards the same way:
+  with no `slack_channel_id` it runs channel-less and makes no Slack call at
+  all. Nothing is sent to Slack.
 - **No residue.** When the activation exits, all services stop and no process
   survives. `state/` and `loops.toml` are gitignored, so nothing runtime is
   committed.
