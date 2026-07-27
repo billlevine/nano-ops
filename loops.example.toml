@@ -50,9 +50,9 @@ host = "127.0.0.1"
 port = 8522
 
 # [loops.<name>] — one block per loop this hub manages. No REAL loop ships in
-# the public core (a loop is where installation policy concentrates — see
-# docs/allowlist.md); this is the shape `bin/ops health`, the hub skill's health
-# pass, and bin/dashboard all read.
+# the public core (a loop is where installation policy concentrates, and the
+# allowlist rule keeps policy out); this is the shape `bin/ops health`, the hub
+# skill's health pass, and bin/dashboard all read.
 #
 # The one loop directory that does ship is loops/example/ — the copyable
 # template (CLAUDE.md + skill) documenting the contract every loop owes the

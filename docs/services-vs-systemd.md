@@ -1,68 +1,21 @@
-# Spike: Flox `[services]` vs systemd `--user` for the always-on pieces
+# Flox `[services]` vs systemd `--user` for the always-on pieces
 
-**Date:** 2026-07-22 · **Flox:** 1.13.2 · **process-compose:** 1.94.0 (bundled)
-**Scope:** a non-invasive prototype in its own directory. The live
-installation this was measured against — its repo, its `loops.toml`, and its
-systemd `--user` services — was **not touched** (verified read-only: its
-`doorbell.service` stayed `active/running` on the same PID throughout, up
-continuously since the day before).
+Why the always-on set is declared as Flox `[services]` with each command wrapped
+in a `while true` supervisor, and why boot survival still needs exactly one
+systemd unit. Measured on Flox 1.13.2 with the bundled process-compose 1.94.0.
 
-## Update — promoted from spike to the real seed (2026-07-22)
+## What was measured
 
-This directory is no longer a throwaway. It is now the **working seed of the
-public `nano-ops` release repo**, and the **real** services port lives here
-first (guiding architecture: private fork + public upstream — see `README.md`
-and the 2026-07-22 sharing/layering research).
+Three services, chosen to probe distinct behaviors, over a side-effect-free
+stand-in for `bin/doorbell` (`doorbell-sim`: the same runtime shape — infinite
+poll loop, per-iteration heartbeat file, stdout logging — but no API calls and
+no reads of live `state/`):
 
-What changed since the original spike below:
-
-- The sim stand-ins (`bin/doorbell-sim`, `bin/doorbell.real`) are gone. The
-  **real** hub scripts were ported in: `bin/doorbell`,
-  `bin/dashboard`, `bin/dashboard-refresh`, `bin/dashboard-server`,
-  `bin/usage-fetch`.
-- `[services]` now defines the four real always-on services, each wrapped in the
-  `while true` supervisor proven below (the in-manifest `Restart=always`
-  substitute). Config/runtime (`loops.toml`, `state/`) are gitignored and seeded
-  by the `[hook]` on first activation.
-- **Verified live here** (fresh checkout + `flox activate --start-services`): all
-  four services `Running`; `flox services status/logs/restart/stop` all work;
-  `doorbell` exits cleanly on the missing-token path and the supervisor restarts
-  it (safe by construction — no token in this repo); `dashboard-server` serves
-  `http://127.0.0.1:8522/dashboard.{html,json}` (alt port so it coexists with a
-  live installation's dashboard on `:8422`); `usage-fetch` wrote
-  `state/usage/budget.json` from the read-only usage API; restart rotated the PID;
-  stop left all `Completed` with **no surviving processes**. The live
-  installation's services were not touched.
-
-The capability findings below (from the original spike) still stand and remain
-the evidence base for the port.
-
-## Question
-
-Can a Flox environment define a `[services]` entry that runs `bin/doorbell`
-(a 30s Slack-DM poller) as a Flox-managed service instead of a hand-installed
-systemd `--user` unit? Worth porting the real services over later?
-
-## What was built
-
-_(Original spike — superseded by the real port described in the Update above.
-The sim files no longer exist; kept here as the record of how the findings were
-obtained.)_
-
-- `bin/doorbell.real` — verbatim copy of the hub's `bin/doorbell` (reference only).
-- `bin/doorbell-sim` — a **faithful, side-effect-free** stand-in: same runtime
-  shape (infinite poll loop, per-iteration heartbeat file, stdout logging) but
-  **no Slack API calls, no `agent-deck` kicks, no reads of live `state/`**. This
-  is what actually runs as the service, so the spike exercises Flox's lifecycle
-  without any risk to the live hub. Knobs via env: `SIM_POLL_S`, `SIM_CRASH_AFTER`.
-- `.flox/env/manifest.toml` — three services, deliberately chosen to probe
-  distinct behaviors:
-  - `doorbell`  — the clean always-on case (`exec python3 …`).
-  - `crasher`   — same sim forced to `exit(1)` after 3 ticks (crash-restart probe).
-  - `resilient` — the same crash wrapped in a `while` supervisor loop
-    (in-manifest crash-restart workaround).
-
-### The manifest (the part that matters)
+- `doorbell`  — the clean always-on case (`exec python3 …`).
+- `crasher`   — the same stand-in forced to `exit(1)` after 3 ticks
+  (crash-restart probe).
+- `resilient` — the same crash wrapped in a `while` supervisor loop
+  (in-manifest crash-restart workaround).
 
 ```toml
 [services]
@@ -78,8 +31,8 @@ resilient.command = '''
 '''
 ```
 
-A real port would be a one-liner per unit, e.g.:
-`doorbell.command = '''exec python3 "$FLOX_ENV_PROJECT/bin/doorbell"'''`
+A real port is a one-liner per unit, e.g.
+`doorbell.command = '''exec python3 "$FLOX_ENV_PROJECT/bin/doorbell"'''`.
 
 ## Results — what works
 
@@ -151,7 +104,10 @@ spot (mitigated by the `while` wrapper) and the async-stop wrinkle. Net: worth
 doing; the manifest is clean and the lifecycle UX is good. Don't drop systemd
 entirely — it's still needed for boot + top-level supervision.
 
-## Reproduce (real port)
+## Reproduce
+
+Against a checkout of this repo, to confirm the ported services behave as
+described above:
 
 ```bash
 cd <this repo>

@@ -6,8 +6,8 @@ schema-version = "1.13.0"
 ## instead of hand-installed systemd --user units: bin/doorbell,
 ## bin/dashboard-refresh, bin/dashboard-server, bin/usage-fetch (plus their
 ## bin/dashboard dependency), each wrapped in the while-true supervisor proven
-## in FINDINGS.md so a hard crash is auto-restarted (process-compose has no
-## native Restart=always).
+## in docs/services-vs-systemd.md so a hard crash is auto-restarted
+## (process-compose has no native Restart=always).
 ##
 ## Boot-autostart and top-level supervision come from ONE systemd --user unit
 ## holding a persistent activation open — templated at

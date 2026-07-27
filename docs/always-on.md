@@ -4,7 +4,7 @@ The always-on set (doorbell, dashboard-refresh, dashboard-server, usage-fetch)
 is declared as Flox `[services]` in `.flox/env/manifest.toml`. That gives one
 declarative, in-repo, versioned definition and one `flox services` UX — but it
 does **not** give boot survival, because of two measured gaps
-([`../FINDINGS.md`](../FINDINGS.md)):
+([`services-vs-systemd.md`](services-vs-systemd.md)):
 
 1. **Services live only inside an activation.** When the owning activation
    exits, every service stops and no process survives. There is no boot
