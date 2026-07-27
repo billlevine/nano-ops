@@ -7,46 +7,41 @@ is declarative, in-repo, versioned, and reproducible.
 
 ## Quickstart
 
+**1. Activate the environment.** The Flox `[hook]` seeds `loops.toml` from
+`loops.example.toml` if it doesn't exist yet and renders the shell.
+
 ```bash
-flox activate --start-services      # hook seeds loops.toml + renders the shell
-bin/ops doctor                      # preflight: toolchain, config, invariants
+flox activate --start-services
+```
+
+**2. Run the preflight.** Checks the toolchain, the config, and the invariants
+(including that `ANTHROPIC_API_KEY` is unset). A missing Slack channel or token
+is reported as a skip, not a failure.
+
+```bash
+bin/ops doctor
+```
+
+**3. Name your installation, then start the hub.** Edit the `[hub]` block in
+`loops.toml` — persona, group, estate, control channel — so it identifies your
+installation rather than the neutral defaults. Then:
+
+```bash
+bin/ops up
+```
+
+Once it's up, the everyday handles:
+
+```bash
 bin/ops services status             # NAME / STATUS / PID for all four
 bin/ops services logs doorbell      # live stdout+stderr
 open "$(bin/ops dashboard url)"     # loopback only
 ```
 
-Then name your installation in `loops.toml` (`[hub]` persona, group, estate,
-control channel) and `bin/ops up` launches the hub session for it.
-
 `flox services stop | restart <name>` manage individual services. Services live
 only for the duration of an activation — an always-on deployment needs one
 persistent activation held open by a supervisor
 ([`docs/always-on.md`](./docs/always-on.md)).
-
-### Interactive hub smoke test
-
-`tests/test-interactive-hub` creates a throwaway clone, starts its foreground
-Flox services and `ops (hub)` session, and lets an ephemeral Codex CLI driver
-probe the hub for up to ten turns. It requires `git`, `flox`, `agent-deck`, and
-an authenticated `codex` CLI:
-
-```bash
-tests/test-interactive-hub /path/to/nano-ops --ref interactive-hub-test-harness
-```
-
-Run it only from a real terminal/session with permission to start local tmux and
-agent-deck processes. It is intentionally not a CI test and should not be run
-from an already sandboxed agent environment. The source can be a local path or
-Git URL; `--work-dir`, `--transcript`, and `--response-timeout` customize the
-run. The durable transcript defaults to the caller's current directory.
-
-`PASS` means the repo's doctor/status/health gate passed and the Codex driver
-saw coherent, non-crashing answers across useful identity and edge-case probes,
-with no claim that the sandbox used the `work` profile. It is a smoke signal,
-not exhaustive correctness proof. `FAIL` identifies a definite gate,
-conversation, or teardown failure; `INCONCLUSIVE` means the evidence was not
-strong enough within the turn/time limit. The harness always stops the
-profile/group `ops` sessions and Flox services it started and removes its clone.
 
 ## What's inside
 
@@ -83,14 +78,46 @@ the loop registry all resolve from `loops.toml` at runtime, defaulting to a
 neutral `"ops"`. An allowlist rule — mechanism is public, identity, policy and
 data are not — is what keeps it that way.
 
+## Testing
+
+`tests/test_dashboard.py` and `tests/test_followups.py` are self-contained
+`unittest` suites over the dashboard renderer and the followups store. Each runs
+against a fresh tempdir and never touches real `state/`:
+
+```bash
+python3 tests/test_dashboard.py
+python3 tests/test_followups.py
+```
+
+### Interactive hub smoke test
+
+`tests/test-interactive-hub` creates a throwaway clone, starts its foreground
+Flox services and `ops (hub)` session, and lets an ephemeral Codex CLI driver
+probe the hub for up to ten turns. It requires `git`, `flox`, `agent-deck`, and
+an authenticated `codex` CLI:
+
+```bash
+tests/test-interactive-hub /path/to/nano-ops --ref interactive-hub-test-harness
+```
+
+Run it only from a real terminal/session with permission to start local tmux and
+agent-deck processes. It is intentionally not a CI test and should not be run
+from an already sandboxed agent environment. The source can be a local path or
+Git URL; `--work-dir`, `--transcript`, and `--response-timeout` customize the
+run. The durable transcript defaults to the caller's current directory.
+
+`PASS` means the repo's doctor/status/health gate passed and the Codex driver
+saw coherent, non-crashing answers across useful identity and edge-case probes,
+with no claim that the sandbox used the `work` profile. It is a smoke signal,
+not exhaustive correctness proof. `FAIL` identifies a definite gate,
+conversation, or teardown failure; `INCONCLUSIVE` means the evidence was not
+strong enough within the turn/time limit. The harness always stops the
+profile/group `ops` sessions and Flox services it started and removes its clone.
+
 ## Guiding architecture — private fork + public upstream
 
 The decisive shape:
 
-- **A brand-new public `nano-ops` core repo, built from an allowlist** —
-  never by flipping the visibility of a live installation's repo, whose git
-  history would retain personal state and secrets. **This directory is the seed
-  of that public core**, and an allowlist rule decides what may enter it.
 - **A live installation stays a private fork** that adds
   `upstream → nano-ops` and pulls improvements via `git fetch upstream` +
   `git rebase upstream/main`. Mechanism is developed here and flows down;
@@ -110,11 +137,6 @@ The services approach is being proven **here first**, then folded back upstream.
 - **No Slack token here.** There is no `state/secrets/slack-user-token`, so
   `bin/doorbell` exits cleanly on the missing-token path each cycle and does
   nothing — the supervisor just restarts it. Nothing is sent to Slack.
-- **Coexists with the live hub.** `dashboard-server` binds `127.0.0.1:8522`
-  (not the operations default `8422`), so it runs alongside a live operations
-  dashboard on the same host without a port conflict. `bin/usage-fetch` only
-  makes a **read-only** GET to the usage API. Nothing touches the live
-  `operations` repo or its services.
 - **No residue.** When the activation exits, all services stop and no process
   survives. `state/` and `loops.toml` are gitignored, so nothing runtime is
   committed.
