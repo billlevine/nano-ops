@@ -1,8 +1,7 @@
 # nano-ops — architecture
 
 What this repo is, and why it is shaped this way. Companion to
-[`../README.md`](../README.md) (the private-fork/public-upstream model),
-[`allowlist.md`](allowlist.md) (what may live here), and
+[`../README.md`](../README.md) (the private-fork/public-upstream model) and
 [`always-on.md`](always-on.md) (surviving reboot).
 
 ## Purpose
@@ -63,7 +62,7 @@ process-compose has no restart policy, so each service command is wrapped in a
 `while true` supervisor (the in-manifest `Restart=always` substitute); and
 services live only inside an activation, so boot survival needs exactly one
 persistent activation held open — see [`always-on.md`](always-on.md). The full
-evidence is in [`../FINDINGS.md`](../FINDINGS.md).
+evidence is in [`services-vs-systemd.md`](services-vs-systemd.md).
 
 ## Invariants
 

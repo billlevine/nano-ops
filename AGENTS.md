@@ -7,9 +7,10 @@ the whole estate is declarative, in-repo, and reproducible from a clone.
 
 This is the **public core**. It carries mechanism, never one installation's
 identity or data: who the operator is, which channel, which loops, and which
-repos all live in a gitignored `loops.toml` and `state/`. See
-[`docs/allowlist.md`](docs/allowlist.md) for what belongs here and what does
-not, and [`README.md`](README.md) for the private-fork/public-upstream shape.
+repos all live in a gitignored `loops.toml` and `state/`. An allowlist rule
+decides what belongs here and what does not — mechanism is public, identity,
+policy and data are not. See [`README.md`](README.md) for the
+private-fork/public-upstream shape.
 
 ## Map
 

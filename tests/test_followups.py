@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for bin/followups: the durable standing-action-item store that a
 loop's queue-exit sweep files internal (non-PR) work into.
-Run: python3 test_followups.py
+Run: python3 tests/test_followups.py
 
 Every test points $FOLLOWUPS_STATE_DIR at a fresh tempdir — never the real
 state/followups/.
@@ -13,7 +13,8 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "followups")
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "..", "bin", "followups")
 
 
 def run_cli(args, state_dir):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for bin/dashboard — the pure-reader half of the estate renderer.
-Run: python3 bin/test_dashboard.py
+Run: python3 tests/test_dashboard.py
 
 bin/dashboard is a PURE READER, so everything worth testing here is a function
 of on-disk state and nothing else. Each test therefore points the reader at a
@@ -14,7 +14,7 @@ answer would silently corrupt:
     attribution, all of which feed the header the operator reads as a budget
   * identity parameterization — that persona, group, estate and every session
     title resolve from loops.toml rather than from anything baked into the code
-    (the invariant in CLAUDE.md and docs/allowlist.md)
+    (the identity-is-configuration invariant in CLAUDE.md)
 
 Nothing here names an operator, a persona, a channel, a host or an absolute
 path; the fixtures invent neutral ones, exactly as a stranger's install would.
@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent.parent / "bin"
 _loader = SourceFileLoader("_dashboard", str(_HERE / "dashboard"))
 _spec = importlib.util.spec_from_loader("_dashboard", _loader)
 dash = importlib.util.module_from_spec(_spec)
