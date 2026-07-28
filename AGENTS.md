@@ -20,8 +20,9 @@ private-fork/public-upstream shape.
 - `loops.toml` — per-installation registry (gitignored); `loops.example.toml` is
   the committed documented form, and the Flox `[hook]` seeds one from the other
 - `bin/ops` — up | status | health | doctor | services | dashboard | compact
-- `bin/doorbell` — zero-token 30s control-channel poller that kicks the hub on
-  new activity; its token is a file at `state/secrets/slack-user-token`
+- `bin/doorbell` — zero-token poller over every `[[hub.inbox]]` in `loops.toml`
+  (each on its own rate and cursor) that kicks the hub on new activity; its
+  token is a file at `state/secrets/slack-user-token`
 - `bin/dashboard`, `bin/dashboard-refresh`, `bin/dashboard-server` — the Tier-1
   local estate dashboard: renderer, regenerator, loopback-only server
 - `bin/usage-fetch` — writes `state/usage/budget.json`, the budget signal

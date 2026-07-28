@@ -1,24 +1,57 @@
 #!/usr/bin/env python3
-"""doorbell — zero-token fast poller for the hub's control channel.
+"""doorbell — zero-token fast poller for the hub's inboxes.
 
-Polls the Slack self-DM every POLL_S seconds using a personal Slack user
-token (stdlib only, no model calls). When a message newer than the hub's
-cursor appears that isn't a hub post (⚙️ prefix), it kicks the hub session
-via `agent-deck session send` so the hub ticks immediately instead of waiting
-out its idle backoff. Read-only by design: never advances the cursor,
-never replies — the hub stays the single writer.
+Polls every inbox declared in loops.toml (`[[hub.inbox]]`) using a personal
+Slack user token (stdlib only, no model calls). Each inbox runs on its OWN
+poll_seconds timer, keeps its OWN cursor, and has its OWN kick cooldown —
+a chatty channel never starves a quiet one and vice versa. When a message
+newer than the hub's cursor for that inbox appears that isn't a hub post
+(⚙️ prefix), it kicks the hub session via `agent-deck session send` so the
+hub ticks immediately instead of waiting out its idle backoff. The kick
+names the inbox purely for observability; the hub tick still re-reads every
+inbox, which is what keeps this simple and crash-safe.
+
+Read-only by design: never advances a cursor, never replies — the hub
+stays the single writer. A brand-new inbox has no cursor file yet, so its
+first poll sees the channel's recent history and kicks once; the hub
+initialises that inbox's cursor on the tick that follows, and polls go
+quiet from there.
 
 Operator identity (which agent-deck session to kick, under which profile) is
-NOT baked in: it comes from loops.toml [hub] — see loops.example.toml.
+NOT baked in: it comes from loops.toml [hub], defaulting to the neutral
+"ops" — see loops.example.toml.
+
+Config (see loops.example.toml):
+
+    [hub]
+    persona = "ops"
+    slack_channel_id = "..."       # back-compat; names the PRIMARY inbox
+
+    [[hub.inbox]]
+    name = "self-dm"
+    channel_id = "..."
+    disposition = "full-trust"
+    poll_seconds = 30
+
+The inbox whose channel_id equals [hub].slack_channel_id is the PRIMARY one
+and keeps the historical bare cursor file (state/hub/cursor) — the operator's
+own control channel. Every other inbox gets state/hub/cursor.<name>. With no
+[[hub.inbox]] tables at all, slack_channel_id alone still works and is
+treated as a single full-trust inbox named "self-dm".
+
+`bin/doorbell --check` prints the resolved inbox table and exits without
+polling (used by `bin/ops doctor`).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import tomllib
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOKEN_FILE = os.path.join(REPO, "state", "secrets", "slack-user-token")
@@ -26,10 +59,16 @@ HUB_DIR = os.path.join(REPO, "state", "hub")
 HUB_CURSOR = os.path.join(HUB_DIR, "cursor")
 DOORBELL_ALIVE = os.path.join(HUB_DIR, "doorbell_alive")
 STATE_DIR = os.path.join(REPO, "state", "doorbell")
-LAST_KICK = os.path.join(STATE_DIR, "last_kick")
-POLL_S = 30
+DEFAULT_POLL_S = 30
+# Upper bound on one sleep, so DOORBELL_ALIVE keeps getting stamped at a
+# steady rate even when every configured inbox polls slowly.
+ALIVE_S = 30
 KICK_COOLDOWN_S = 120
-KICK_MSG = "doorbell: new control-channel activity — run one hub tick now"
+# A misconfigured inbox (missing token scope, channel the token can't see)
+# fails on every poll. Log the first occurrence, then repeat it at most this
+# often, so one bad inbox can't bury the others' output in journald.
+ERROR_REPEAT_S = 600
+DEFAULT_DISPOSITION = "conservative"  # unstated trust is never full trust
 
 
 def read_file(path, default=""):
@@ -40,13 +79,22 @@ def read_file(path, default=""):
         return default
 
 
-def hub_config() -> dict:
+def safe_name(raw):
+    """Inbox names become filename suffixes — keep them boring."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw)).strip("-") or "inbox"
+
+
+def load_config(path=None):
+    with open(path or os.path.join(REPO, "loops.toml"), "rb") as f:
+        return tomllib.load(f)
+
+
+def hub_config():
     """loops.toml [hub] — the per-installation operator identity. Never raises:
-    a missing/unparseable registry degrades to defaults, and main() then exits
-    on the missing channel id with a readable message."""
+    a missing/unparseable registry degrades to neutral defaults here, and main()
+    reports the real config error when it re-reads the file strictly."""
     try:
-        with open(os.path.join(REPO, "loops.toml"), "rb") as f:
-            hub = tomllib.load(f).get("hub", {})
+        hub = load_config().get("hub", {})
     except (OSError, tomllib.TOMLDecodeError):
         return {}
     return hub if isinstance(hub, dict) else {}
@@ -62,14 +110,77 @@ DECK_PROFILE = (os.environ.get("DOORBELL_DECK_PROFILE")
                 or HUB.get("deck_profile") or "ops")
 
 
-def channel_id():
-    return HUB.get("slack_channel_id")
+@dataclass(frozen=True)
+class Inbox:
+    name: str
+    channel_id: str
+    disposition: str
+    poll_seconds: int
+    primary: bool
+
+    @property
+    def cursor_path(self):
+        """The hub's cursor for this inbox. The primary inbox keeps the bare
+        historical path; everything else is suffixed with the inbox name."""
+        return HUB_CURSOR if self.primary else os.path.join(HUB_DIR, f"cursor.{self.name}")
+
+    @property
+    def last_kick_path(self):
+        return os.path.join(STATE_DIR, f"last_kick.{self.name}")
 
 
-def fetch_messages(token, channel):
-    query = urllib.parse.urlencode({"channel": channel, "limit": 10})
+def load_inboxes(config):
+    """[hub] → the list of inboxes to poll, oldest field wins for back-compat."""
+    hub = config.get("hub") or {}
+    legacy_id = str(hub.get("slack_channel_id") or "").strip()
+    entries = hub.get("inbox") or []
+    if not entries and legacy_id:
+        entries = [{"name": "self-dm", "channel_id": legacy_id,
+                    "disposition": "full-trust"}]
+    parsed, seen = [], set()
+    for entry in entries:
+        channel_id = str(entry.get("channel_id") or "").strip()
+        if not channel_id:
+            raise ValueError(f"[[hub.inbox]] entry without channel_id: {entry!r}")
+        name = safe_name(entry.get("name") or channel_id)
+        if name in seen:
+            raise ValueError(f"duplicate [[hub.inbox]] name: {name}")
+        seen.add(name)
+        poll = int(entry.get("poll_seconds") or DEFAULT_POLL_S)
+        if poll < 1:
+            raise ValueError(f"inbox {name}: poll_seconds must be >= 1")
+        parsed.append({
+            "name": name,
+            "channel_id": channel_id,
+            "disposition": str(entry.get("disposition") or DEFAULT_DISPOSITION),
+            "poll_seconds": poll,
+        })
+    if not parsed:
+        return []
+    # PRIMARY = the inbox naming [hub].slack_channel_id (the operator's own
+    # control channel), which is both the bare-cursor owner and the hub's
+    # escalation target. Falls back to the first entry so a config that drops
+    # the legacy field still resolves.
+    primary = next((p for p in parsed if p["channel_id"] == legacy_id), parsed[0])
+    return [Inbox(primary=(p is primary), **p) for p in parsed]
+
+
+def history_query(channel, oldest=None):
+    """Slack conversations.history query. When we already have the hub's cursor
+    for this inbox, ask only for messages *after* it (oldest + inclusive=false)
+    so a quiet poll downloads nothing instead of re-fetching the same last 10
+    every interval. This holds per inbox — every channel polls cheap, not just
+    the first one."""
+    params = {"channel": channel, "limit": 10}
+    if oldest and float(oldest) > 0:
+        params["oldest"] = oldest
+        params["inclusive"] = "false"
+    return urllib.parse.urlencode(params)
+
+
+def fetch_messages(token, channel, oldest=None):
     req = urllib.request.Request(
-        f"https://slack.com/api/conversations.history?{query}",
+        f"https://slack.com/api/conversations.history?{history_query(channel, oldest)}",
         headers={"Authorization": f"Bearer {token}"},
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -79,8 +190,7 @@ def fetch_messages(token, channel):
     return data.get("messages", [])
 
 
-def needs_kick(messages):
-    cursor = float(read_file(HUB_CURSOR, "0") or 0)
+def needs_kick(messages, cursor):
     for m in messages:
         if m.get("subtype"):  # edits, joins, etc.
             continue
@@ -92,9 +202,14 @@ def needs_kick(messages):
     return None
 
 
-def kick():
+def kick_message(inbox_name):
+    return f"doorbell: new activity in {inbox_name} — run one hub tick now"
+
+
+def kick(inbox_name):
     result = subprocess.run(
-        ["agent-deck", "-p", DECK_PROFILE, "session", "send", HUB_SESSION, KICK_MSG],
+        ["agent-deck", "-p", DECK_PROFILE, "session", "send", HUB_SESSION,
+         kick_message(inbox_name)],
         capture_output=True,
         text=True,
         timeout=30,
@@ -102,6 +217,31 @@ def kick():
     if result.returncode != 0:
         print(f"doorbell: kick failed: {result.stderr.strip()}", file=sys.stderr, flush=True)
     return result.returncode == 0
+
+
+def poll_inbox(token, inbox, now=None):
+    """One poll of one inbox. Returns the ts that triggered a kick, else None."""
+    # One cursor read drives both the server-side oldest filter and the local
+    # newer-than check, so a concurrent hub cursor advance can't split the two.
+    cursor_str = read_file(inbox.cursor_path, "0") or "0"
+    try:
+        cursor = float(cursor_str)
+    except ValueError:
+        cursor_str, cursor = "0", 0.0
+    oldest = cursor_str if cursor > 0 else None
+    ts = needs_kick(fetch_messages(token, inbox.channel_id, oldest), cursor)
+    if not ts:
+        return None
+    now = time.time() if now is None else now
+    last = float(read_file(inbox.last_kick_path, "0") or 0)
+    # Cooldown is per inbox: a chatty channel must not swallow another
+    # channel's kick, and the hub re-reads every inbox on each tick anyway.
+    if now - last < KICK_COOLDOWN_S or not kick(inbox.name):
+        return None
+    with open(inbox.last_kick_path, "w") as f:
+        f.write(str(now))
+    print(f"doorbell: kicked hub for {inbox.name} msg ts={ts}", flush=True)
+    return ts
 
 
 def mark_alive():
@@ -113,29 +253,47 @@ def mark_alive():
 
 
 def main():
+    check_only = "--check" in sys.argv[1:]
+    try:
+        inboxes = load_inboxes(load_config())
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        sys.exit(f"doorbell: bad inbox config: {exc}")
+    if not inboxes:
+        sys.exit("doorbell: no inboxes configured ([[hub.inbox]] in loops.toml)")
+    if check_only:
+        for ib in inboxes:
+            flag = " (primary)" if ib.primary else ""
+            print(f"{ib.name}\t{ib.channel_id}\t{ib.disposition}\t{ib.poll_seconds}s{flag}")
+        return
     token = read_file(TOKEN_FILE)
     if not token:
         sys.exit(f"doorbell: no token at {TOKEN_FILE}")
-    channel = channel_id()
-    if not channel:
-        sys.exit("doorbell: no [hub].slack_channel_id in loops.toml")
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(HUB_DIR, exist_ok=True)
-    print(f"doorbell: watching {channel} every {POLL_S}s, "
-          f"kicking {HUB_SESSION!r} (profile {DECK_PROFILE})", flush=True)
+    for ib in inboxes:
+        print(f"doorbell: watching {ib.name} ({ib.channel_id}, {ib.disposition}) "
+              f"every {ib.poll_seconds}s", flush=True)
+    print(f"doorbell: kicking {HUB_SESSION!r} (profile {DECK_PROFILE})", flush=True)
+    # Independent timers: each inbox is due on its own poll_seconds, measured
+    # from the start of its previous poll. All are due immediately at startup.
+    due = {ib.name: 0.0 for ib in inboxes}
+    last_error = {}  # inbox name → (message, when it was last printed)
     while True:
         mark_alive()
-        try:
-            ts = needs_kick(fetch_messages(token, channel))
-            if ts:
-                last = float(read_file(LAST_KICK, "0") or 0)
-                if time.time() - last >= KICK_COOLDOWN_S and kick():
-                    with open(LAST_KICK, "w") as f:
-                        f.write(str(time.time()))
-                    print(f"doorbell: kicked hub for msg ts={ts}", flush=True)
-        except Exception as exc:  # keep polling through transient failures
-            print(f"doorbell: {exc}", file=sys.stderr, flush=True)
-        time.sleep(POLL_S)
+        now = time.time()
+        for ib in inboxes:
+            if now < due[ib.name]:
+                continue
+            due[ib.name] = now + ib.poll_seconds
+            try:
+                poll_inbox(token, ib)
+                last_error.pop(ib.name, None)
+            except Exception as exc:  # keep polling through transient failures
+                msg, (prev, at) = str(exc), last_error.get(ib.name, (None, 0.0))
+                if msg != prev or now - at >= ERROR_REPEAT_S:
+                    print(f"doorbell: {ib.name}: {msg}", file=sys.stderr, flush=True)
+                    last_error[ib.name] = (msg, now)
+        time.sleep(max(1.0, min(ALIVE_S, min(due.values()) - time.time())))
 
 
 if __name__ == "__main__":
