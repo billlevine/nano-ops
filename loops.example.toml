@@ -34,12 +34,45 @@ estate = "ops"
 deck_profile = "ops"
 # session_title = "ops (hub)"
 
-# Slack self-DM channel ID — read by bin/doorbell (the control-channel poller).
-# Left unset on purpose: with no slack_channel_id AND no
-# state/secrets/slack-user-token in this repo, bin/doorbell exits cleanly on the
-# missing-config path and does nothing. Safe by construction. Fill it in on a
-# real install; the token is a file, never a value in this registry.
+# Slack self-DM channel ID — read by bin/doorbell (the inbox poller). Also
+# marks which inbox below is the PRIMARY one: it owns the bare state/hub/cursor
+# and is where conservative inboxes escalate to.
+# Left unset on purpose: with no slack_channel_id, no [[hub.inbox]] tables AND
+# no state/secrets/slack-user-token in this repo, bin/doorbell exits cleanly on
+# the missing-config path and does nothing. Safe by construction. Fill it in on
+# a real install; the token is a file, never a value in this registry.
 # slack_channel_id = "REPLACE_WITH_YOUR_SELF_DM_CHANNEL_ID"
+
+# [[hub.inbox]] — the channels the hub watches. bin/doorbell polls each on its
+# OWN poll_seconds, with its OWN cursor and its OWN kick cooldown, so a chatty
+# channel never starves a quiet one. The hub tick re-reads them all.
+#
+# name          filename-safe label; also names the non-primary cursor file
+#               (state/hub/cursor.<name>). The primary inbox keeps the bare
+#               state/hub/cursor.
+# channel_id    Slack channel/DM id.
+# disposition   how much the hub may do on its own for this inbox:
+#                 full-trust    act immediately on what arrives here.
+#                 conservative  acknowledge, then escalate to the primary
+#                               inbox and ask. Never act unilaterally.
+#               Unstated defaults to "conservative" — unstated trust is never
+#               full trust. Reserve full-trust for your own control channel.
+# poll_seconds  per-inbox poll rate; defaults to 30.
+#
+# With no [[hub.inbox]] tables at all, slack_channel_id above still works on
+# its own and is treated as a single full-trust inbox named "self-dm".
+#
+# [[hub.inbox]]
+# name = "self-dm"
+# channel_id = "REPLACE_WITH_YOUR_SELF_DM_CHANNEL_ID"
+# disposition = "full-trust"
+# poll_seconds = 30
+#
+# [[hub.inbox]]
+# name = "team-handoff"
+# channel_id = "REPLACE_WITH_ANOTHER_CHANNEL_ID"
+# disposition = "conservative"
+# poll_seconds = 60
 
 [dashboard]
 # bin/dashboard-server binds here; bin/dashboard links to it in its output.

@@ -64,14 +64,14 @@ persistent activation held open by a supervisor
 CLAUDE.md              what this repo is; the conventions that bind every session
 hub/                   the hub session's home — CLAUDE.md + the hub tick skill
 bin/ops                operator CLI: up|status|health|doctor|services|dashboard|compact
-bin/doorbell           zero-token Slack self-DM poller (kicks the hub on activity)
+bin/doorbell           zero-token Slack inbox poller (kicks the hub on activity)
 bin/dashboard          estate dashboard renderer (pure reader; --json regen path)
 bin/dashboard-refresh  keeps state/dashboard.json fresh via `dashboard --json`
 bin/dashboard-server   loopback-only static server for the dashboard (allowlist)
 bin/usage-fetch        writes state/usage/budget.json from Anthropic's usage API
 bin/followups          durable standing-action-item store
-tests/                 test_dashboard.py, test_followups.py, test_hub_skill.py,
-                       test-interactive-hub
+tests/                 test_dashboard.py, test_doorbell.py, test_followups.py,
+                       test_hub_skill.py, test-interactive-hub
 .flox/env/manifest.toml  toolchain + [services], each under the supervisor wrapper
 loops.example.toml     committed sample registry (copy → loops.toml)
 infra/nano-ops-services.service.example
@@ -96,15 +96,17 @@ data are not — is what keeps it that way.
 
 ## Testing
 
-`tests/test_dashboard.py` and `tests/test_followups.py` are self-contained
-`unittest` suites over the dashboard renderer and the followups store. Each runs
-against a fresh tempdir and never touches real `state/`. `tests/test_hub_skill.py`
-covers the hub tick's channel-less guard — the invariant behind "Slack is
-optional" — by checking the skill still states it everywhere the tick would
-otherwise touch the channel:
+`tests/test_dashboard.py`, `tests/test_doorbell.py` and
+`tests/test_followups.py` are self-contained `unittest` suites over the
+dashboard renderer, the inbox poller and the followups store. Each runs against
+a fresh tempdir and never touches real `state/`, real Slack, or a real
+`loops.toml`. `tests/test_hub_skill.py` covers the hub tick's channel-less
+guard — the invariant behind "Slack is optional" — by checking the skill still
+states it everywhere the tick would otherwise touch the channel:
 
 ```bash
 python3 tests/test_dashboard.py
+python3 tests/test_doorbell.py
 python3 tests/test_followups.py
 python3 tests/test_hub_skill.py
 ```
