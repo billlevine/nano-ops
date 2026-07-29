@@ -16,7 +16,9 @@ private-fork/public-upstream shape.
 
 - `hub/` — the hub session's home (CLAUDE.md + hub skill). Start it: `bin/ops up`
 - `loops/<name>/` — one folder per loop: CLAUDE.md + skill + scripts.
-  `loops/example/` is the copyable template; no real loop ships in the core
+  `loops/example/` is the copyable template and `loops/mechanic/` is the
+  nightly diagnose-and-propose pass; no loop carrying an installation's own
+  policy ships in the core
 - `loops.toml` — per-installation registry (gitignored); `loops.example.toml` is
   the committed documented form, and the Flox `[hook]` seeds one from the other
 - `bin/ops` — up | status | health | doctor | services | dashboard | compact
@@ -29,7 +31,9 @@ private-fork/public-upstream shape.
 - `bin/followups` — durable standing-action-item store
 - `.flox/env/manifest.toml` — toolchain + the always-on `[services]`
 - `state/` — gitignored runtime state: hub cursor/pace, `ledger.jsonl`, loop state
-- `docs/design.md` — architecture; `docs/always-on.md` — boot-survival runbook
+- `docs/design.md` — architecture; `docs/always-on.md` — boot-survival runbook;
+  `docs/garage.md` — where estate changes get built, and why that is not the
+  hub session and not a loop
 - `docs/ideas.md` — backlog the hub appends to from the control channel
 
 ## Conventions
@@ -55,8 +59,10 @@ private-fork/public-upstream shape.
 - Skill edits don't reach a running session — after editing a loop's skill or
   CLAUDE.md, restart that session.
 - Roles: the hub is the operator (runs and reloads loops, never edits them);
-  improvements happen in a separate dev session at the repo root. Loops are
-  never edited from inside themselves.
+  the mechanic loop diagnoses and proposes but never operates; improvements are
+  built in a separate dev session at the repo root — the garage
+  ([`docs/garage.md`](docs/garage.md)). Loops are never edited from inside
+  themselves.
 - Inter-session asks go via `agent-deck session send <title> "..."` — never
   through the control channel, where an unprefixed message reads as the
   operator's own (the hub skips its own "⚙️ "-prefixed posts).

@@ -82,15 +82,22 @@ deck_profile = "ops"
 host = "127.0.0.1"
 port = 8522
 
-# [loops.<name>] — one block per loop this hub manages. No REAL loop ships in
-# the public core (a loop is where installation policy concentrates, and the
-# allowlist rule keeps policy out); this is the shape `bin/ops health`, the hub
-# skill's health pass, and bin/dashboard all read.
+# [loops.<name>] — one block per loop this hub manages. No loop carrying an
+# installation's POLICY ships in the public core (which repos it watches, whose
+# conventions it enforces — that is what the allowlist rule keeps out); this is
+# the shape `bin/ops health`, the hub skill's health pass, and bin/dashboard
+# all read.
 #
-# The one loop directory that does ship is loops/example/ — the copyable
-# template (CLAUDE.md + skill) documenting the contract every loop owes the
-# estate. Uncomment the block below to run the template itself as a cadence
-# canary; copy the directory and rename it to build a real loop.
+# Two loop directories do ship, because neither one names anybody:
+#
+#   loops/example/   the copyable template (CLAUDE.md + skill) documenting the
+#                    contract every loop owes the estate. Its default job is a
+#                    cadence canary. Copy the directory and rename it to build
+#                    a real loop.
+#   loops/mechanic/  the nightly diagnose-and-propose pass over this estate.
+#                    Runs as-is on any installation — it reads the registry,
+#                    the ledger and the policy files this install already
+#                    writes. Proposals only; it never operates.
 #
 # [loops.example]
 # dir = "loops/example"        # working directory, relative to the repo root
@@ -100,6 +107,34 @@ port = 8522
 # persona = "the example"      # display name; session title is "<persona> (<name>)"
 # model = "claude-sonnet-5"    # per-loop model, so cheap loops stay cheap
 # role = "one line, shown on the dashboard card"
+#
+# [loops.mechanic]
+# dir = "loops/mechanic"
+# skill = "mechanic"
+# interval = "20m"             # outside the night window every tick is a heartbeat
+# autostart = true
+# persona = "the mechanic"
+# model = "claude-sonnet-5"
+# role = "nightly self-optimization pass"
+#
+# The mechanic's night window is NOT registry config — it lives in
+# state/mechanic/config.toml, which the engine writes with a 02:00-05:00 default
+# on first run. Blank its pass_start to keep the loop as a heartbeat only.
+
+# [extraction] — OPTIONAL, and only for an estate that is a private fork feeding
+# a public core built from an allowlist. It switches on the mechanic's EXTRACTION
+# lens, which is otherwise a single "not configured" line each pass.
+#
+# repo       where the public-core checkout lives on this machine. Installation-
+#            specific by design; the lens notes it and moves on when it is gone.
+# allowlist  THE manifest, resolved against THIS repo rather than the checkout —
+#            it governs which of these paths may be extracted, so it belongs with
+#            the paths it names, and there is no second copy to drift out of sync.
+#            docs/extraction-allowlist.example.md is the template to copy.
+#
+# [extraction]
+# repo = "~/src/nano-ops"
+# allowlist = "docs/extraction-allowlist.md"
 
 [usage]
 # Cadence (seconds) for bin/usage-fetch, which populates state/usage/budget.json
