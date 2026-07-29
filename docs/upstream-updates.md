@@ -54,18 +54,30 @@ Set the remote once:
 Then, per update:
 
     git fetch upstream
-    git log --oneline HEAD..upstream/main        # what you're about to take
-    git diff --stat HEAD..upstream/main
+    git log --oneline HEAD..upstream/main         # what you're about to take
+    git diff --stat HEAD...upstream/main          # note: three dots
 
 Check what it touches against your own commits — this is the five seconds that
 tells you whether to expect conflicts:
 
-    git diff --name-only HEAD..upstream/main > /tmp/theirs
-    git diff --name-only upstream/main...HEAD > /tmp/mine
-    comm -12 <(sort /tmp/theirs) <(sort /tmp/mine)   # files you BOTH changed
+    comm -12 \
+      <(git diff --name-only HEAD...upstream/main | LC_ALL=C sort) \
+      <(git diff --name-only upstream/main...HEAD | LC_ALL=C sort)
 
-An empty result means the update is mechanical. Anything listed is where you
-will do work.
+An empty result means the update is mechanical. Anything listed is a file you
+and the core both changed — that is where you will do work.
+
+Two details in that command are load-bearing, and both bite silently:
+
+- **Three dots, not two.** `HEAD...upstream/main` diffs from the *merge base*,
+  which is "what the core changed since we diverged" — the question you are
+  actually asking. `HEAD..upstream/main` diffs the two endpoints, so it also
+  lists every file **you** added (they are "missing" from upstream) and reports
+  your own work as incoming change.
+- **`LC_ALL=C sort`.** `comm` compares bytewise; a locale-aware `sort` orders
+  punctuation differently, so dotfiles like `.gitignore` land out of order and
+  `comm` silently emits wrong results after printing "input is not in sorted
+  order" to stderr — which is easy to miss in a pipeline.
 
 Then take it:
 
@@ -127,6 +139,7 @@ change, so the next update is boring again.
 
 At any time, this tells you how much conflict surface you have:
 
+    git fetch upstream
     for f in $(git diff --name-only upstream/main...HEAD); do
       git cat-file -e upstream/main:"$f" 2>/dev/null \
         && echo "EDITS CORE : $f" \
