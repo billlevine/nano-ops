@@ -142,12 +142,20 @@ The decisive shape:
 
 - **A live installation stays a private fork** that adds
   `upstream → nano-ops` and pulls improvements via `git fetch upstream` +
-  `git rebase upstream/main`. Mechanism is developed here and flows down;
+  `git merge upstream/main`. Mechanism is developed here and flows down;
   installation policy stays in the fork's own commits.
-- **Installation-specific bits are gitignored, not committed:** `state/` (runtime,
-  always ignored) and `loops.toml` (per-install registry — operator identity,
-  control channel, loops; a committed `loops.example.toml` documents it and the
-  `[hook]` seeds `loops.toml` from it on first activation).
+  [`docs/upstream-updates.md`](./docs/upstream-updates.md) is the runbook, and
+  it carries the rule that keeps updates cheap: **an estate adds files, it does
+  not edit core ones.** Every core file a fork edits is a conflict on some
+  future update, and the cost compounds.
+- **Installation-specific bits are gitignored, not committed:** `state/`
+  (runtime, always ignored), `loops.toml` (per-install registry — operator
+  identity, control channel, loops; a committed `loops.example.toml` documents
+  it and the `[hook]` seeds `loops.toml` from it on first activation),
+  `docs/ideas.md` (one estate's backlog is not another's), and every
+  `loops/<name>/` that isn't `example/` or `mechanic/`. That list is not
+  incidental — each entry is a file a fork would otherwise have had to edit,
+  and therefore a conflict that no longer happens.
 - **FloxHub composition** delivers the shared toolchain later (a `flox/nano-ops`
   environment both the public core and the private fork `[include]`), keeping
   execution substrate and orchestration source cleanly separated.

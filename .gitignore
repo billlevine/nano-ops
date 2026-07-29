@@ -4,6 +4,20 @@
 /state/
 /loops.toml
 
+# Real loops are installation policy and live in your own fork, never here.
+# Ignoring them by DEFAULT, rather than naming each one, is deliberate: a fork
+# that has to edit this file to add a loop has edited a core file, and every
+# core file a fork edits is a conflict on some future update. Add loops freely
+# — this needs no change. See docs/upstream-updates.md.
+/loops/*
+!/loops/example/
+!/loops/mechanic/
+
+# One estate's backlog is not another's, and the hub appends to this file
+# constantly. Untracked here for the same reason as loops.toml: so a fork's
+# copy and the core's can never diverge into a conflict.
+/docs/ideas.md
+
 # Python bytecode (bin/dashboard is imported as a module by bin/usage-fetch)
 __pycache__/
 *.py[cod]
