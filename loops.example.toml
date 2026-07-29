@@ -82,15 +82,23 @@ deck_profile = "ops"
 host = "127.0.0.1"
 port = 8522
 
-# [loops.<name>] — one block per loop this hub manages. No REAL loop ships in
-# the public core (a loop is where installation policy concentrates, and the
-# allowlist rule keeps policy out); this is the shape `bin/ops health`, the hub
-# skill's health pass, and bin/dashboard all read.
+# [loops.<name>] — one block per loop this hub manages. This is the shape
+# `bin/ops health`, the hub skill's health pass, and bin/dashboard all read.
 #
-# The one loop directory that does ship is loops/example/ — the copyable
-# template (CLAUDE.md + skill) documenting the contract every loop owes the
-# estate. Uncomment the block below to run the template itself as a cadence
-# canary; copy the directory and rename it to build a real loop.
+# A loop is where installation policy concentrates, so almost no loop ships in
+# the public core — the allowlist rule keeps policy out. Two directories are
+# here regardless, and both are mechanism rather than anyone's policy:
+#
+#   loops/example/   the copyable template (CLAUDE.md + skill) documenting the
+#                    contract every loop owes the estate. Copy the directory
+#                    and rename it to build a real loop.
+#   loops/mechanic/  the nightly diagnose-and-propose pass. It reads only what
+#                    an installation already writes — this registry, the
+#                    ledger, the policy files, the session list — and names no
+#                    operator, loop, repo or channel. Every estate needs one to
+#                    build itself out.
+#
+# Uncomment either block to run it.
 #
 # [loops.example]
 # dir = "loops/example"        # working directory, relative to the repo root
@@ -100,6 +108,20 @@ port = 8522
 # persona = "the example"      # display name; session title is "<persona> (<name>)"
 # model = "claude-sonnet-5"    # per-loop model, so cheap loops stay cheap
 # role = "one line, shown on the dashboard card"
+#
+# [loops.mechanic]
+# dir = "loops/mechanic"
+# skill = "mechanic"
+# interval = "20m"             # heartbeat cadence; the PASS runs once a night
+# autostart = true
+# persona = "the mechanic"
+# model = "claude-sonnet-5"
+# role = "nightly self-optimization pass — diagnoses and proposes, never operates"
+#
+# The mechanic's nightly window is NOT set here — it lives in
+# state/mechanic/config.toml (pass_start/pass_end, local HH:MM), written with
+# defaults on first run. An empty pass_start disables the pass and leaves a
+# heartbeat-only loop.
 
 [usage]
 # Cadence (seconds) for bin/usage-fetch, which populates state/usage/budget.json

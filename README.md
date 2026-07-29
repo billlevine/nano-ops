@@ -173,11 +173,13 @@ The services approach is being proven **here first**, then folded back upstream.
   [`docs/always-on.md`](./docs/always-on.md) is the runbook, but the unit is
   rendered and enabled by the operator on their own machine — nothing in this
   repo, `bin/ops` included, installs or touches a systemd unit.
-- **No loops ship here yet.** `hub/` and the registry shape are in place; the
-  `loops/<name>/` folders are not. A loop is where installation policy
-  concentrates, so the public core will carry a generic example loop rather than
-  any working loop from a live estate.
-- **Not published.** Nothing here is pushed anywhere; there is no remote.
+- **Almost no loops ship here.** A loop is where installation policy
+  concentrates, so the core carries no working loop from a live estate. Two
+  directories are here because they are mechanism rather than policy:
+  `loops/example/`, the copyable template documenting the contract every loop
+  owes the estate, and `loops/mechanic/`, the nightly diagnose-and-propose
+  pass, which reads only what an installation already writes and names no
+  operator, loop, repo or channel. Everything else is yours to build.
 
 See [`docs/services-vs-systemd.md`](./docs/services-vs-systemd.md) for the full
 Flox-`[services]`-vs-systemd findings that motivated this port.
