@@ -98,7 +98,12 @@ port = 8522
 #                    operator, loop, repo or channel. Every estate needs one to
 #                    build itself out.
 #
-# Uncomment either block to run it.
+# The example block below is commented out — it is a template, and running the
+# template itself is a deliberate choice. The mechanic block is NOT: an estate
+# needs its mechanic from the first day it has anything to diagnose, and a core
+# loop that every install has to discover and uncomment is a core loop nobody
+# runs. `autostart = true` costs nothing until you run `bin/ops up` — nothing
+# here starts a loop at activation time.
 #
 # [loops.example]
 # dir = "loops/example"        # working directory, relative to the repo root
@@ -108,20 +113,21 @@ port = 8522
 # persona = "the example"      # display name; session title is "<persona> (<name>)"
 # model = "claude-sonnet-5"    # per-loop model, so cheap loops stay cheap
 # role = "one line, shown on the dashboard card"
-#
-# [loops.mechanic]
-# dir = "loops/mechanic"
-# skill = "mechanic"
-# interval = "20m"             # heartbeat cadence; the PASS runs once a night
-# autostart = true
-# persona = "the mechanic"
-# model = "claude-sonnet-5"
-# role = "nightly self-optimization pass — diagnoses and proposes, never operates"
-#
+
+[loops.mechanic]
+dir = "loops/mechanic"
+skill = "mechanic"
+interval = "20m"             # heartbeat cadence; the PASS runs once a night
+autostart = true
+persona = "the mechanic"
+model = "claude-sonnet-5"
+role = "nightly self-optimization pass — diagnoses and proposes, never operates"
+
 # The mechanic's nightly window is NOT set here — it lives in
 # state/mechanic/config.toml (pass_start/pass_end, local HH:MM), written with
 # defaults on first run. An empty pass_start disables the pass and leaves a
-# heartbeat-only loop.
+# heartbeat-only loop; that is the switch to use if you want the mechanic
+# registered and healthy but not spending anything yet.
 
 [usage]
 # Cadence (seconds) for bin/usage-fetch, which populates state/usage/budget.json
