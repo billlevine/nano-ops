@@ -18,6 +18,17 @@
 # copy and the core's can never diverge into a conflict.
 /docs/ideas.md
 
+# Persona selection is installation policy — which roles your estate has, and
+# which sessions wear them. personas/config.example.toml is the committed
+# documented form. compiled/ and the persona.md sidecars are generated from it
+# by bin/persona-compile, so they are installation-specific too; regenerate
+# with --install rather than committing them.
+/personas/config.toml
+/personas/compiled/
+/personas/roles/*
+!/personas/roles/example.md
+persona.md
+
 # Python bytecode (bin/dashboard is imported as a module by bin/usage-fetch)
 __pycache__/
 *.py[cod]
