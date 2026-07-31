@@ -30,6 +30,10 @@ private-fork/public-upstream shape.
 - `.flox/env/manifest.toml` — toolchain + the always-on `[services]`
 - `state/` — gitignored runtime state: hub cursor/pace, `ledger.jsonl`, loop state
 - `docs/design.md` — architecture; `docs/always-on.md` — boot-survival runbook
+- `docs/garage.md` — the three roles and where estate changes get built;
+  `docs/upstream-updates.md` — taking core updates into a fork;
+  `docs/extraction-allowlist.example.md` — the allowlist format the mechanic's
+  extraction lens parses
 - `docs/ideas.md` — backlog the hub appends to from the control channel
 
 ## Conventions
