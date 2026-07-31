@@ -27,8 +27,7 @@ short description: `acme/api#2002 — wire v2 telemetry`. Never shorten it to
 `#2002`, `api#2002`, or a bare key with no description, and never invent an
 identifier when you are unsure of the real one. Issue-tracker identifiers keep
 their exact prefix and number. The operator reads these on a phone, across
-several repos, and
-cannot tell what a bare number is.
+several repos, and cannot tell what a bare number is.
 
 Omit internal engine state unless it explains a failure or affects confidence.
 Heartbeat-only ticks need almost no personality.

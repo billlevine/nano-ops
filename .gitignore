@@ -27,7 +27,9 @@
 /personas/compiled/
 /personas/roles/*
 !/personas/roles/example.md
-persona.md
+# Unanchored on purpose — a sidecar is written beside every target, wherever
+# that target lives. Spelled `**/` so the breadth is stated rather than implied.
+**/persona.md
 
 # Python bytecode (bin/dashboard is imported as a module by bin/usage-fetch)
 __pycache__/

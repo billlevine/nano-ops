@@ -34,6 +34,11 @@ Usage:
     bin/persona-compile --role hub      restrict to one role
     bin/persona-compile --print hub     write the compiled body to stdout
 
+    --check and --install are mutually exclusive, and --print combines with
+    neither: each of those pairs would otherwise silently ignore one of the
+    modes asked for. --role narrows a compile to one role and skips MANIFEST.md,
+    so a full pass is what refreshes the audit record.
+
     --personas-dir DIR / --config FILE / --out DIR / --repo DIR override paths
     (used by the tests; defaults are all derived from the repo root).
 
@@ -47,6 +52,7 @@ import hashlib
 import os
 import re
 import sys
+import tempfile
 import tomllib
 
 BEGIN = "<!-- BEGIN GENERATED PERSONA — bin/persona-compile"
@@ -56,6 +62,11 @@ END = "<!-- END GENERATED PERSONA -->"
 # it. One fixed name for every target: each lives in its own directory, and the
 # import is resolved relative to that directory.
 SIDECAR = "persona.md"
+
+# A ```/~~~ fence line, and an HTML comment block. Both are things strip_title
+# must recognise rather than treat as prose — see its docstring.
+FENCE = re.compile(r"^\s*(```|~~~)")
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
 # The one piece of prose the compiler itself owns. It pins the persona layer
 # below the operational contract in every compiled output, so a persona can
@@ -79,8 +90,35 @@ def repo_root() -> str:
 
 
 def read(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
+    # newline="" disables universal-newline translation. Without it a CRLF
+    # target is silently normalised to LF on the way back out, which would
+    # rewrite hand-written bytes OUTSIDE the generated markers — the one thing
+    # install promises never to touch.
+    with open(path, encoding="utf-8", newline="") as f:
         return f.read()
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Replace a file's contents without ever leaving it truncated.
+
+    These are operational-contract files and their load-bearing sidecars. A
+    plain open(path, "w") truncates first, so an interrupt or a full disk
+    leaves a session's CLAUDE.md empty. Write a sibling temp file, flush it to
+    disk, then rename over the target: readers see the old bytes or the new
+    ones, never a partial file. newline="" for the same reason as read().
+    """
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".persona-compile.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def sha256(text: str) -> str:
@@ -96,7 +134,18 @@ def strip_title(text: str, demote: int = 1) -> tuple[str, str]:
     Sources are authored as standalone documents (`# The tracker` / `## Signature`).
     The compiled file nests them, so every remaining heading drops to the depth of
     the section it lands under.
+
+    Three things this is careful about, because the output is prompt text:
+
+    - Fenced code blocks are left alone. A `# comment` inside a ```bash fence is
+      a shell comment, not a heading, and promoting it corrupts the example.
+    - Demotion clamps at H6. Markdown has no H7, so overflowing produces a line
+      that renders as literal `#######` text.
+    - HTML comments are dropped. That is what lets a template file carry
+      instructions for the human editing it (see personas/roles/example.md)
+      without those instructions becoming the compiled session's disposition.
     """
+    text = HTML_COMMENT.sub("", text)
     lines = text.strip("\n").split("\n")
     title = ""
     if lines and lines[0].startswith("# "):
@@ -104,8 +153,21 @@ def strip_title(text: str, demote: int = 1) -> tuple[str, str]:
         lines = lines[1:]
     while lines and not lines[0].strip():
         lines = lines[1:]
-    pad = "#" * demote
-    body = "\n".join(pad + l if re.match(r"^#{1,5} ", l) else l for l in lines)
+
+    out, in_fence = [], False
+    for line in lines:
+        if FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        m = None if in_fence else re.match(r"^(#{1,6}) (.*)$", line)
+        if m:
+            level = min(len(m.group(1)) + demote, 6)
+            out.append("#" * level + " " + m.group(2))
+        else:
+            out.append(line)
+    # Dropping comment blocks can leave a run of blank lines behind.
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(out))
     return title, body.strip("\n")
 
 
@@ -114,12 +176,20 @@ def load_config(path: str) -> dict:
         return tomllib.load(f)
 
 
-def crew_for(role: str, cfg: dict) -> str:
-    """The hub may wear a different signature from the loop crew (spec §config)."""
+def crew_for(role: str, cfg: dict, cfg_path: str = "config.toml") -> str:
+    """The hub may wear a different signature from the loop crew.
+
+    Two tiers, keyed off the role named `hub` — which is a structural concept of
+    this repo (`hub/` is a top-level directory that `bin/ops up` starts), not an
+    installation's identity. A per-role tier is a config-schema change, not a
+    bug fix, so it is not made here; `loop_crew` remains the fallback.
+    """
     key = "hub" if role == "hub" else "loop_crew"
     crew = cfg.get(key)
-    if not crew:
-        raise SystemExit(f"persona-compile: config.toml is missing `{key}`")
+    if not isinstance(crew, str) or not crew:
+        what = "is missing" if crew is None else "must be a crew name (a string), not"
+        got = "" if crew is None else f" {type(crew).__name__}"
+        raise SystemExit(f"persona-compile: {cfg_path} {what} `{key}`{got}")
     return crew
 
 
@@ -127,15 +197,20 @@ def discover_roles(personas_dir: str) -> list[str]:
     d = os.path.join(personas_dir, "roles")
     if not os.path.isdir(d):
         raise SystemExit(f"persona-compile: no roles directory at {d}")
-    return sorted(f[:-3] for f in os.listdir(d) if f.endswith(".md"))
+    roles = sorted(f[:-3] for f in os.listdir(d) if f.endswith(".md"))
+    if not roles:
+        raise SystemExit(f"persona-compile: no roles in {d}; at least one "
+                         f"<role>.md is required (copy roles/example.md)")
+    return roles
 
 
 # --------------------------------------------------------------------------- #
 # compile
 # --------------------------------------------------------------------------- #
-def compile_role(role: str, personas_dir: str, cfg: dict) -> dict:
+def compile_role(role: str, personas_dir: str, cfg: dict,
+                 cfg_path: str = "config.toml") -> dict:
     """Resolve one role into its compiled body. Returns a record for the manifest."""
-    crew = crew_for(role, cfg)
+    crew = crew_for(role, cfg, cfg_path)
     paths = {
         "worldview": os.path.join(personas_dir, "WORLDVIEW.md"),
         "house": os.path.join(personas_dir, "HOUSE_STYLE.md"),
@@ -243,10 +318,105 @@ def sidecar_path(repo: str, target_rel: str) -> str:
     It MUST be a sibling. A `@`-import only resolves at or below the session's
     own directory — `@../../personas/compiled/<role>.md` and an absolute path
     both silently import nothing — no error, just a session wearing no persona.
-    See docs/personas.md. personas/compiled/<role>.md remains the canonical
-    compiled artifact and the review surface; this is its installed copy, the
-    same body under a name the import can actually reach."""
+    See docs/personas.md. personas/compiled/<role>.md is the deterministic
+    artifact `--check` compares against — nothing reads it at install time and
+    it is gitignored, so it is a comparand rather than a review surface; this
+    is the installed copy, the same body under a name the import can reach."""
     return os.path.join(repo, os.path.dirname(target_rel), SIDECAR)
+
+
+def contained(repo: str, path: str) -> bool:
+    """Is `path` inside the repo? Config values must not be able to escape it.
+
+    os.path.join drops `repo` entirely when handed an absolute component, and
+    never collapses `..`, so an unvalidated [targets] value rewrites files
+    anywhere on the filesystem. Compared on realpath so a symlinked target is
+    judged by where the write actually lands.
+    """
+    root = os.path.realpath(repo)
+    return os.path.realpath(path) == root or \
+        os.path.realpath(path).startswith(root + os.sep)
+
+
+def validate_targets(repo: str, targets: dict, roles: list[str],
+                     cfg_path: str) -> None:
+    """Reject a [targets] table before anything is written, not partway through."""
+    for name, rel in sorted(targets.items()):
+        if name not in roles:
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] names "
+                             f"'{name}', which has no personas/roles/{name}.md")
+        if not isinstance(rel, str) or not rel:
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] {name} must "
+                             f"be a path relative to the repo root")
+        if os.path.isabs(rel) or not contained(repo, os.path.join(repo, rel)):
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] {name} = "
+                             f"'{rel}' resolves outside the repo; targets are "
+                             f"relative to the repo root")
+
+    # One fixed sidecar name per directory. Two targets sharing a directory
+    # overwrite each other's body, and no --install ever makes --check clean —
+    # so say so now rather than exiting 0 on wiring that cannot converge.
+    seen: dict[str, str] = {}
+    for name, rel in sorted(targets.items()):
+        spath = os.path.realpath(sidecar_path(repo, rel))
+        if spath in seen:
+            raise SystemExit(
+                f"persona-compile: {cfg_path} [targets] {seen[spath]} and {name} "
+                f"both resolve to {os.path.relpath(spath, repo)}; each target "
+                f"needs its own directory, since the sidecar name is fixed")
+        seen[spath] = name
+
+
+def uncode(text: str) -> str:
+    """Blank out fenced code blocks, keeping line count so offsets still line up.
+
+    Documentation quotes these markers — docs/personas.md shows the pair a
+    target needs, and the loops describe them in prose. A scanner that cannot
+    tell a documented marker from an installed one reports the documentation as
+    a stray persona, which is the same class of mistake as splicing on a
+    first-match find.
+    """
+    out, in_fence = [], False
+    for line in text.split("\n"):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            out.append("")
+        else:
+            out.append("" if in_fence else line)
+    return "\n".join(out)
+
+
+# Runtime state, VCS internals and dependency trees are never persona targets,
+# and state/ in particular can hold whole worktrees.
+SKIP_DIRS = {".git", ".flox", "node_modules", "state", "__pycache__"}
+
+
+def installed_blocks(repo: str) -> list[tuple[str, str | None]]:
+    """Every file in the repo carrying a generated block, with the role it names.
+
+    --check otherwise only ever looks at what the config currently selects, so
+    dropping a role from [targets] leaves its block and body in place, worn by
+    a live session, and reports clean forever. The one transient signal (a
+    stale MANIFEST.md) is extinguished by the next --install.
+    """
+    found = []
+    for base, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for name in sorted(files):
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                continue  # the link's target is walked on its own
+            try:
+                text = uncode(read(path))
+            except (OSError, UnicodeDecodeError):
+                continue
+            if BEGIN not in text:
+                continue
+            m = re.search(re.escape(BEGIN) + r"\s*·\s*role=([^\s]+)", text)
+            found.append((os.path.relpath(path, repo), m.group(1) if m else None))
+    return found
 
 
 def sidecar(rec: dict) -> str:
@@ -269,9 +439,13 @@ def manifest(recs: list[dict], targets: dict) -> str:
         "# Compiled persona manifest",
         "",
         "The auditable record of what each session is wearing. `sha256` is the",
-        "hash of the compiled body, which is also stamped into the generated",
-        "block in the target CLAUDE.md. `bin/persona-compile --check` fails when",
-        "a compiled file or an installed block no longer matches these sources.",
+        "hash of the compiled body; it is recorded here and in the installed",
+        "sidecar's own header. It is deliberately NOT in the generated block in",
+        "the target CLAUDE.md — that block carries only the role, which is what",
+        "keeps the target byte-stable across recompiles, and is why `--check`",
+        "compares the sidecar on its own. `bin/persona-compile --check` fails",
+        "when a compiled file, an installed block or a sidecar no longer matches",
+        "these sources.",
         "",
     ]
     for rec in recs:
@@ -291,21 +465,49 @@ def manifest(recs: list[dict], targets: dict) -> str:
 # --------------------------------------------------------------------------- #
 # install / check
 # --------------------------------------------------------------------------- #
+def marker_span(text: str) -> tuple[int, int] | None:
+    """Locate the one generated block in a target, or explain why there isn't one.
+
+    Returns (start, end-of-END) for exactly one well-formed pair. Raises
+    ValueError when the file has markers but not a usable pair, and returns
+    None only when it has none at all.
+
+    Uniqueness is the point. Taking the first `find` of each marker
+    independently is wrong in two directions, and both are silent: a stray or
+    quoted BEGIN ahead of the real block makes the replacement swallow every
+    hand-written line between them, and a second complete pair is left live in
+    the prompt while a check that only compared the first reports clean. A
+    target that mentions the markers in prose is a real thing — the loops
+    document them — so this refuses rather than guesses.
+    """
+    starts = [m.start() for m in re.finditer(re.escape(BEGIN), text)]
+    ends = [m.start() for m in re.finditer(re.escape(END), text)]
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1:
+        raise ValueError(
+            f"expected exactly one generated-persona marker pair, found "
+            f"{len(starts)} BEGIN and {len(ends)} END")
+    if ends[0] < starts[0]:
+        raise ValueError("generated-persona END marker precedes its BEGIN")
+    return starts[0], ends[0] + len(END)
+
+
 def replace_block(text: str, new_block: str) -> str:
     """Swap the generated block in a target file. Markers must already exist."""
-    start = text.find(BEGIN)
-    end = text.find(END)
-    if start < 0 or end < 0 or end < start:
+    span = marker_span(text)
+    if span is None:
         raise ValueError("no generated-persona markers")
-    return text[:start] + new_block + text[end + len(END):]
+    start, end = span
+    return text[:start] + new_block + text[end:]
 
 
 def current_block(text: str) -> str | None:
-    start = text.find(BEGIN)
-    end = text.find(END)
-    if start < 0 or end < 0 or end < start:
+    span = marker_span(text)
+    if span is None:
         return None
-    return text[start:end + len(END)]
+    start, end = span
+    return text[start:end]
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -321,9 +523,19 @@ def run(argv: list[str] | None = None) -> int:
     ap.add_argument("--install", action="store_true",
                     help="refresh the generated block in each target CLAUDE.md")
     ap.add_argument("--print", dest="print_role",
-                    help="write one compiled body to stdout and exit")
+                    help="write one compiled body to stdout and exit; cannot be "
+                         "combined with --check or --install")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
+
+    # Reject rather than silently resolve. --print returns before any drift or
+    # install work, and the check/install branches are check-first, so each of
+    # these combinations used to succeed while ignoring what was asked for —
+    # including handing a caller exit 0 from a command that never looked.
+    if args.print_role and (args.check or args.install):
+        ap.error("--print cannot be combined with --check or --install")
+    if args.check and args.install:
+        ap.error("--check and --install are mutually exclusive")
 
     repo = os.path.abspath(args.repo)
     personas_dir = args.personas_dir or os.path.join(repo, "personas")
@@ -333,20 +545,20 @@ def run(argv: list[str] | None = None) -> int:
         raise SystemExit(f"persona-compile: no config at {cfg_path}")
     cfg = load_config(cfg_path)
     targets = cfg.get("targets", {})
+    if not isinstance(targets, dict):
+        raise SystemExit(f"persona-compile: {cfg_path} [targets] must be a table "
+                         f"of role = \"path\", not {type(targets).__name__}")
 
     roles = discover_roles(personas_dir)
     unknown = [r for r in (args.role or []) if r not in roles]
     if unknown:
         raise SystemExit(f"persona-compile: unknown role(s): {', '.join(unknown)}. "
                          f"known: {', '.join(roles)}")
-    for name in targets:
-        if name not in roles:
-            raise SystemExit(f"persona-compile: config.toml [targets] names "
-                             f"'{name}', which has no personas/roles/{name}.md")
+    validate_targets(repo, targets, roles, cfg_path)
     if args.role:
         roles = [r for r in roles if r in args.role]
 
-    recs = [compile_role(r, personas_dir, cfg) for r in roles]
+    recs = [compile_role(r, personas_dir, cfg, cfg_path) for r in roles]
 
     if args.print_role:
         match = [r for r in recs if r["role"] == args.print_role]
@@ -369,8 +581,16 @@ def run(argv: list[str] | None = None) -> int:
                              f"{os.path.relpath(path, repo)} is missing")
         else:
             os.makedirs(out_dir, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(want)
+            write_atomic(path, want)
+
+    # Nothing else enumerates the output directory, so a role that was renamed
+    # or removed leaves its compiled file behind under a clean report.
+    if args.check and not args.role and os.path.isdir(out_dir):
+        expected = {f"{rec['role']}.md" for rec in recs} | {"MANIFEST.md"}
+        for name in sorted(os.listdir(out_dir)):
+            if name.endswith(".md") and name not in expected:
+                drift.append(f"{os.path.relpath(os.path.join(out_dir, name), repo)} "
+                             f"is orphaned (no personas/roles/{name})")
 
     # MANIFEST.md — only meaningful for a full compile
     if not args.role:
@@ -382,8 +602,15 @@ def run(argv: list[str] | None = None) -> int:
                 drift.append(f"{os.path.relpath(mpath, repo)} is "
                              f"{'stale' if have else 'missing'}")
         else:
-            with open(mpath, "w", encoding="utf-8") as f:
-                f.write(want)
+            os.makedirs(out_dir, exist_ok=True)
+            write_atomic(mpath, want)
+    elif not args.check:
+        # A targeted compile deliberately skips the manifest, which then
+        # asserts a stale sha for the role just rebuilt. Say so rather than
+        # letting the next full --check report drift the operator did not cause.
+        if not args.quiet:
+            print("note: --role skips MANIFEST.md; run a full compile to refresh "
+                  "the audit record", file=sys.stderr)
 
     # Installed blocks in the live CLAUDE.md files. A bare compile only refreshes
     # personas/compiled/; wiring a target is a deliberate --install / --check.
@@ -397,7 +624,14 @@ def run(argv: list[str] | None = None) -> int:
             continue
         text = read(path)
         want = block(rec)
-        have = current_block(text)
+        try:
+            have = current_block(text)
+        except ValueError as e:
+            # Markers present but not a usable pair. Never guess which one to
+            # replace — replacing the wrong span deletes hand-written contract
+            # text with no error and no backup.
+            drift.append(f"{rel} has malformed generated-persona markers: {e}")
+            continue
         if have is None:
             drift.append(f"{rel} has no generated-persona markers "
                          f"(add them once, then --install)")
@@ -406,22 +640,35 @@ def run(argv: list[str] | None = None) -> int:
             if have != want:
                 drift.append(f"{rel} installed block is stale")
         elif args.install and have != want:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(replace_block(text, want))
+            write_atomic(path, replace_block(text, want))
 
-        # The sidecar the block imports. Written even when the block itself is
-        # already current: the block only carries the sha, so an out-of-date
-        # body behind an up-to-date pointer is exactly the drift to catch.
+        # The sidecar the block imports. Compared even when the block itself is
+        # already current: the block carries NOTHING derived from the persona's
+        # content — only the role — so an out-of-date body behind an up-to-date
+        # pointer is invisible unless the sidecar is compared on its own.
         spath = sidecar_path(repo, rel)
         swant = sidecar(rec)
         srel = os.path.relpath(spath, repo)
+        shave = read(spath) if os.path.isfile(spath) else None
         if args.check:
-            shave = read(spath) if os.path.isfile(spath) else None
             if shave != swant:
                 drift.append(f"{srel} is {'stale' if shave else 'missing'}")
-        elif args.install:
-            with open(spath, "w", encoding="utf-8") as f:
-                f.write(swant)
+        elif args.install and shave != swant:
+            # Comparing before writing: --install is idempotent for the target,
+            # and the sidecar should not churn its mtime either.
+            write_atomic(spath, swant)
+
+    # A block on disk whose role is no longer in [targets] is a session still
+    # wearing a persona nothing selects. Only a full pass can say that, since
+    # --role deliberately narrows what is known.
+    if args.check and not args.role:
+        for rel, role in installed_blocks(repo):
+            if role is None:
+                drift.append(f"{rel} has a generated-persona block with no role= stamp")
+            elif role not in targets:
+                drift.append(f"{rel} still installs role '{role}', which is not in "
+                             f"[targets] (re-add it, or remove the block and its "
+                             f"{SIDECAR})")
 
     if not args.quiet:
         for rec in recs:

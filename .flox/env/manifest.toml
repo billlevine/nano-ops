@@ -69,6 +69,14 @@ on-activate = '''
   if [ ! -f "$FLOX_ENV_PROJECT/loops.toml" ]; then
     cp "$FLOX_ENV_PROJECT/loops.example.toml" "$FLOX_ENV_PROJECT/loops.toml"
   fi
+  # personas/config.toml is the same kind of file — gitignored installation
+  # policy with a committed example — so it gets the same treatment, and
+  # bin/persona-compile works from a fresh clone rather than exiting on a
+  # missing config.
+  if [ ! -f "$FLOX_ENV_PROJECT/personas/config.toml" ]; then
+    cp "$FLOX_ENV_PROJECT/personas/config.example.toml" \
+       "$FLOX_ENV_PROJECT/personas/config.toml"
+  fi
   # Render the static dashboard shell once (token-free, ~3s). The
   # dashboard-refresh service then keeps state/dashboard.json fresh and the
   # shell re-polls it in place. Guarded on the shell's existence (runs once)

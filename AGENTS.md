@@ -27,9 +27,22 @@ private-fork/public-upstream shape.
   local estate dashboard: renderer, regenerator, loopback-only server
 - `bin/usage-fetch` — writes `state/usage/budget.json`, the budget signal
 - `bin/followups` — durable standing-action-item store
+- `bin/persona-compile` — compiles `personas/` into one body per role.
+  `--install` writes that body to a `persona.md` sidecar beside each target and
+  puts a stable `@persona.md` import between the target's generated markers, so
+  a persona edit never shows up as a diff in an operational-contract file.
+  `--check` exits 1 on drift. It never invents a marker location
+- `personas/` — the voice layer: `WORLDVIEW.md` + `HOUSE_STYLE.md` + `roles/` +
+  `crews/`. `config.toml`, `roles/*` (except `example.md`), `compiled/` and the
+  `persona.md` sidecars are gitignored — which roles an estate has and which
+  sessions wear them is installation policy, like `loops.toml`.
+  `config.example.toml` is the committed documented form
 - `.flox/env/manifest.toml` — toolchain + the always-on `[services]`
 - `state/` — gitignored runtime state: hub cursor/pace, `ledger.jsonl`, loop state
 - `docs/design.md` — architecture; `docs/always-on.md` — boot-survival runbook
+- `docs/personas.md` — the voice layer: the source layers, why the `@` import
+  must be a sibling (a non-sibling one silently loads nothing), how to re-run
+  that probe, and what a clean `--check` does and does not prove
 - `docs/ideas.md` — backlog the hub appends to from the control channel
 
 ## Conventions

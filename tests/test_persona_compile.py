@@ -32,8 +32,15 @@ ROLE_HUB = ("# The hub\n\n## Disposition and working style\n\nMove work.\n\n"
             "## Signature\n\nSound forward-leaning.\n")
 ROLE_TRACK = ("# The tracker\n\n## Disposition and working style\n\nWatch the board.\n\n"
              "## Signature\n\nSound alert.\n")
-CREW_A = "# Working clothes\n\nLiteral facts, light framing.\n"
-CREW_B = "# Backstage company\n\nWarm ensemble contrast.\n"
+# Crew fixtures carry `##` subsections because every crew this repo ships does.
+# A heading-free fixture cannot see a heading-depth regression, and it made
+# TestCrewSwapIsolation's stated invariant vacuous.
+CREW_A = ("# Working clothes\n\nLiteral facts, light framing.\n\n"
+          "## Register\n\nPlain and unadorned.\n\n"
+          "## Limits\n\nCannot override the operational contract.\n")
+CREW_B = ("# Backstage company\n\nWarm ensemble contrast.\n\n"
+          "## Register\n\nCollegial and warm.\n\n"
+          "## Limits\n\nCannot override the operational contract.\n")
 
 CONFIG = 'hub = "working-clothes"\nloop_crew = "working-clothes"\n'
 
@@ -166,10 +173,23 @@ class TestCrewSwapIsolation(unittest.TestCase):
 
     @staticmethod
     def split(body):
-        """Split a compiled body into {section heading: text}."""
+        """Split a compiled body into {section heading: text}.
+
+        The crew section is everything from `### Crew — …` to the end. Crew
+        bodies are demoted one level (the role layer is the only one demoted
+        two), so a crew's own `##` subsections land at `###` — siblings of
+        `### Crew` rather than children. That flattening matches the compiler
+        this was extracted from and is deliberately not changed here; what the
+        split must not do is mistake those subsections for top-level sections
+        of the persona, which would make the isolation assertion below vacuous.
+        """
         out, key, buf = {}, "(preamble)", []
+        in_crew = False
         for line in body.splitlines():
-            if line.startswith("### "):
+            if line.startswith("### Crew — "):
+                out[key] = "\n".join(buf)
+                key, buf, in_crew = line, [], True
+            elif line.startswith("### ") and not in_crew:
                 out[key] = "\n".join(buf)
                 key, buf = line, []
             else:
@@ -230,6 +250,46 @@ class TestValidation(unittest.TestCase):
                     "--out", os.path.join(self.tmp, "c"), "--quiet"])
         self.assertIn("ghost", str(cm.exception))
 
+    def test_an_empty_roles_directory_exits_with_the_documented_message(self):
+        """Not a traceback. The PR promised 'the compiler exits if absent'."""
+        p = build_pack(self.tmp)
+        for f in os.listdir(os.path.join(p, "roles")):
+            os.remove(os.path.join(p, "roles", f))
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p,
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("at least one", str(cm.exception))
+
+    def test_conflicting_modes_are_rejected_not_silently_resolved(self):
+        p = build_pack(self.tmp)
+        for combo in (["--print", "hub", "--check"],
+                      ["--print", "hub", "--install"],
+                      ["--check", "--install"]):
+            with self.subTest(combo=combo):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        pc.run(["--repo", self.tmp, "--personas-dir", p,
+                                "--out", os.path.join(self.tmp, "c"),
+                                "--quiet", *combo])
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_a_non_string_crew_selection_says_what_went_wrong(self):
+        """[hub] as a TOML table is the natural mistake — loops.toml uses one."""
+        p = build_pack(self.tmp, config='[hub]\ncrew = "working-clothes"\n')
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p,
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("must be a crew name", str(cm.exception))
+
+    def test_the_config_error_names_the_config_actually_in_use(self):
+        p = build_pack(self.tmp)
+        other = os.path.join(self.tmp, "elsewhere.toml")
+        write(other, 'hub = "working-clothes"\n')
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p, "--config", other,
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("elsewhere.toml", str(cm.exception))
+
     def test_unknown_role_flag_is_an_error(self):
         p = build_pack(self.tmp)
         with self.assertRaises(SystemExit) as cm:
@@ -237,6 +297,111 @@ class TestValidation(unittest.TestCase):
                     "--out", os.path.join(self.tmp, "c"), "--role", "ghost",
                     "--quiet"])
         self.assertIn("unknown role", str(cm.exception))
+
+
+class TestMarkers(unittest.TestCase):
+    """Marker parsing refuses ambiguity instead of guessing a span.
+
+    First-match `find` on each marker independently was wrong in two silent
+    directions: a stray BEGIN ahead of the real block made the replacement
+    swallow the hand-written lines between them, and a second complete pair
+    stayed live in the prompt while a check that compared only the first
+    reported clean.
+    """
+
+    REC = {"role": "demo", "display": "Demo", "crew": "c", "body": "B",
+           "sha": "abc123", "sources": "s"}
+
+    def block(self):
+        return pc.block(self.REC)
+
+    def test_a_stray_begin_marker_never_swallows_hand_written_text(self):
+        text = ("HEAD\n" + pc.BEGIN + " · role=demo -->\n"
+                "IMPORTANT OPERATIONAL RULE\n"
+                + pc.BEGIN + " · role=demo -->\nbody\n" + pc.END + "\nTAIL\n")
+        with self.assertRaises(ValueError) as cm:
+            pc.replace_block(text, self.block())
+        self.assertIn("exactly one", str(cm.exception))
+        # ...and the hand-written line is still there, because nothing was written.
+        self.assertIn("IMPORTANT OPERATIONAL RULE", text)
+
+    def test_a_second_complete_block_is_not_silently_left_stale(self):
+        one = pc.BEGIN + " · role=demo -->\nOLD\n" + pc.END
+        text = f"HEAD\n{one}\nmiddle\n{one}\nTAIL\n"
+        with self.assertRaises(ValueError):
+            pc.current_block(text)
+
+    def test_end_before_begin_is_reported_not_replaced(self):
+        text = "HEAD\n" + pc.END + "\n" + pc.BEGIN + " -->\nTAIL\n"
+        with self.assertRaises(ValueError) as cm:
+            pc.current_block(text)
+        self.assertIn("precedes", str(cm.exception))
+
+    def test_a_file_with_no_markers_is_not_an_error(self):
+        self.assertIsNone(pc.current_block("nothing here\n"))
+
+
+class TestPathSafety(unittest.TestCase):
+    """[targets] values cannot reach outside the repo, or collide."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def build(self, targets):
+        return build_pack(self.tmp, config=CONFIG + "\n[targets]\n" + targets)
+
+    def test_an_absolute_target_is_rejected(self):
+        p = self.build('hub = "/etc/CLAUDE.md"\n')
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p,
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("outside the repo", str(cm.exception))
+
+    def test_a_parent_relative_target_is_rejected(self):
+        p = self.build('hub = "../../elsewhere/CLAUDE.md"\n')
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p,
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("outside the repo", str(cm.exception))
+
+    def test_two_targets_in_one_directory_are_rejected_before_any_write(self):
+        """The sidecar name is fixed, so this config can never check clean."""
+        p = self.build('hub = "d/AGENTS.md"\ntracker = "d/OTHER.md"\n')
+        os.makedirs(os.path.join(self.tmp, "d"))
+        with self.assertRaises(SystemExit) as cm:
+            pc.run(["--repo", self.tmp, "--personas-dir", p, "--install",
+                    "--out", os.path.join(self.tmp, "c"), "--quiet"])
+        self.assertIn("own directory", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "d", pc.SIDECAR)))
+
+
+class TestStripTitle(unittest.TestCase):
+    """Heading demotion is markdown-aware; HTML comments never reach a prompt."""
+
+    def test_headings_inside_a_fence_are_left_alone(self):
+        _, body = pc.strip_title("# T\n\n```bash\n# a shell comment\n```\n")
+        self.assertIn("# a shell comment", body)
+        self.assertNotIn("## a shell comment", body)
+
+    def test_demotion_clamps_at_h6(self):
+        _, body = pc.strip_title("# T\n\n##### deep\n", demote=2)
+        self.assertIn("###### deep", body)
+        self.assertNotIn("####### deep", body)
+
+    def test_html_comments_are_stripped(self):
+        _, body = pc.strip_title(
+            "# T\n\n<!-- note to the author, not the session -->\n\nReal prose.\n")
+        self.assertNotIn("note to the author", body)
+        self.assertIn("Real prose.", body)
+
+    def test_the_example_role_ships_no_authoring_instructions(self):
+        """The one target a fresh clone installs must not wear its own README."""
+        cfg = {"hub": "working-clothes", "loop_crew": "working-clothes"}
+        rec = pc.compile_role("example", os.path.join(REPO, "personas"), cfg)
+        self.assertNotIn("Copy this file to", rec["body"])
+        self.assertNotIn("The compiler expects them at this depth", rec["body"])
+        self.assertIn("## Persona — The example role", rec["body"])
 
 
 class TestInstall(unittest.TestCase):
@@ -375,19 +540,134 @@ class TestInstall(unittest.TestCase):
         self.assertIn("Operational rule: never merge.", text)
         self.assertIn("Never set ANTHROPIC_API_KEY.", text)
 
+    def test_bytes_outside_the_markers_survive_including_line_endings(self):
+        """Substring presence is not byte preservation.
+
+        Reading in text mode normalises CRLF on the way in, so writing the
+        whole string back rewrote every line ending in the file — outside the
+        managed region as well as in it.
+        """
+        with open(self.target, "wb") as f:
+            f.write(("HEAD ONE\r\nHEAD TWO\r\n" + pc.BEGIN + " -->\r\n"
+                     + pc.END + "\r\nTAIL ONE\r\n").encode("utf-8"))
+        self.cli()
+        self.cli("--install")
+        with open(self.target, "rb") as f:
+            raw = f.read()
+        self.assertIn(b"HEAD ONE\r\nHEAD TWO\r\n", raw)
+        self.assertIn(b"TAIL ONE\r\n", raw)
+
+    def test_a_deconfigured_target_is_drift_not_silence(self):
+        """A role dropped from [targets] leaves a live persona nothing selects."""
+        self.cli()
+        self.cli("--install")
+        rc, _ = self.cli("--check")
+        self.assertEqual(rc, 0)
+        write(os.path.join(self.personas, "config.toml"), CONFIG)  # no [targets]
+        rc, err = self.cli("--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("still installs role 'hub'", err)
+
+    def test_an_orphaned_compiled_file_is_drift(self):
+        self.cli()
+        write(os.path.join(self.out, "ghost.md"), "left behind\n")
+        rc, err = self.cli("--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("orphaned", err)
+
+    def test_a_failed_write_leaves_the_contract_file_intact(self):
+        """The reason writes go through a temp file and a rename.
+
+        A plain open(path, "w") truncates first, so an interrupt or a full disk
+        leaves an operational-contract file empty. Here the write fails partway
+        and the original must still be on disk, whole.
+        """
+        self.cli()
+        self.cli("--install")
+        before = slurp(self.target)
+
+        class Boom(Exception):
+            pass
+
+        class HalfBroken(str):
+            """Writes some bytes, then fails — a full disk, in miniature."""
+
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **kw):
+            f = real_fdopen(fd, *a, **kw)
+            orig = f.write
+
+            def write(text):
+                orig(text[:20])
+                raise Boom("disk full")
+            f.write = write
+            return f
+
+        os.fdopen = exploding_fdopen
+        try:
+            with self.assertRaises(Boom):
+                pc.write_atomic(self.target, "REPLACEMENT CONTENT" * 10)
+        finally:
+            os.fdopen = real_fdopen
+
+        self.assertEqual(before, slurp(self.target))
+        leftovers = [f for f in os.listdir(os.path.dirname(self.target))
+                     if f.startswith(".persona-compile.")]
+        self.assertEqual(leftovers, [], "temp file left behind")
+
+    def test_an_unchanged_sidecar_is_not_rewritten(self):
+        self.cli()
+        self.cli("--install")
+        before = os.stat(self.sidecar).st_mtime_ns
+        os.utime(self.sidecar, ns=(before - 10**9, before - 10**9))
+        stamped = os.stat(self.sidecar).st_mtime_ns
+        self.cli("--install")
+        self.assertEqual(stamped, os.stat(self.sidecar).st_mtime_ns)
+
 
 class TestRealPack(unittest.TestCase):
-    """The shipped personas/ pack compiles, and every live target is wired."""
+    """The shipped personas/ pack compiles from a clean checkout.
 
-    def test_repo_pack_compiles_and_is_installed(self):
+    Deliberately driven through the COMMITTED config.example.toml into a
+    tempdir. personas/config.toml, personas/compiled/ and the persona.md
+    sidecars are all gitignored, so anything that reads them tests the author's
+    working directory rather than the branch — and asserting that *this*
+    installation's targets are wired would be carrying installation policy in
+    the core, which is exactly what the core is not supposed to do.
+    """
+
+    def test_repo_pack_compiles_from_the_committed_sources_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rc, _ = run("--repo", REPO,
-                        "--personas-dir", os.path.join(REPO, "personas"),
-                        "--out", os.path.join(tmp, "compiled"))
-            self.assertEqual(rc, 0)
-        rc, err = run("--repo", REPO, "--check")
-        self.assertEqual(rc, 0, f"personas/ is out of date — run "
-                                f"bin/persona-compile --install\n{err}")
+            rc, err = run("--repo", REPO,
+                          "--personas-dir", os.path.join(REPO, "personas"),
+                          "--config", os.path.join(REPO, "personas",
+                                                   "config.example.toml"),
+                          "--out", os.path.join(tmp, "compiled"))
+            self.assertEqual(rc, 0, err)
+            for role in pc.discover_roles(os.path.join(REPO, "personas")):
+                self.assertTrue(
+                    os.path.isfile(os.path.join(tmp, "compiled", f"{role}.md")))
+            self.assertTrue(
+                os.path.isfile(os.path.join(tmp, "compiled", "MANIFEST.md")))
+
+    def test_shipped_crews_name_no_roles(self):
+        """The public core carries mechanism, not one estate's org chart.
+
+        A crew is a register and applies identically to every role wearing it,
+        so a `## <Role>` overlay in a shipped crew is both an identity leak and
+        an instruction most sessions cannot satisfy.
+        """
+        crews = os.path.join(REPO, "personas", "crews")
+        for filename in sorted(os.listdir(crews)):
+            if not filename.endswith(".md"):
+                continue
+            with self.subTest(crew=filename):
+                body = slurp(os.path.join(crews, filename))
+                headings = [l for l in body.splitlines() if l.startswith("## ")]
+                self.assertEqual(headings, [], f"{filename} carries per-role "
+                                               f"overlays: {headings}")
+                self.assertNotIn("Apply only the overlay", body)
 
     def test_every_shipped_crew_compiles_for_every_role(self):
         personas = os.path.join(REPO, "personas")

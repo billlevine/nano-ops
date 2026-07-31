@@ -54,10 +54,14 @@ generated persona block and survives every persona recompile.
 This loop reads fine with no persona at all — everything above is the
 operational contract, and it is complete on its own.
 
-If your estate compiles personas, the compiler appends a generated block
-below this line, between `BEGIN GENERATED PERSONA` / `END GENERATED PERSONA`
-markers. Nothing inside those markers is hand-edited: change the source files
-and recompile. A persona block shapes voice, judgment emphasis, and what you
-notice. It never adds authority, relaxes a safety rule, changes a required
-action, or replaces an output format — those live in this file and in the
-skill, and they win every time.
+If your estate compiles personas, name this loop in `personas/config.toml`
+`[targets]`, add the generated-persona marker pair below this paragraph where
+you want the import to sit, and run `bin/persona-compile --install`. The
+compiler never invents that location — a target with no markers is reported as
+drift and left untouched — so placing them is a decision you make once, by
+hand. See `docs/personas.md`; `loops/example/AGENTS.md` shows the finished
+shape. Nothing inside the markers is hand-edited, and neither is the
+`persona.md` sidecar they point at: change `personas/` and recompile. A persona
+shapes voice, judgment emphasis, and what you notice. It never adds authority,
+relaxes a safety rule, changes a required action, or replaces an output format
+— those live in this file and in the skill, and they win every time.
