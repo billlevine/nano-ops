@@ -3,8 +3,8 @@ name: mechanic
 description: >-
   Nightly self-optimization pass over this estate — finds cost/config
   optimizations, scriptability candidates, and public-core extraction
-  candidates, applies only safe reversible doc changes, and writes
-  everything else up as morning proposals. Use when the user says
+  candidates, and writes every one of them up as a morning proposal. It
+  implements nothing itself. Use when the user says
   "run the mechanic", "mechanic pass",
   "what did the mechanic find", "the mechanic's report", "optimization
   report", "tune the loops", or runs `/loop <interval> /mechanic` in a
@@ -48,8 +48,10 @@ registry, session configs, lessons, loop skills — and asks five questions:
    drives, and only when they say so.
 
 **Roles: the mechanic diagnoses and proposes.** The hub operates; a dev
-session at the repo root edits. The mechanic's one apply lane is narrow and
-defined below.
+session at the repo root edits. **The mechanic implements nothing.** Every
+finding leaves this loop as a proposal, an observation, or a recorded decision
+not to propose — never as a commit. See **What the mechanic may write** below,
+which is the whole of it.
 
 **Never block on a prompt**: the pass runs at night with nobody watching. The
 operator watches their control channel, not the agent-deck TUI, so a pending
@@ -212,11 +214,19 @@ recorded, `windows` says `done` until the next night.
    Proposals only — filing a candidate is the operator's move once they
    approve, not the mechanic's. A quiet pass here is the normal case;
    extraction-worthy changes are rare and bursty.
-6. **Classify and act.** Sort every finding into the apply lane or a
-   proposal (definitions below). Apply-lane changes: make the edit, one
-   git commit each (no push), one central-ledger line each. Record every
-   finding either way:
-   `record '{"event":"finding","class":"cost|config|scriptability|extraction","action":"applied|proposed","summary":"..."}'`.
+6. **Classify and record.** Every finding gets one of three dispositions, and
+   none of them is an edit:
+   - `proposed` — it goes in REPORT.md as a proposal, with its evidence.
+   - `observed` — worth knowing, not worth acting on. It goes under
+     **Observations** in the Evidence section.
+   - `no-proposal` — you looked and decided not to propose anything. Say why
+     in the summary; "I considered this and it isn't worth a change" is a
+     result, and a silent finding is indistinguishable from a missed one.
+
+   `record '{"event":"finding","class":"cost|config|scriptability|extraction","action":"proposed|observed|no-proposal","summary":"..."}'`.
+   There is no `applied`. If you catch yourself reaching for one, the finding
+   is a proposal and the edit is somebody else's — see **What the mechanic may
+   write**.
 7. **Write `../../state/mechanic/REPORT.md`** (overwrite; history.jsonl
    is the archive). Two layers over one source of truth — a short
    handoff the operator can act on, and the evidence that backs it:
@@ -229,16 +239,14 @@ recorded, `windows` says `done` until the next night.
          Evidence section / a file / a ledger date>.
        - **P2 …**
 
-       ## Applied autonomously
-       - <sha> <what and why>
-
        ## Evidence
        ### P1 <title>
        - the quoted ledger lines / config values that support it
        - the exact suggested change
        - caveats, alternatives considered, what would falsify this
-       ### Observations (no action)
-       - <worth knowing, not worth acting on>
+       ### Observations (no proposal)
+       - <worth knowing, not worth acting on — or looked at and
+         deliberately not proposed, with why>
 
    **The handoff is short; the evidence is complete.** Three or four
    sentences per proposal, in the order above — recommendation first,
@@ -255,28 +263,47 @@ recorded, `windows` says `done` until the next night.
 
    **A proposal is a request, not a plan you are about to carry out.**
    Writing P1 gives you no authority to make the change, and neither does
-   the operator agreeing with it in the channel — that is the hub's work. See
-   the apply lane below, which is unchanged.
-8. `record '{"event":"pass_done","findings":N,"applied":N,"proposed":N}'`,
+   the operator agreeing with it in the channel — that is the hub's work, or
+   the dev session's. There is no lane in which it becomes yours.
+8. `record '{"event":"pass_done","findings":N,"proposed":N,"observed":N,"no_proposal":N}'`,
    then append one summary line to `../../state/ledger.jsonl` as
    `{"ts","actor":"mechanic","kind":"activity","summary":"..."}`.
 
-## The apply lane
+## What the mechanic may write
 
-A finding may be applied autonomously only when **all four** hold:
+Exactly two things, and neither of them is an implementation:
 
-1. The change is to a file under `docs/` or `state/mechanic/`.
-2. No running session reads that file to decide its behavior.
-3. `git revert` restores it completely — no side effects beyond the file.
-4. It changes words or records, not what any loop *does*.
+1. **Its own operational state, under `../../state/mechanic/`** —
+   `history.jsonl` (the authoritative pass archive), `REPORT.md` (the morning
+   view), `digest.json` (the baseline snapshot), `last_tick` (the heartbeat),
+   and `config.toml` when the engine writes it. These are how the loop *runs*.
+   They are written through `mechanic.py` (`record`, `gather`, the report
+   write), never by hand-editing a file the engine owns.
+2. **One central-ledger line per pass**, appended to `../../state/ledger.jsonl`
+   as `{"ts","actor":"mechanic","kind","summary"}`, plus a line for any error
+   or correction the pass hits. Append-only, same as every other loop.
 
-Everything else is a proposal in REPORT.md. In particular these are
-**always** proposals, never direct edits — not for typos, not for
-one-character fixes, not when the fix is "obviously safe":
+**Nothing else. No git commit, ever.** The mechanic diagnoses and proposes; it
+does not implement. It used to be allowed to edit and commit files under
+`docs/` on its own when a four-part safety test passed. The test was sound and
+the changes were reversible — that was never the problem. The problem is that
+"diagnose and propose, never operate" and "except for this one class of change"
+cannot both be the rule, and the exception is the half a tired reader
+remembers. So the lane is gone rather than narrowed again.
+
+What that means concretely for the cases the lane used to cover:
+
+| Used to be an apply | Now |
+|---|---|
+| A distilled lessons entry from ledger corrections | A proposal. Whatever store your estate keeps its lessons in, the mechanic proposes the entry; the hub or the dev session writes it. |
+| An ideas-file note | A proposal, or an observation if it is just worth knowing. |
+| A doc typo, "harmless to fix" | A proposal. The cost of one more line in REPORT.md is smaller than the cost of a lane. |
+
+And the things that were never applyable stay exactly as they were:
 
 - `loops.toml` values (model, interval, autostart — they change running
   behavior at the next restart)
-- any file under another `loops/<name>/`, `hub/`, `bin/`, or `infra/`
+- any file under another `loops/<name>/`, `hub/`, `bin/`, `infra/`, or `docs/`
 - anything requiring a session start/stop/restart or an
   `agent-deck session send` — the mechanic never touches sessions;
   the hub is the operator
@@ -290,6 +317,7 @@ one-character fixes, not when the fix is "obviously safe":
 | "It's a one-line model swap the operator already wants" | The operator decides *when*; a restart is operator work |
 | "The skill has a typo, harmless to fix" | Skill edits need a session restart to take effect — operator work, and stale-skill states are a classic way loops break |
 | "I'll just restart it myself so the fix lands" | Session lifecycle belongs to the hub, full stop |
+| "It's only a docs change, and it's revertible" | That was the old apply lane. It is gone; a revertible change is still a change nobody reviewed |
 
 ## Morning relay
 

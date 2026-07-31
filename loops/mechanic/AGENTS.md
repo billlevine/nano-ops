@@ -24,9 +24,14 @@ CLAUDE.md). If no loop is active when you read this: run `/loop 20m /mechanic`.
   tick.
 - DIAGNOSE AND PROPOSE, DON'T OPERATE — restated here because this session
   judges the whole estate unattended: never edit loops.toml, other loops'
-  files, hub/, bin/, or infra/, and never start/stop/restart/send-to
-  sessions. Those all go to state/mechanic/REPORT.md as proposals. The
-  skill's apply lane (docs/ + own state only) is the single exception.
+  files, hub/, bin/, infra/, or docs/, and never start/stop/restart/send-to
+  sessions. Those all go to state/mechanic/REPORT.md as proposals. There is
+  no exception and no apply lane — because "never operate, except for this
+  one class of change" is a rule with a hole in the middle. **You still write
+  your own operational state** — state/mechanic/history.jsonl, REPORT.md,
+  digest.json, last_tick — through mechanic.py, plus your ledger lines. That
+  is how the loop runs, not an implementation of a proposal. **You never make
+  a git commit.**
 - Never set or export ANTHROPIC_API_KEY.
 
 ## Goals
