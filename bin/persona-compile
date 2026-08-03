@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""persona-compile — resolve the persona source layers into one file per role.
+
+Reads personas/ (WORLDVIEW.md + HOUSE_STYLE.md + roles/<role>.md +
+crews/<crew>.md, selected by personas/config.toml) and writes one compiled
+persona per role to personas/compiled/<role>.md, plus MANIFEST.md recording
+the selected crew and the content hash of every compiled body.
+
+The compiled body is what actually enters a session's prompt. `--install`
+writes it to a `persona.md` sidecar beside each target CLAUDE.md and puts a
+`@persona.md` import between that file's generated markers.
+
+The import matters: the harness resolves `@` when it injects CLAUDE.md, so the
+body is in the prompt at startup and after auto-compaction. A prose reference
+("load ./personas/compiled/<role>.md") is NOT equivalent — it depends on the
+model choosing to Read the file, which silently loaded nothing on Haiku. Nor
+is a non-sibling import: `@../../...` and absolute paths resolve to nothing.
+Both verified by headless probe on a small model with the file-reading tools
+denied, so nothing could arrive via a tool call; see docs/personas.md.
+
+The payoff over inlining the body directly is that CLAUDE.md stays byte-stable
+across recompiles. Only the sidecar changes when a persona changes, so a
+persona edit no longer shows up as a diff in an operational-contract file.
+
+Deterministic by construction: no timestamps, no environment, sorted output.
+Compiling the same sources twice produces byte-identical files.
+
+Usage:
+    bin/persona-compile                 compile all roles into personas/compiled/
+    bin/persona-compile --check         verify compiled/ and installed blocks
+                                        are up to date (exit 1 on drift)
+    bin/persona-compile --install       refresh the generated block in each
+                                        target CLAUDE.md
+    bin/persona-compile --role hub      restrict to one role
+    bin/persona-compile --print hub     write the compiled body to stdout
+
+    --check and --install are mutually exclusive, and --print combines with
+    neither: each of those pairs would otherwise silently ignore one of the
+    modes asked for. --role narrows a compile to one role and skips MANIFEST.md,
+    so a full pass is what refreshes the audit record.
+
+    --personas-dir DIR / --config FILE / --out DIR / --repo DIR override paths
+    (used by the tests; defaults are all derived from the repo root).
+
+Nothing here starts, stops, or talks to a session. Applying a compiled persona
+to a running loop is a deliberate restart, done by hand.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+import tempfile
+import tomllib
+
+BEGIN = "<!-- BEGIN GENERATED PERSONA — bin/persona-compile"
+END = "<!-- END GENERATED PERSONA -->"
+
+# Filename of the sidecar written beside each target CLAUDE.md and imported by
+# it. One fixed name for every target: each lives in its own directory, and the
+# import is resolved relative to that directory.
+SIDECAR = "persona.md"
+
+# A ```/~~~ fence line, and an HTML comment block. Both are things strip_title
+# must recognise rather than treat as prose — see its docstring.
+FENCE = re.compile(r"^\s*(```|~~~)")
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+# The one piece of prose the compiler itself owns. It pins the persona layer
+# below the operational contract in every compiled output, so a persona can
+# never be read as relaxing an authority or safety rule.
+PREAMBLE = """\
+This is the persona layer. It shapes voice, judgment emphasis, and what you
+notice. It never adds authority, relaxes a safety rule, changes a required
+action, or replaces an output format. Those live in this CLAUDE.md and in the
+skill, and they win every time.
+
+Precedence: truth, then action, then the operational contract, then evidence,
+then role judgment, then house prose, then role signature, then crew costume.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# paths
+# --------------------------------------------------------------------------- #
+def repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def read(path: str) -> str:
+    # newline="" disables universal-newline translation. Without it a CRLF
+    # target is silently normalised to LF on the way back out, which would
+    # rewrite hand-written bytes OUTSIDE the generated markers — the one thing
+    # install promises never to touch.
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Replace a file's contents without ever leaving it truncated.
+
+    These are operational-contract files and their load-bearing sidecars. A
+    plain open(path, "w") truncates first, so an interrupt or a full disk
+    leaves a session's CLAUDE.md empty. Write a sibling temp file, flush it to
+    disk, then rename over the target: readers see the old bytes or the new
+    ones, never a partial file. newline="" for the same reason as read().
+    """
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".persona-compile.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# source normalisation
+# --------------------------------------------------------------------------- #
+def strip_title(text: str, demote: int = 1) -> tuple[str, str]:
+    """Split a source file into (H1 title, body with headings demoted `demote` levels).
+
+    Sources are authored as standalone documents (`# The tracker` / `## Signature`).
+    The compiled file nests them, so every remaining heading drops to the depth of
+    the section it lands under.
+
+    Three things this is careful about, because the output is prompt text:
+
+    - Fenced code blocks are left alone. A `# comment` inside a ```bash fence is
+      a shell comment, not a heading, and promoting it corrupts the example.
+    - Demotion clamps at H6. Markdown has no H7, so overflowing produces a line
+      that renders as literal `#######` text.
+    - HTML comments are dropped. That is what lets a template file carry
+      instructions for the human editing it (see personas/roles/example.md)
+      without those instructions becoming the compiled session's disposition.
+    """
+    text = HTML_COMMENT.sub("", text)
+    lines = text.strip("\n").split("\n")
+    title = ""
+    if lines and lines[0].startswith("# "):
+        title = lines[0][2:].strip()
+        lines = lines[1:]
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+
+    out, in_fence = [], False
+    for line in lines:
+        if FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        m = None if in_fence else re.match(r"^(#{1,6}) (.*)$", line)
+        if m:
+            level = min(len(m.group(1)) + demote, 6)
+            out.append("#" * level + " " + m.group(2))
+        else:
+            out.append(line)
+    # Dropping comment blocks can leave a run of blank lines behind.
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(out))
+    return title, body.strip("\n")
+
+
+def load_config(path: str) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def crew_for(role: str, cfg: dict, cfg_path: str = "config.toml") -> str:
+    """The hub may wear a different signature from the loop crew.
+
+    Two tiers, keyed off the role named `hub` — which is a structural concept of
+    this repo (`hub/` is a top-level directory that `bin/ops up` starts), not an
+    installation's identity. A per-role tier is a config-schema change, not a
+    bug fix, so it is not made here; `loop_crew` remains the fallback.
+    """
+    key = "hub" if role == "hub" else "loop_crew"
+    crew = cfg.get(key)
+    if not isinstance(crew, str) or not crew:
+        what = "is missing" if crew is None else "must be a crew name (a string), not"
+        got = "" if crew is None else f" {type(crew).__name__}"
+        raise SystemExit(f"persona-compile: {cfg_path} {what} `{key}`{got}")
+    return crew
+
+
+def discover_roles(personas_dir: str) -> list[str]:
+    d = os.path.join(personas_dir, "roles")
+    if not os.path.isdir(d):
+        raise SystemExit(f"persona-compile: no roles directory at {d}")
+    roles = sorted(f[:-3] for f in os.listdir(d) if f.endswith(".md"))
+    if not roles:
+        raise SystemExit(f"persona-compile: no roles in {d}; at least one "
+                         f"<role>.md is required (copy roles/example.md)")
+    return roles
+
+
+# --------------------------------------------------------------------------- #
+# compile
+# --------------------------------------------------------------------------- #
+def compile_role(role: str, personas_dir: str, cfg: dict,
+                 cfg_path: str = "config.toml") -> dict:
+    """Resolve one role into its compiled body. Returns a record for the manifest."""
+    crew = crew_for(role, cfg, cfg_path)
+    paths = {
+        "worldview": os.path.join(personas_dir, "WORLDVIEW.md"),
+        "house": os.path.join(personas_dir, "HOUSE_STYLE.md"),
+        "role": os.path.join(personas_dir, "roles", f"{role}.md"),
+        "crew": os.path.join(personas_dir, "crews", f"{crew}.md"),
+    }
+    for what, p in paths.items():
+        if not os.path.isfile(p):
+            raise SystemExit(f"persona-compile: role '{role}' needs {what} at {p}, "
+                             f"which does not exist")
+
+    src = {k: read(p) for k, p in paths.items()}
+    # Role bodies carry their own `## Disposition` / `## Signature` headings and
+    # land one level deeper than the rest, so they drop two levels, not one.
+    _, wv = strip_title(src["worldview"])
+    _, hs = strip_title(src["house"])
+    role_title, role_body = strip_title(src["role"], demote=2)
+    crew_title, crew_body = strip_title(src["crew"])
+
+    display = role_title or role
+    src_line = " ".join(
+        f"{os.path.relpath(paths[k], personas_dir)}@{sha256(src[k])[:12]}"
+        for k in ("worldview", "house", "role", "crew"))
+
+    body = "\n".join([
+        f"## Persona — {display}",
+        "",
+        PREAMBLE.rstrip("\n"),
+        "",
+        "### Shared worldview",
+        "",
+        wv,
+        "",
+        "### House prose",
+        "",
+        hs,
+        "",
+        f"### Role — {display}",
+        "",
+        role_body,
+        "",
+        f"### Crew — {crew_title or crew}",
+        "",
+        crew_body,
+        "",
+    ])
+    return {
+        "role": role,
+        "display": display,
+        "crew": crew,
+        "body": body,
+        "sha": sha256(body),
+        "sources": src_line,
+    }
+
+
+def compiled_file(rec: dict) -> str:
+    """The standalone personas/compiled/<role>.md rendering of a body."""
+    return "\n".join([
+        "<!-- GENERATED by bin/persona-compile — DO NOT EDIT. "
+        "Edit personas/ sources and recompile. -->",
+        f"<!-- role={rec['role']} crew={rec['crew']} sha256={rec['sha'][:12]} -->",
+        f"<!-- sources: {rec['sources']} -->",
+        "",
+        f"# Compiled persona — {rec['display']}",
+        "",
+        rec["body"],
+    ])
+
+
+def block(rec: dict) -> str:
+    """The generated block installed into a live CLAUDE.md.
+
+    It is a POINTER, not the body: a `@`-import of the sidecar written next to
+    the target (see sidecar_path). The harness resolves `@` at injection time,
+    so the body still arrives in the prompt at startup and after compaction —
+    the property that makes this safe at all — while the body itself stays in
+    its own file, separately reviewable and updateable.
+
+    Keeping CLAUDE.md byte-stable across recompiles is the point: only the
+    sidecar changes when a persona changes, so a recompile no longer shows up
+    as a diff in an operational-contract file (or as extraction drift on one).
+
+    Note what is NOT here: the crew and the content hash. Those live in the
+    sidecar's own header. If the stamp were here, every persona edit would
+    still rewrite CLAUDE.md and the decoupling would buy nothing. Only `role`
+    survives, because which persona a file wears is a property of the target
+    (config.toml `[targets]`), not of the persona's content — so this block
+    changes only when a target is deliberately re-pointed at another role."""
+    return "\n".join([
+        f"{BEGIN} · role={rec['role']} -->",
+        "<!-- Do not edit inside these markers, and do not edit the "
+        f"{SIDECAR} it points at. Edit personas/ and run "
+        "bin/persona-compile --install. -->",
+        "",
+        f"@{SIDECAR}",
+        "",
+        END,
+    ])
+
+
+def sidecar_path(repo: str, target_rel: str) -> str:
+    """Where a target's persona body lives: a sibling of its CLAUDE.md.
+
+    It MUST be a sibling. A `@`-import only resolves at or below the session's
+    own directory — `@../../personas/compiled/<role>.md` and an absolute path
+    both silently import nothing — no error, just a session wearing no persona.
+    See docs/personas.md. personas/compiled/<role>.md is the deterministic
+    artifact `--check` compares against — nothing reads it at install time and
+    it is gitignored, so it is a comparand rather than a review surface; this
+    is the installed copy, the same body under a name the import can reach."""
+    return os.path.join(repo, os.path.dirname(target_rel), SIDECAR)
+
+
+def contained(repo: str, path: str) -> bool:
+    """Is `path` inside the repo? Config values must not be able to escape it.
+
+    os.path.join drops `repo` entirely when handed an absolute component, and
+    never collapses `..`, so an unvalidated [targets] value rewrites files
+    anywhere on the filesystem. Compared on realpath so a symlinked target is
+    judged by where the write actually lands.
+    """
+    root = os.path.realpath(repo)
+    return os.path.realpath(path) == root or \
+        os.path.realpath(path).startswith(root + os.sep)
+
+
+def validate_targets(repo: str, targets: dict, roles: list[str],
+                     cfg_path: str) -> None:
+    """Reject a [targets] table before anything is written, not partway through."""
+    for name, rel in sorted(targets.items()):
+        if name not in roles:
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] names "
+                             f"'{name}', which has no personas/roles/{name}.md")
+        if not isinstance(rel, str) or not rel:
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] {name} must "
+                             f"be a path relative to the repo root")
+        if os.path.isabs(rel) or not contained(repo, os.path.join(repo, rel)):
+            raise SystemExit(f"persona-compile: {cfg_path} [targets] {name} = "
+                             f"'{rel}' resolves outside the repo; targets are "
+                             f"relative to the repo root")
+
+    # One fixed sidecar name per directory. Two targets sharing a directory
+    # overwrite each other's body, and no --install ever makes --check clean —
+    # so say so now rather than exiting 0 on wiring that cannot converge.
+    seen: dict[str, str] = {}
+    for name, rel in sorted(targets.items()):
+        spath = os.path.realpath(sidecar_path(repo, rel))
+        if spath in seen:
+            raise SystemExit(
+                f"persona-compile: {cfg_path} [targets] {seen[spath]} and {name} "
+                f"both resolve to {os.path.relpath(spath, repo)}; each target "
+                f"needs its own directory, since the sidecar name is fixed")
+        seen[spath] = name
+
+
+def uncode(text: str) -> str:
+    """Blank out fenced code blocks, keeping line count so offsets still line up.
+
+    Documentation quotes these markers — docs/personas.md shows the pair a
+    target needs, and the loops describe them in prose. A scanner that cannot
+    tell a documented marker from an installed one reports the documentation as
+    a stray persona, which is the same class of mistake as splicing on a
+    first-match find.
+    """
+    out, in_fence = [], False
+    for line in text.split("\n"):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            out.append("")
+        else:
+            out.append("" if in_fence else line)
+    return "\n".join(out)
+
+
+# Runtime state, VCS internals and dependency trees are never persona targets,
+# and state/ in particular can hold whole worktrees.
+SKIP_DIRS = {".git", ".flox", "node_modules", "state", "__pycache__"}
+
+
+def installed_blocks(repo: str) -> list[tuple[str, str | None]]:
+    """Every file in the repo carrying a generated block, with the role it names.
+
+    --check otherwise only ever looks at what the config currently selects, so
+    dropping a role from [targets] leaves its block and body in place, worn by
+    a live session, and reports clean forever. The one transient signal (a
+    stale MANIFEST.md) is extinguished by the next --install.
+    """
+    found = []
+    for base, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for name in sorted(files):
+            if not name.endswith(".md"):
+                continue
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                continue  # the link's target is walked on its own
+            try:
+                text = uncode(read(path))
+            except (OSError, UnicodeDecodeError):
+                continue
+            if BEGIN not in text:
+                continue
+            m = re.search(re.escape(BEGIN) + r"\s*·\s*role=([^\s]+)", text)
+            found.append((os.path.relpath(path, repo), m.group(1) if m else None))
+    return found
+
+
+def sidecar(rec: dict) -> str:
+    """The generated sidecar body imported by a target's CLAUDE.md."""
+    return "\n".join([
+        f"<!-- GENERATED by bin/persona-compile — DO NOT EDIT. "
+        f"role={rec['role']} · crew={rec['crew']} · sha256={rec['sha'][:12]} -->",
+        "<!-- Source: personas/. Change a persona there and run "
+        "bin/persona-compile --install. -->",
+        "",
+        rec["body"].rstrip("\n"),
+        "",
+    ])
+
+
+def manifest(recs: list[dict], targets: dict) -> str:
+    lines = [
+        "<!-- GENERATED by bin/persona-compile — DO NOT EDIT. -->",
+        "",
+        "# Compiled persona manifest",
+        "",
+        "The auditable record of what each session is wearing. `sha256` is the",
+        "hash of the compiled body; it is recorded here and in the installed",
+        "sidecar's own header. It is deliberately NOT in the generated block in",
+        "the target CLAUDE.md — that block carries only the role, which is what",
+        "keeps the target byte-stable across recompiles, and is why `--check`",
+        "compares the sidecar on its own. `bin/persona-compile --check` fails",
+        "when a compiled file, an installed block or a sidecar no longer matches",
+        "these sources.",
+        "",
+    ]
+    for rec in recs:
+        lines += [
+            f"## {rec['role']}",
+            "",
+            f"- display name: {rec['display']}",
+            f"- crew: {rec['crew']}",
+            f"- sha256: {rec['sha']}",
+            f"- target: {targets.get(rec['role'], '(not installed)')}",
+            f"- sources: {rec['sources']}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# install / check
+# --------------------------------------------------------------------------- #
+def marker_span(text: str) -> tuple[int, int] | None:
+    """Locate the one generated block in a target, or explain why there isn't one.
+
+    Returns (start, end-of-END) for exactly one well-formed pair. Raises
+    ValueError when the file has markers but not a usable pair, and returns
+    None only when it has none at all.
+
+    Uniqueness is the point. Taking the first `find` of each marker
+    independently is wrong in two directions, and both are silent: a stray or
+    quoted BEGIN ahead of the real block makes the replacement swallow every
+    hand-written line between them, and a second complete pair is left live in
+    the prompt while a check that only compared the first reports clean. A
+    target that mentions the markers in prose is a real thing — the loops
+    document them — so this refuses rather than guesses.
+    """
+    starts = [m.start() for m in re.finditer(re.escape(BEGIN), text)]
+    ends = [m.start() for m in re.finditer(re.escape(END), text)]
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1:
+        raise ValueError(
+            f"expected exactly one generated-persona marker pair, found "
+            f"{len(starts)} BEGIN and {len(ends)} END")
+    if ends[0] < starts[0]:
+        raise ValueError("generated-persona END marker precedes its BEGIN")
+    return starts[0], ends[0] + len(END)
+
+
+def replace_block(text: str, new_block: str) -> str:
+    """Swap the generated block in a target file. Markers must already exist."""
+    span = marker_span(text)
+    if span is None:
+        raise ValueError("no generated-persona markers")
+    start, end = span
+    return text[:start] + new_block + text[end:]
+
+
+def current_block(text: str) -> str | None:
+    span = marker_span(text)
+    if span is None:
+        return None
+    start, end = span
+    return text[start:end]
+
+
+def run(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="persona-compile", add_help=True)
+    ap.add_argument("--repo", default=repo_root())
+    ap.add_argument("--personas-dir")
+    ap.add_argument("--config")
+    ap.add_argument("--out")
+    ap.add_argument("--role", action="append",
+                    help="restrict to this role (repeatable)")
+    ap.add_argument("--check", action="store_true",
+                    help="verify compiled files and installed blocks; exit 1 on drift")
+    ap.add_argument("--install", action="store_true",
+                    help="refresh the generated block in each target CLAUDE.md")
+    ap.add_argument("--print", dest="print_role",
+                    help="write one compiled body to stdout and exit; cannot be "
+                         "combined with --check or --install")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args(argv)
+
+    # Reject rather than silently resolve. --print returns before any drift or
+    # install work, and the check/install branches are check-first, so each of
+    # these combinations used to succeed while ignoring what was asked for —
+    # including handing a caller exit 0 from a command that never looked.
+    if args.print_role and (args.check or args.install):
+        ap.error("--print cannot be combined with --check or --install")
+    if args.check and args.install:
+        ap.error("--check and --install are mutually exclusive")
+
+    repo = os.path.abspath(args.repo)
+    personas_dir = args.personas_dir or os.path.join(repo, "personas")
+    cfg_path = args.config or os.path.join(personas_dir, "config.toml")
+    out_dir = args.out or os.path.join(personas_dir, "compiled")
+    if not os.path.isfile(cfg_path):
+        raise SystemExit(f"persona-compile: no config at {cfg_path}")
+    cfg = load_config(cfg_path)
+    targets = cfg.get("targets", {})
+    if not isinstance(targets, dict):
+        raise SystemExit(f"persona-compile: {cfg_path} [targets] must be a table "
+                         f"of role = \"path\", not {type(targets).__name__}")
+
+    roles = discover_roles(personas_dir)
+    unknown = [r for r in (args.role or []) if r not in roles]
+    if unknown:
+        raise SystemExit(f"persona-compile: unknown role(s): {', '.join(unknown)}. "
+                         f"known: {', '.join(roles)}")
+    validate_targets(repo, targets, roles, cfg_path)
+    if args.role:
+        roles = [r for r in roles if r in args.role]
+
+    recs = [compile_role(r, personas_dir, cfg, cfg_path) for r in roles]
+
+    if args.print_role:
+        match = [r for r in recs if r["role"] == args.print_role]
+        if not match:
+            raise SystemExit(f"persona-compile: no compiled role '{args.print_role}'")
+        sys.stdout.write(match[0]["body"])
+        return 0
+
+    drift: list[str] = []
+
+    # personas/compiled/<role>.md
+    for rec in recs:
+        path = os.path.join(out_dir, f"{rec['role']}.md")
+        want = compiled_file(rec)
+        if args.check:
+            have = read(path) if os.path.isfile(path) else None
+            if have != want:
+                drift.append(f"{os.path.relpath(path, repo)} is stale"
+                             if have else
+                             f"{os.path.relpath(path, repo)} is missing")
+        else:
+            os.makedirs(out_dir, exist_ok=True)
+            write_atomic(path, want)
+
+    # Nothing else enumerates the output directory, so a role that was renamed
+    # or removed leaves its compiled file behind under a clean report.
+    if args.check and not args.role and os.path.isdir(out_dir):
+        expected = {f"{rec['role']}.md" for rec in recs} | {"MANIFEST.md"}
+        for name in sorted(os.listdir(out_dir)):
+            if name.endswith(".md") and name not in expected:
+                drift.append(f"{os.path.relpath(os.path.join(out_dir, name), repo)} "
+                             f"is orphaned (no personas/roles/{name})")
+
+    # MANIFEST.md — only meaningful for a full compile
+    if not args.role:
+        mpath = os.path.join(out_dir, "MANIFEST.md")
+        want = manifest(recs, targets)
+        if args.check:
+            have = read(mpath) if os.path.isfile(mpath) else None
+            if have != want:
+                drift.append(f"{os.path.relpath(mpath, repo)} is "
+                             f"{'stale' if have else 'missing'}")
+        else:
+            os.makedirs(out_dir, exist_ok=True)
+            write_atomic(mpath, want)
+    elif not args.check:
+        # A targeted compile deliberately skips the manifest, which then
+        # asserts a stale sha for the role just rebuilt. Say so rather than
+        # letting the next full --check report drift the operator did not cause.
+        if not args.quiet:
+            print("note: --role skips MANIFEST.md; run a full compile to refresh "
+                  "the audit record", file=sys.stderr)
+
+    # Installed blocks in the live CLAUDE.md files. A bare compile only refreshes
+    # personas/compiled/; wiring a target is a deliberate --install / --check.
+    for rec in recs:
+        rel = targets.get(rec["role"])
+        if not rel or not (args.check or args.install):
+            continue
+        path = os.path.join(repo, rel)
+        if not os.path.isfile(path):
+            drift.append(f"{rel} (target for role '{rec['role']}') does not exist")
+            continue
+        text = read(path)
+        want = block(rec)
+        try:
+            have = current_block(text)
+        except ValueError as e:
+            # Markers present but not a usable pair. Never guess which one to
+            # replace — replacing the wrong span deletes hand-written contract
+            # text with no error and no backup.
+            drift.append(f"{rel} has malformed generated-persona markers: {e}")
+            continue
+        if have is None:
+            drift.append(f"{rel} has no generated-persona markers "
+                         f"(add them once, then --install)")
+            continue
+        if args.check:
+            if have != want:
+                drift.append(f"{rel} installed block is stale")
+        elif args.install and have != want:
+            write_atomic(path, replace_block(text, want))
+
+        # The sidecar the block imports. Compared even when the block itself is
+        # already current: the block carries NOTHING derived from the persona's
+        # content — only the role — so an out-of-date body behind an up-to-date
+        # pointer is invisible unless the sidecar is compared on its own.
+        spath = sidecar_path(repo, rel)
+        swant = sidecar(rec)
+        srel = os.path.relpath(spath, repo)
+        shave = read(spath) if os.path.isfile(spath) else None
+        if args.check:
+            if shave != swant:
+                drift.append(f"{srel} is {'stale' if shave else 'missing'}")
+        elif args.install and shave != swant:
+            # Comparing before writing: --install is idempotent for the target,
+            # and the sidecar should not churn its mtime either.
+            write_atomic(spath, swant)
+
+    # A block on disk whose role is no longer in [targets] is a session still
+    # wearing a persona nothing selects. Only a full pass can say that, since
+    # --role deliberately narrows what is known.
+    if args.check and not args.role:
+        for rel, role in installed_blocks(repo):
+            if role is None:
+                drift.append(f"{rel} has a generated-persona block with no role= stamp")
+            elif role not in targets:
+                drift.append(f"{rel} still installs role '{role}', which is not in "
+                             f"[targets] (re-add it, or remove the block and its "
+                             f"{SIDECAR})")
+
+    if not args.quiet:
+        for rec in recs:
+            tgt = targets.get(rec["role"], "-")
+            print(f"{rec['role']:<12} crew={rec['crew']:<18} "
+                  f"sha256={rec['sha'][:12]}  {tgt}")
+        if args.check:
+            print("check: drift" if drift else "check: clean")
+
+    if drift:
+        for d in drift:
+            print(f"DRIFT {d}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

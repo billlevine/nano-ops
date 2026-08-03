@@ -1,0 +1,59 @@
+# personas/config.example.toml — committed sample persona selection.
+#
+# The real file is `personas/config.toml`, which is gitignored: which roles
+# your estate has, and which sessions wear them, is installation policy. Copy
+# this file and edit it:
+#
+#     cp personas/config.example.toml personas/config.toml
+#     bin/persona-compile --install
+#
+# A persona shapes voice, judgment emphasis, and what a session notices. It
+# never adds authority, relaxes a safety rule, changes a required action, or
+# replaces an output format — those live in each target's own CLAUDE.md and in
+# its skill, and they win every time.
+
+# WHICH COSTUME EACH TIER WEARS. Both name a file in personas/crews/ without
+# the .md, and they stay independently settable so the hub can sound different
+# from the loops. `loop_crew` is required whenever any role other than `hub`
+# exists; `hub` is required only if you have a personas/roles/hub.md. Setting
+# both is the simplest thing that always works.
+#
+#   working-clothes   plain and unadorned; the neutral default
+#   sharp-crew        concise and direct
+#   sharp-crew-lift   sharp-crew, plus controlled energy and dry humor
+#   warm-ensemble     collegial and warmer, still brief
+hub = "working-clothes"
+loop_crew = "working-clothes"
+
+# WHERE EACH COMPILED ROLE IS INSTALLED.
+#
+# Every key must match a personas/roles/<key>.md. Every value is the target
+# file, relative to the repo root. `--install` writes the body to a persona.md
+# sidecar beside that file and puts a stable `@persona.md` import between the
+# generated markers inside it. The target must already contain those markers;
+# the compiler never invents a location for them.
+#
+# Point at the CANONICAL file. This repo keeps AGENTS.md as the real file with
+# CLAUDE.md symlinked to it, so name AGENTS.md here. (Naming the symlink also
+# works — the write follows it through and the link survives — but the
+# canonical path is what you mean.)
+#
+# The sidecar MUST end up a sibling of the file that imports it. A `@` import
+# resolves only at or below the session's own directory: `@../../<path>` and
+# absolute paths import nothing at all, silently, leaving a session wearing no
+# persona. That is why the body is copied beside each target instead of being
+# imported from personas/compiled/.
+# Each target needs its own directory: the sidecar name is fixed, so two
+# targets in one directory would overwrite each other's body. The compiler
+# refuses such a config rather than exiting 0 on wiring that can never
+# check clean.
+#
+# Before uncommenting either line below you need TWO things that this repo does
+# not ship, and the compiler will not invent: a personas/roles/<role>.md (a
+# missing one is a hard error that blocks compiling every role, not just that
+# one), and the BEGIN/END GENERATED PERSONA marker pair already placed in the
+# target file where you want the import to sit. See docs/personas.md.
+[targets]
+example = "loops/example/AGENTS.md"
+# mechanic = "loops/mechanic/AGENTS.md"
+# hub      = "hub/AGENTS.md"

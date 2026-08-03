@@ -84,3 +84,23 @@ loops/<name>/
 ```
 
 State lives at `REPO/state/<name>/`, outside the loop directory and gitignored.
+
+## Persona (optional)
+
+This loop reads fine with no persona at all — everything above is the
+operational contract, and it is complete on its own.
+
+If your estate compiles personas, name this loop in `personas/config.toml`
+`[targets]` and run `bin/persona-compile --install`. The compiler writes the
+body to a `persona.md` sidecar beside this file and puts a `@persona.md` import
+between the markers below. Do not edit inside them, and do not edit the sidecar
+— change `personas/` and recompile. A persona shapes voice and judgment
+emphasis; it never adds authority, relaxes a safety rule, changes a required
+action, or replaces an output format. Those live above, and they win.
+
+<!-- BEGIN GENERATED PERSONA — bin/persona-compile · role=example -->
+<!-- Do not edit inside these markers, and do not edit the persona.md it points at. Edit personas/ and run bin/persona-compile --install. -->
+
+@persona.md
+
+<!-- END GENERATED PERSONA -->

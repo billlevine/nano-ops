@@ -70,8 +70,13 @@ bin/dashboard-refresh  keeps state/dashboard.json fresh via `dashboard --json`
 bin/dashboard-server   loopback-only static server for the dashboard (allowlist)
 bin/usage-fetch        writes state/usage/budget.json from Anthropic's usage API
 bin/followups          durable standing-action-item store
+bin/persona-compile    compiles personas/ into one body per role; --install
+                       wires it into each target via a persona.md sidecar
+personas/              the voice layer: WORLDVIEW.md + HOUSE_STYLE.md + roles/
+                       + crews/, plus config.example.toml (copy → config.toml)
 tests/                 test_dashboard.py, test_doorbell.py, test_followups.py,
-                       test_hub_skill.py, test-interactive-hub
+                       test_hub_skill.py, test_mechanic.py,
+                       test_persona_compile.py, test-interactive-hub
 .flox/env/manifest.toml  toolchain + [services], each under the supervisor wrapper
 loops.example.toml     committed sample registry (copy → loops.toml)
 infra/nano-ops-services.service.example
@@ -85,6 +90,8 @@ docs/extraction-allowlist.example.md
                        template for the allowlist the extraction lens parses
 docs/services-vs-systemd.md
                        measured evidence: Flox [services] vs systemd --user
+docs/personas.md       the voice layer: layers, why the import must be a sibling,
+                       and what --check does not prove
 docs/ideas.md          backlog the hub appends to from the control channel
 ```
 
@@ -109,11 +116,18 @@ a fresh tempdir and never touches real `state/`, real Slack, or a real
 guard — the invariant behind "Slack is optional" — by checking the skill still
 states it everywhere the tick would otherwise touch the channel:
 
+`tests/test_persona_compile.py` covers `bin/persona-compile` — determinism, the
+byte-stability guarantee, marker safety, path containment, and install/check
+drift. It compiles the shipped `personas/` pack through the committed
+`config.example.toml` into a tempdir, so it passes on a fresh clone without any
+`personas/config.toml` present.
+
 ```bash
 python3 tests/test_dashboard.py
 python3 tests/test_doorbell.py
 python3 tests/test_followups.py
 python3 tests/test_hub_skill.py
+python3 tests/test_persona_compile.py
 ```
 
 ### Interactive hub smoke test
