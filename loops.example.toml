@@ -135,3 +135,18 @@ role = "nightly self-optimization pass — diagnoses and proposes, never operate
 # and a budget guard can gate on. 900s (15m) keeps it fresh enough while holding
 # the authenticated /usage calls to ~96/day.
 refresh_seconds = 900
+
+# [extraction] — only meaningful in a PRIVATE FORK of this core, where it turns
+# on the mechanic's EXTRACTION lens: the pass that spots mechanism sitting in
+# your fork that belongs upstream in the public core. Commented out because a
+# fresh clone IS the core and has nothing to extract into.
+#
+# `repo` enables the lens — the value is never opened or resolved, only tested
+# for non-emptiness, so a typo leaves you a lens that looks healthy and compares
+# nothing. `allowlist` is optional and resolves against THIS repo (the fork),
+# not the core. docs/extraction-allowlist.example.md is the template to copy and
+# the spec for the format the lens parses.
+#
+# [extraction]
+# repo = "~/src/nano-ops"
+# allowlist = "docs/extraction-allowlist.md"

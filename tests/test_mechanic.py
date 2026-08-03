@@ -661,6 +661,64 @@ class TestParseAllowlist(unittest.TestCase):
         self.assertEqual(mechanic.parse_allowlist(""), ([], []))
 
 
+class TestShippedAllowlistTemplate(unittest.TestCase):
+    """docs/extraction-allowlist.example.md is parsed by the lens, so it is code.
+
+    ALLOWLIST_MD above is a hand-written fixture and can drift from what the
+    core actually ships; these cases read the real file, so a doc edit that
+    silently changes what the parser sees fails here instead of in someone's
+    fork."""
+
+    EXAMPLE = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docs", "extraction-allowlist.example.md")
+
+    def setUp(self):
+        with open(self.EXAMPLE, encoding="utf-8") as f:
+            self.text = f.read()
+        self.include, self.exclude = mechanic.parse_allowlist(self.text)
+
+    def test_include_is_exactly_the_documented_core_surface(self):
+        self.assertEqual(self.include, [
+            ".flox/env/manifest.lock", ".flox/env/manifest.toml", "bin/",
+            "docs/", "hub/", "infra/", "loops.example.toml", "loops/example/",
+            "loops/mechanic/", "tests/"])
+
+    def test_exclude_covers_every_fork_local_doc_the_template_names(self):
+        # The broad `docs/` include would otherwise nominate each of these for
+        # extraction into the public core on every pass.
+        for rel in ("docs/extraction-allowlist.md", "docs/ideas.md",
+                    "docs/lessons.md", "docs/new-machine-setup.md"):
+            self.assertIn(rel, self.exclude)
+        self.assertIn("state/", self.exclude)
+        self.assertIn("loops.toml", self.exclude)
+
+    def test_every_backticked_path_under_deliberately_out_is_an_exclude(self):
+        # The CAUTION promises this. An illustrative aside written in backticks
+        # in that section is a live pattern, not prose — which is why the
+        # section's own examples avoid backticking a real path.
+        out = [b for t, b in mechanic.split_sections(self.text)
+               if "deliberately out" in t.lower()]
+        self.assertEqual(len(out), 1, "the 'deliberately out' heading moved")
+        for tok in mechanic.BACKTICK_RE.findall(out[0]):
+            if not mechanic._pathlike(tok) or tok in self.include:
+                continue
+            self.assertIn(tok, self.exclude)
+
+    def test_no_include_pattern_is_missing_from_the_core(self):
+        root = os.path.dirname(os.path.dirname(self.EXAMPLE))
+        _, absent, _ = mechanic.resolve_allowlist(root, self.include)
+        self.assertEqual(absent, [], "template names paths this core lacks")
+
+    def test_the_three_parser_anchors_are_present(self):
+        # parse_allowlist finds its buckets by substring-matching these in a
+        # heading; renaming one empties its bucket with no error at all.
+        titles = [t.lower() for t, _ in mechanic.split_sections(self.text)]
+        for anchor in ("what is in", "invariant", "deliberately out"):
+            self.assertTrue(any(anchor in t for t in titles),
+                            f"no heading contains the anchor {anchor!r}")
+
+
 class TestExcludedBy(unittest.TestCase):
     def test_exact_and_prefix_matches(self):
         ex = ["state/", "loops.toml"]
