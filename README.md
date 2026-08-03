@@ -83,6 +83,11 @@ infra/nano-ops-services.service.example
                        template for the ONE boot supervisor unit (never installed)
 docs/design.md         architecture: the three layers, the always-on set, invariants
 docs/always-on.md      runbook for surviving logout and reboot
+docs/garage.md         the three roles, and where changes to the estate get built
+docs/upstream-updates.md
+                       taking core updates into your fork, and the rule that keeps them cheap
+docs/extraction-allowlist.example.md
+                       template for the allowlist the extraction lens parses
 docs/services-vs-systemd.md
                        measured evidence: Flox [services] vs systemd --user
 docs/personas.md       the voice layer: layers, why the import must be a sibling,

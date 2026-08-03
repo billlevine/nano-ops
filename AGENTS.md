@@ -40,6 +40,10 @@ private-fork/public-upstream shape.
 - `.flox/env/manifest.toml` — toolchain + the always-on `[services]`
 - `state/` — gitignored runtime state: hub cursor/pace, `ledger.jsonl`, loop state
 - `docs/design.md` — architecture; `docs/always-on.md` — boot-survival runbook
+- `docs/garage.md` — the three roles and where estate changes get built;
+  `docs/upstream-updates.md` — taking core updates into a fork;
+  `docs/extraction-allowlist.example.md` — the allowlist format the mechanic's
+  extraction lens parses
 - `docs/personas.md` — the voice layer: the source layers, why the `@` import
   must be a sibling (a non-sibling one silently loads nothing), how to re-run
   that probe, and what a clean `--check` does and does not prove
