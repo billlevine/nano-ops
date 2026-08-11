@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Tests for lib/estate_work.py — the composed estate work view (t-135).
+
+The contract this pins down:
+
+  * every derived field restates a rule that already exists somewhere else,
+    and calls it rather than reimplementing it;
+  * `blocks` is the exact transpose of `blocked_by`, so the two directions of
+    one edge set cannot disagree;
+  * a project rollup is COUNTED from the task rows on every read, so it cannot
+    go stale when a task moves;
+  * "unprojected" is a synthetic grouping in the read model and never a row in
+    SQLite;
+  * a store missing a table or a column loses the section that needed it and
+    nothing else.
+
+Run: python3 tests/test_estate_work.py
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "lib"))
+
+import estate_attention  # noqa: E402
+import estate_work  # noqa: E402
+
+ESTATE = str(_HERE.parent / "bin" / "estate")
+NOW = dt.datetime(2026, 7, 31, 12, 0, tzinfo=dt.timezone.utc)
+UTC = dt.timezone.utc
+
+
+def iso(days: float) -> str:
+    return (NOW + dt.timedelta(days=days)).isoformat()
+
+
+class _Store(unittest.TestCase):
+    """A real store, built through the CLI — the read model must agree with
+    the writer, and a hand-written INSERT would let the two drift."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.env = dict(os.environ, ESTATE_STATE_DIR=str(self.dir),
+                        ESTATE_TZ="UTC")
+
+    def estate(self, *args):
+        result = subprocess.run([sys.executable, ESTATE, *args],
+                                capture_output=True, text=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def connect(self):
+        conn = sqlite3.connect(f"file:{self.dir / 'estate.db'}?mode=ro",
+                               uri=True)
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        return conn
+
+    def build(self, **kw):
+        kw.setdefault("now", NOW)
+        kw.setdefault("tz", UTC)
+        return estate_work.build(self.connect(), **kw)
+
+    def tasks(self, view=None):
+        return {t["id"]: t for t in (view or self.build())["tasks"]}
+
+
+class DependencyEdgesTest(_Store):
+    def chain(self):
+        self.estate("task", "add", "the blocker", "--kind", "generic", "--ready")
+        self.estate("task", "add", "the blocked one", "--kind", "generic", "--ready")
+        self.estate("task", "add", "provenance", "--kind", "generic", "--ready")
+        self.estate("dep", "add", "t-1", "t-2", "--kind", "blocks")
+        self.estate("dep", "add", "t-3", "t-1", "--kind", "discovered-from")
+
+    def test_every_edge_kind_is_carried_not_only_blocks(self):
+        self.chain()
+        view = self.build()
+        self.assertEqual({e["kind"] for e in view["dependencies"]},
+                         {"blocks", "discovered-from"})
+        self.assertEqual(view["dep_counts"],
+                         {"blocks": 1, "discovered-from": 1})
+
+    def test_both_endpoints_arrive_resolved(self):
+        self.chain()
+        edge = next(e for e in self.build()["dependencies"]
+                    if e["kind"] == "blocks")
+        self.assertEqual(edge["from_title"], "the blocker")
+        self.assertEqual(edge["from_status"], "ready")
+        self.assertEqual(edge["to_title"], "the blocked one")
+        self.assertEqual(edge["to_status"], "ready")
+
+    def test_active_is_the_scheduling_rule_and_only_for_blocks(self):
+        self.chain()
+        edges = {e["kind"]: e for e in self.build()["dependencies"]}
+        self.assertTrue(edges["blocks"]["active"])
+        self.assertIsNone(edges["discovered-from"]["active"],
+                          "provenance is not resolved by any task status")
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("done", "t-1", "--actor", "hub", "--summary", "done",
+                    "--verification", "tests pass")
+        edges = {e["kind"]: e for e in self.build()["dependencies"]}
+        self.assertFalse(edges["blocks"]["active"])
+
+    def test_blocks_is_the_exact_transpose_of_blocked_by(self):
+        """One edge set, two readings. They cannot disagree by construction."""
+        self.chain()
+        tasks = self.tasks()
+        self.assertEqual(tasks["t-2"]["blocked_by"], ["t-1"])
+        self.assertEqual(tasks["t-1"]["blocks"], ["t-2"])
+        for task in tasks.values():
+            for blocker in task["blocked_by"]:
+                self.assertIn(task["id"], tasks[blocker]["blocks"])
+            for held in task["blocks"]:
+                self.assertIn(task["id"], tasks[held]["blocked_by"])
+
+    def test_both_directions_clear_together_when_the_blocker_finishes(self):
+        self.chain()
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("done", "t-1", "--actor", "hub", "--summary", "done",
+                    "--verification", "tests pass")
+        tasks = self.tasks()
+        self.assertEqual(tasks["t-2"]["blocked_by"], [])
+        self.assertEqual(tasks["t-1"]["blocks"], [])
+        self.assertEqual(tasks["t-2"]["status"], "ready",
+                         "being blocked was never a status")
+
+    def test_an_unknown_edge_kind_is_carried_not_dropped(self):
+        """"All relationships" has to mean all of them. A kind this module has
+        not heard of is still an edge somebody wrote."""
+        self.chain()
+        conn = sqlite3.connect(self.dir / "estate.db")
+        conn.execute("INSERT INTO task_deps VALUES ('t-2','t-3','supersedes','x')")
+        conn.commit(); conn.close()
+        edge = next(e for e in self.build()["dependencies"]
+                    if e["kind"] == "supersedes")
+        self.assertEqual(edge["from_title"], "the blocked one")
+        self.assertIsNone(edge["active"], "only `blocks` has an active reading")
+
+    def test_titles_are_resolved_so_no_reader_scans_the_task_array(self):
+        self.chain()
+        tasks = self.tasks()
+        self.assertEqual(tasks["t-2"]["blocked_by_titles"],
+                         {"t-1": "the blocker"})
+        self.assertEqual(tasks["t-1"]["blocks_titles"],
+                         {"t-2": "the blocked one"})
+
+
+class ProposalViewTest(_Store):
+    def add(self, title="Disk fills during export"):
+        return self.estate(
+            "proposal", "add", title,
+            "--condition", "the export fills the disk",
+            "--desired-outcome", "exports stay below the disk budget",
+            "--completion-check", "run estate backup and check free space")
+
+    def test_full_review_record_is_normalized(self):
+        self.assertEqual(self.add(), "t-1")
+        view = self.build()
+        self.assertEqual(view["proposals"], ["t-1"])
+        self.assertEqual(view["proposal_counts"]["pending-review"], 1)
+        proposal = self.tasks(view)["t-1"]["proposal"]
+        self.assertEqual(proposal["condition"], "the export fills the disk")
+        self.assertEqual(proposal["desired_outcome"],
+                         "exports stay below the disk budget")
+        self.assertEqual(proposal["completion_check"],
+                         "run estate backup and check free space")
+        self.assertFalse(proposal["legacy"])
+
+    def test_recurrence_count_and_last_time_are_derived_from_events(self):
+        self.add()
+        self.add("Disk filled again")
+        proposal = self.tasks()["t-1"]["proposal"]
+        self.assertEqual(proposal["recurrences"], 1)
+        self.assertIsNotNone(proposal["last_recurrence_at"])
+
+    def test_legacy_review_holes_are_explicit(self):
+        self.estate("proposal", "add", "old proposal")
+        proposal = self.tasks()["t-1"]["proposal"]
+        self.assertTrue(proposal["legacy"])
+        self.assertIsNone(proposal["completion_check"])
+
+
+class DueStateTest(_Store):
+    def test_the_five_states_plus_unreadable_are_derived_not_stored(self):
+        self.estate("task", "add", "overdue", "--kind", "generic", "--due", iso(-2))
+        self.estate("task", "add", "today", "--kind", "generic", "--due", iso(0.3))
+        self.estate("task", "add", "soon", "--kind", "generic", "--due", iso(2))
+        self.estate("task", "add", "later", "--kind", "generic", "--due", iso(30))
+        self.estate("task", "add", "undated", "--kind", "generic")
+        tasks = self.tasks()
+        self.assertEqual(tasks["t-1"]["due_state"], "overdue")
+        self.assertEqual(tasks["t-2"]["due_state"], "due_today")
+        self.assertEqual(tasks["t-3"]["due_state"], "due_soon")
+        self.assertEqual(tasks["t-4"]["due_state"], "later")
+        self.assertEqual(tasks["t-5"]["due_state"], "undated")
+
+    def test_the_boundary_moves_with_the_clock_and_no_row_changes(self):
+        """S31 — a deadline arriving changes nothing that is written down."""
+        self.estate("task", "add", "soon", "--kind", "generic", "--due", iso(2))
+        self.assertEqual(self.tasks()["t-1"]["due_state"], "due_soon")
+        later = self.build(now=NOW - dt.timedelta(days=10))
+        self.assertEqual(self.tasks(later)["t-1"]["due_state"], "later")
+        past = self.build(now=NOW + dt.timedelta(days=10))
+        self.assertEqual(self.tasks(past)["t-1"]["due_state"], "overdue")
+
+    def test_the_notice_interval_is_a_policy_argument(self):
+        self.estate("task", "add", "a week out", "--kind", "generic",
+                    "--due", iso(7))
+        self.assertEqual(self.tasks()["t-1"]["due_state"], "later")
+        wide = self.build(notice=14)
+        self.assertEqual(self.tasks(wide)["t-1"]["due_state"], "due_soon")
+
+    def test_a_terminal_task_has_no_due_state(self):
+        """Its deadline is history. Calling a finished task overdue is how a
+        section teaches its reader to skip it."""
+        self.estate("task", "add", "was due", "--kind", "generic",
+                    "--due", iso(-5), "--ready")
+        self.assertEqual(self.tasks()["t-1"]["due_state"], "overdue")
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("done", "t-1", "--actor", "hub", "--summary", "done",
+                    "--verification", "shipped")
+        task = self.tasks()["t-1"]
+        self.assertIsNone(task["due_state"])
+        self.assertIsNotNone(task["days_left"],
+                             "the number is still a fact about the date")
+
+    def test_an_unreadable_deadline_is_its_own_answer(self):
+        self.estate("task", "add", "bad date", "--kind", "generic")
+        conn = sqlite3.connect(self.dir / "estate.db")
+        conn.execute("UPDATE tasks SET due_at='next tuesday' WHERE id='t-1'")
+        conn.commit(); conn.close()
+        task = self.tasks()["t-1"]
+        self.assertEqual(task["due_state"], "unreadable")
+        self.assertIsNone(task["days_left"])
+
+
+class AttentionSetTest(_Store):
+    def populate(self):
+        self.estate("task", "add", "chase the vendor", "--kind", "followup",
+                    "--due", iso(-1))
+        self.estate("task", "add", "no date", "--kind", "followup")
+        self.estate("task", "add", "ordinary work", "--kind", "generic", "--ready")
+        self.estate("task", "add", "stuck on a person", "--kind", "generic", "--ready")
+        self.estate("claim", "t-4", "--actor", "hub")
+        self.estate("needs-owner", "t-4", "waiting on the owner", "--actor", "hub")
+
+    def test_the_set_is_open_followups_plus_needs_owner_and_nothing_else(self):
+        self.populate()
+        view = self.build()
+        self.assertEqual(set(view["attention"]), {"t-1", "t-2", "t-4"})
+        self.assertFalse(self.tasks(view)["t-3"]["is_attention"])
+
+    def test_it_is_ordered_most_urgent_first(self):
+        self.populate()
+        self.assertEqual(self.build()["attention"][0], "t-1",
+                         "the overdue follow-up leads")
+
+    def test_it_is_ids_not_a_second_copy_of_the_rows(self):
+        """§4.10 — a duplicated row is a row that can disagree with itself."""
+        self.populate()
+        view = self.build()
+        self.assertTrue(all(isinstance(v, str) for v in view["attention"]))
+        self.assertTrue(all(isinstance(v, str) for v in view["followups"]))
+
+    def test_counts_cover_every_state_including_the_empty_ones(self):
+        self.populate()
+        counts = self.build()["attention_counts"]
+        for state in estate_attention.ALL_STATES:
+            self.assertIn(state, counts,
+                          "a zero is an answer; a missing key is not")
+        self.assertEqual(counts["overdue"], 1)
+        self.assertEqual(counts["undated"], 2)
+        self.assertEqual(counts["total"], 3)
+
+    def test_a_blocked_task_is_not_attention(self):
+        """Blocked work waits on WORK. A dependency finishing releases it, not
+        a person reading it (docs/attention-contract.md)."""
+        self.estate("task", "add", "blocker", "--kind", "generic", "--ready")
+        self.estate("task", "add", "held up", "--kind", "generic", "--ready")
+        self.estate("dep", "add", "t-1", "t-2", "--kind", "blocks")
+        view = self.build()
+        self.assertEqual(view["attention"], [])
+        self.assertEqual(self.tasks(view)["t-2"]["blocked_by"], ["t-1"])
+
+    def test_a_resolved_followup_leaves_attention_but_stays_on_file(self):
+        self.populate()
+        self.estate("mark-ready", "t-2", "--actor", "hub")
+        self.estate("claim", "t-2", "--actor", "hub")
+        self.estate("done", "t-2", "--actor", "hub", "--summary", "answered",
+                    "--verification", "he replied")
+        view = self.build()
+        self.assertNotIn("t-2", view["attention"])
+        self.assertIn("t-2", view["followups"])
+        self.assertEqual(view["followup_counts"],
+                         {"open": 1, "resolved": 1, "total": 2})
+        self.assertEqual(self.tasks(view)["t-2"]["followup"]["state"], "resolved")
+
+
+FOLLOWUPS = str(_HERE.parent / "bin" / "followups")
+
+
+def followups_is_estate_backed() -> bool:
+    """True when bin/followups is the shim that reads THIS store.
+
+    The envelope below is written by one script and decoded by another, and
+    only the decoder is in this extraction. A repo whose bin/followups is still
+    the standalone JSON store writes nothing this reader can see, so the test
+    would report a missing re-sync as a decoding bug. Checking the file rather
+    than a version string means the test resumes by itself once the shim lands.
+    """
+    try:
+        with open(FOLLOWUPS) as f:
+            return "ESTATE_STATE_DIR" in f.read()
+    except OSError:
+        return False
+
+
+class FollowupEnvelopeTest(_Store):
+    @unittest.skipUnless(followups_is_estate_backed(),
+                         "bin/followups here is the standalone JSON store, not "
+                         "the shim over this store")
+    def test_the_refs_envelope_is_decoded_for_every_followup(self):
+        subprocess.run([sys.executable, FOLLOWUPS, "add", "ask about the SLA",
+                        "--source", "slack", "--ref", "chan-123/456",
+                        "--context", "raised in the standup"],
+                       capture_output=True, text=True, env=self.env, check=True)
+        view = self.tasks()["t-1"]["followup"]
+        self.assertEqual(view["legacy_id"], "followup:1")
+        self.assertEqual(view["source"], "slack")
+        self.assertEqual(view["ref"], "chan-123/456")
+        self.assertEqual(view["context"], "raised in the standup")
+        self.assertEqual(view["state"], "open")
+
+    def test_only_followups_carry_the_envelope(self):
+        self.estate("task", "add", "ordinary", "--kind", "generic")
+        self.assertIsNone(self.tasks()["t-1"]["followup"])
+
+    def test_a_claimed_followup_is_open_not_resolved(self):
+        """Deliberately NOT bin/followups' binary, which calls anything but
+        literal `open` resolved because the legacy file had no other word."""
+        self.estate("task", "add", "in hand", "--kind", "followup")
+        self.estate("mark-ready", "t-1", "--actor", "hub")
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.assertEqual(self.tasks()["t-1"]["followup"]["state"], "open")
+
+    def test_an_unparseable_refs_blob_is_not_an_error(self):
+        self.estate("task", "add", "broken refs", "--kind", "followup")
+        conn = sqlite3.connect(self.dir / "estate.db")
+        conn.execute("UPDATE tasks SET refs='{not json' WHERE id='t-1'")
+        conn.commit(); conn.close()
+        self.assertEqual(estate_work.decode_refs("{not json"), {})
+        self.assertEqual(self.tasks()["t-1"]["followup"]["legacy_id"], None)
+
+    def test_the_raw_refs_blob_is_not_shipped_twice(self):
+        """§4.6 normalizes the FOLLOW-UP envelope, which has a contract. A
+        general decoded copy beside the raw column is the same bytes twice."""
+        self.estate("task", "add", "ordinary", "--kind", "generic")
+        self.assertNotIn("refs_decoded", self.tasks()["t-1"])
+
+
+class InboxMessageTest(_Store):
+    """t-296: the open-inbox-messages cut. A projection of the same task rows,
+    not a second store — and the panel's whole job is to answer "did that ever
+    get handled?" without anybody finding a Slack thread."""
+
+    def message(self, title, ts, thread=None):
+        refs = ('{"message_id": "msg-%s", "channel": "C0X", '
+                '"message_ts": "%s", "thread_ts": %s, "inbox": "self-dm"}'
+                % (ts.replace(".", ""), ts,
+                   f'"{thread}"' if thread else "null"))
+        self.estate("task", "add", title, "--kind", "inbox-message",
+                    "--refs", refs, "--ready", "--actor", "hub")
+
+    def test_open_messages_are_listed_oldest_first(self):
+        """Oldest first because the one open longest is the one most likely to
+        have been missed, which is the entire failure this tracks."""
+        self.message("the first thing he asked", "1754000001.0001")
+        self.message("the second thing", "1754000002.0001")
+        view = self.build()
+        self.assertEqual(view["inbox_messages"], ["t-1", "t-2"])
+        self.assertEqual(view["inbox_message_counts"],
+                         {"ready": 2, "total": 2})
+
+    def test_a_closed_message_leaves_the_list(self):
+        self.message("answered already", "1754000003.0001")
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("done", "t-1", "--actor", "hub", "--summary", "answered")
+        view = self.build()
+        self.assertEqual(view["inbox_messages"], [])
+        self.assertEqual(view["inbox_message_counts"]["total"], 0)
+        self.assertFalse(self.tasks(view)["t-1"]["message"]["open"])
+
+    def test_an_escalated_message_is_open_here_and_in_attention(self):
+        """One attention set (docs/attention-contract.md). This panel is a cut
+        across the conversations, never a second attention store."""
+        self.message("should I merge it", "1754000004.0001")
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("needs-owner", "t-1", "their call", "--actor", "hub")
+        view = self.build()
+        self.assertEqual(view["inbox_messages"], ["t-1"])
+        self.assertEqual(view["attention"], ["t-1"])
+
+    def test_the_slack_identity_is_decoded_for_the_renderer(self):
+        self.message("in a thread", "1754000005.0001", thread="1753999999.0001")
+        view = self.tasks()["t-1"]["message"]
+        self.assertEqual(view["channel"], "C0X")
+        self.assertEqual(view["message_ts"], "1754000005.0001")
+        self.assertEqual(view["thread_ts"], "1753999999.0001")
+        self.assertEqual(view["inbox"], "self-dm")
+        self.assertTrue(view["threaded"])
+
+    def test_only_inbox_messages_carry_the_envelope(self):
+        self.estate("task", "add", "ordinary", "--kind", "generic")
+        self.assertIsNone(self.tasks()["t-1"]["message"])
+        self.assertEqual(self.build()["inbox_messages"], [])
+
+
+class ProjectRollupTest(_Store):
+    def populate(self):
+        self.estate("project", "add", "Gap audit", "--kind", "rollout")
+        self.estate("task", "add", "blocker", "--kind", "generic", "--ready",
+                    "--project", "p-1")
+        self.estate("task", "add", "held up", "--kind", "generic", "--ready",
+                    "--project", "p-1")
+        self.estate("dep", "add", "t-1", "t-2", "--kind", "blocks")
+        self.estate("task", "add", "ask the owner", "--kind", "followup",
+                    "--project", "p-1", "--due", iso(-3))
+        self.estate("task", "add", "shipped", "--kind", "generic", "--ready",
+                    "--project", "p-1")
+        self.estate("claim", "t-4", "--actor", "hub")
+        self.estate("done", "t-4", "--actor", "hub", "--summary", "done",
+                    "--verification", "green")
+        self.estate("task", "add", "loose work", "--kind", "generic", "--ready")
+
+    def project(self, pid):
+        return next(p for p in self.build()["projects"] if p["id"] == pid)
+
+    def test_the_rollup_counts_what_the_task_rows_say(self):
+        self.populate()
+        rollup = self.project("p-1")["rollup"]
+        self.assertEqual(rollup["tasks"], 4)
+        self.assertEqual(rollup["open"], 3)
+        self.assertEqual(rollup["terminal"], 1)
+        self.assertEqual(rollup["blocked"], 1)
+        self.assertEqual(rollup["attention"], 1)
+        self.assertEqual(rollup["overdue"], 1)
+        self.assertEqual(rollup["by_status"], {"ready": 2, "open": 1, "done": 1})
+        self.assertEqual(rollup["by_kind"], {"generic": 3, "followup": 1})
+
+    def test_it_is_recomputed_and_never_written_down(self):
+        self.populate()
+        self.assertEqual(self.project("p-1")["rollup"]["blocked"], 1)
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("done", "t-1", "--actor", "hub", "--summary", "done",
+                    "--verification", "green")
+        self.assertEqual(self.project("p-1")["rollup"]["blocked"], 0)
+
+    def test_unprojected_work_is_a_grouping_with_the_same_shape(self):
+        self.populate()
+        bucket = self.project(estate_work.UNPROJECTED)
+        self.assertTrue(bucket["unprojected"])
+        self.assertEqual(bucket["rollup"]["tasks"], 1)
+        self.assertEqual(bucket["rollup"]["task_ids"], ["t-5"])
+
+    def test_the_grouping_is_not_a_row_in_sqlite(self):
+        self.populate()
+        rows = self.connect().execute("SELECT id FROM projects").fetchall()
+        self.assertEqual([r["id"] for r in rows], ["p-1"])
+
+    def test_a_store_with_no_projects_still_reports_the_grouping(self):
+        self.estate("task", "add", "loose", "--kind", "generic")
+        projects = self.build()["projects"]
+        self.assertEqual([p["id"] for p in projects],
+                         [estate_work.UNPROJECTED])
+
+    def test_project_counts_exclude_the_synthetic_bucket(self):
+        self.populate()
+        self.assertEqual(self.build()["project_counts"], {"active": 1})
+
+    def test_a_task_carries_its_projects_title(self):
+        self.populate()
+        self.assertEqual(self.tasks()["t-1"]["project_title"], "Gap audit")
+        self.assertIsNone(self.tasks()["t-5"]["project_title"])
+
+    def test_a_dangling_project_id_is_reported_not_dropped(self):
+        self.estate("task", "add", "orphaned", "--kind", "generic")
+        conn = sqlite3.connect(self.dir / "estate.db")
+        conn.execute("UPDATE tasks SET project_id='p-99' WHERE id='t-1'")
+        conn.commit(); conn.close()
+        ghost = self.project("p-99")
+        self.assertTrue(ghost["missing"])
+        self.assertEqual(ghost["rollup"]["task_ids"], ["t-1"])
+
+    def test_closed_projects_sort_after_active_ones(self):
+        self.estate("project", "add", "finished", "--kind", "rollout")
+        self.estate("project", "add", "running", "--kind", "rollout")
+        self.estate("project", "close", "p-1", "done")
+        ids = [p["id"] for p in self.build()["projects"]]
+        self.assertEqual(ids[:2], ["p-2", "p-1"])
+
+
+class DegradedStoreTest(unittest.TestCase):
+    """A derived view must never take down the panel that carries it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "estate.db"
+
+    def view(self, script):
+        conn = sqlite3.connect(self.db)
+        conn.executescript(script)
+        conn.commit(); conn.close()
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        return estate_work.build(conn, now=NOW, tz=UTC)
+
+    def test_a_store_with_no_dependency_table_has_no_edges(self):
+        view = self.view("""
+            CREATE TABLE tasks (seq INTEGER PRIMARY KEY, id TEXT, status TEXT,
+                                kind TEXT, title TEXT, updated_at TEXT);
+            INSERT INTO tasks VALUES (1,'t-1','ready','generic','a','x');""")
+        self.assertEqual(view["dependencies"], [])
+        self.assertEqual(view["tasks"][0]["blocked_by"], [])
+        self.assertEqual(view["tasks"][0]["blocks"], [])
+
+    def test_a_store_with_no_projects_table_still_groups_the_work(self):
+        view = self.view("""
+            CREATE TABLE tasks (seq INTEGER PRIMARY KEY, id TEXT, status TEXT,
+                                kind TEXT, title TEXT, updated_at TEXT);
+            INSERT INTO tasks VALUES (1,'t-1','ready','generic','a','x');""")
+        self.assertEqual([p["id"] for p in view["projects"]],
+                         [estate_work.UNPROJECTED])
+        self.assertEqual(view["project_counts"], {})
+
+    def test_a_store_predating_due_at_has_undated_work_not_an_error(self):
+        view = self.view("""
+            CREATE TABLE tasks (seq INTEGER PRIMARY KEY, id TEXT, status TEXT,
+                                kind TEXT, title TEXT, updated_at TEXT);
+            INSERT INTO tasks VALUES (1,'t-1','needs-owner','generic','a','x');""")
+        self.assertEqual(view["tasks"][0]["due_state"], "undated")
+        self.assertEqual(view["attention"], ["t-1"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

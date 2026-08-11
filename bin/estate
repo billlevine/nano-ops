@@ -1,0 +1,3445 @@
+#!/usr/bin/env python3
+"""estate — shared project/task store for the operations estate.
+
+Phase 0 builds and proves the store with zero production consumers. SQLite is
+the source of truth; events are an append-only audit stream.
+
+SUBCOMMANDS
+-----------
+  estate init
+  estate project add|list|show|close ...
+  estate task add|list|find|show|set-due ...
+  estate proposal add|list|show|stage|classify|fingerprint ...
+  estate ready | log | note | mark-ready | claim | extend | retry
+  estate event --actor A --kind K --summary S
+               [--subsystem X --phase P] [--fingerprint F] [--at TS] ...
+  estate events [--actor A] [--task T] [--project P] [--memory M] [--ask Q]
+                [--session S] [--kind K] [--subsystem X] [--phase P]
+                [--fingerprint F] [--run R] [--run-outcome O]
+                [--since-seq N] [--until-seq N]
+                [--limit N] [--detail] [--json]
+  estate runs [--subsystem S] [--days N] [--attention] [--all] [--json]
+  estate release | block | needs-owner | done | reopen | drop
+  estate dep add|list ... | orphans [--sweep] | stale [--days N]
+  estate due [--within N] [--kind K] [--json]
+  estate attention [--notice N] [--state S] [--kind K] [--json] [--counts]
+  estate memory recall --scope X [--kind K] [--json] [--refs] [--no-touch]
+  estate memory add|list|query|show|log|promote|supersede|merge ...
+  estate memory archive|reinstate|seen|render ...
+  estate ask | inbox | answer | expired-asks [--sweep]
+  estate export | backup | doctor | json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import textwrap
+import time
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+
+import actors  # noqa: E402  (lib path is established above)
+import estate_arrivals  # noqa: E402
+import estate_attention  # noqa: E402
+import estate_deps  # noqa: E402
+import estate_events  # noqa: E402
+import estate_ledger  # noqa: E402
+import estate_memory  # noqa: E402
+import estate_runs  # noqa: E402
+
+STATE_DIR = os.environ.get("ESTATE_STATE_DIR") or os.path.join(REPO_ROOT, "state")
+DB_PATH = os.path.join(STATE_DIR, "estate.db")
+EXPORT_DIR = os.path.join(STATE_DIR, "estate", "export")
+BACKUP_DIR = os.path.join(STATE_DIR, "estate", "backup")
+LESSONS_PATH = (os.environ.get("ESTATE_LESSONS_PATH")
+                or os.path.join(REPO_ROOT, "docs", "lessons.md"))
+NOW = dt.datetime.now(dt.timezone.utc)
+WAL_MAX_BYTES = 64 * 1024 * 1024
+FRESH_SECONDS = 26 * 3600
+TABLES = ("projects", "tasks", "task_deps", "events", "memories", "asks")
+TRANSITIONS = {
+    "open": {"ready": "ready", "drop": "dropped"},
+    "ready": {"claim": "claimed", "drop": "dropped"},
+    "claimed": {"done": "done", "block": "blocked", "needs-owner": "needs-owner",
+                "release": "ready", "drop": "dropped"},
+    "needs-owner": {"reopen": "ready", "drop": "dropped"},
+    "blocked": {"reopen": "ready", "drop": "dropped"},
+    "done": {"reopen": "ready"},
+    "dropped": {},
+}
+DEP_KINDS = ("blocks", "parent", "related", "discovered-from")
+# Kinds the POOL queries skip unless a caller asks for them by name (t-296).
+#
+# `inbox-message` is the hub mirroring the owner's own inbox traffic, one task per
+# message, so "was that message ever answered" is a query instead of a cursor's
+# shadow. Those rows are a record of a CONVERSATION, not work anybody claims off
+# the shared pool: a chatty morning can file a dozen of them, several as small
+# as "thanks". `ready` ("what should I pick up") and `stale` ("what is nobody
+# looking at") are read by the hub's end-of-day pass, the night shift and the
+# briefer's backlog-drift digest, and every one of them would fill with chatter.
+#
+# So the filter is here, in the two questions that are ABOUT the pool, and
+# nowhere else. `task list`, `task find`, `attention`, `due`, `orphans` and
+# `json` are untouched: a message parked at `needs-owner` IS waiting on a person
+# and belongs in the attention set (docs/attention-contract.md), and a claimed
+# message whose worker died SHOULD orphan back to `ready` like anything else.
+# `--kind inbox-message` still returns them here too — this hides nothing from
+# a caller that asks.
+UNPOOLED_KINDS = ("inbox-message",)
+# P-02, the proposal review lifecycle. `stage` is the REVIEW state of a
+# proposed change; `status` stays the WORK state of the task. They are
+# deliberately orthogonal: "the owner has not decided yet" and "nobody has picked
+# this up yet" are different facts, and collapsing them is how a rejected
+# proposal ends up indistinguishable from an untouched one.
+#
+#   pending-review    proposed, awaiting the owner's decision
+#   approved-backlog  approved — the ONLY stage anything may claim
+#   rejected          decided against
+#   resolved          the condition no longer holds (fixed, or the work landed)
+#   stopped           withdrawn or superseded before it was finished
+PROPOSAL_KIND = "proposal"
+PENDING, APPROVED = "pending-review", "approved-backlog"
+REJECTED, RESOLVED, STOPPED = "rejected", "resolved", "stopped"
+PROPOSAL_STAGES = (PENDING, APPROVED, REJECTED, RESOLVED, STOPPED)
+PROPOSAL_LIVE = (PENDING, APPROVED)
+# Every proposal stage except approved-backlog. `ready` omits these and `claim`
+# refuses them, so "only approved work is selectable" is mechanical rather than
+# a sentence in a skill file a tired reader skips (gap audit S13, S49).
+GATED_STAGES = tuple(s for s in PROPOSAL_STAGES if s != APPROVED)
+# A closed stage can be reopened, because a resolved condition can come back
+# and a rejection can be reconsidered — but only through `pending-review`, so a
+# second decision is always a recorded decision and never an accident.
+STAGE_TRANSITIONS = {
+    PENDING: (APPROVED, REJECTED, RESOLVED, STOPPED),
+    APPROVED: (RESOLVED, STOPPED, REJECTED, PENDING),
+    REJECTED: (PENDING,),
+    RESOLVED: (PENDING,),
+    STOPPED: (PENDING, APPROVED),
+}
+# A terminal review decision is a decision about the WORK, not only about the
+# review. Every stage below is gated, so a task left at `ready` behind one can
+# never be claimed and never closes — it just sits in `stale` looking unstarted
+# when it was in fact decided weeks ago (11 of them, found 2026-08-05). So the
+# decision drives the task's own status in the SAME transaction as the stage,
+# and the two halves of the row cannot disagree.
+#
+# `stopped` closes as `done` rather than `dropped` on purpose: withdrawn or
+# superseded work stopped being somebody's to do, and `dropped` is reserved for
+# the decision that it never should have been (which is what `rejected` is).
+STAGE_CLOSES = {RESOLVED: "done", REJECTED: "dropped", STOPPED: "done"}
+# And the other direction. Leaving a terminal stage for a live one — the reopen
+# path in STAGE_TRANSITIONS — puts the task back in the pool, because a
+# reconsidered proposal that stays `done` is unreachable in the other way.
+STAGE_REOPENS = "ready"
+# The equivalence fingerprint rides in refs under this key, so `task find
+# --ref fingerprint=...` reaches it with no new column and no second store.
+FINGERPRINT_KEY = "fingerprint"
+FINGERPRINT_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+# P-09, the review record. A proposal the owner can act on says three things: what
+# was observed, what the estate should look like afterwards, and how anyone
+# tells that it does. They ride in refs beside the fingerprint — named keys,
+# no new columns — and `proposal show` is what renders them for a reviewer.
+#
+# The store ACCEPTS them and does not REQUIRE them, deliberately. The mechanic
+# is where they are mandatory (mechanic.py `propose` refuses a payload without
+# all three), because that is the writer the scenarios are about. Requiring
+# them here would break the two paths that legitimately have no such text:
+# `--adopt-task` on work that predates the lifecycle, and
+# bin/migrate-mechanic-proposals reconciling legacy reports. Inventing a
+# completion check for a proposal written before completion checks existed
+# would be fabrication, not migration.
+CONDITION_KEY = "condition"
+REVIEW_FIELDS = (CONDITION_KEY, "desired_outcome", "completion_check")
+TTL_RE = re.compile(r"^(\d+)([smhd])$")
+# A task in one of these is finished; everything else is still someone's to do.
+TERMINAL = ("done", "dropped")
+# P-12, the failed-attempt record. A `claimed` task that goes back to `ready`
+# without finishing HAS BEEN ATTEMPTED, and that attempt did not work. Before
+# this, the only trace was the requeue transition itself, which says where the
+# task went and nothing about what happened to it — so a crashed attempt and
+# its retry were indistinguishable, and "how many times has this failed" had no
+# answer at all.
+#
+# These are `kind` values, not phases. `kind` names the RECORD TYPE and `phase`
+# names the class of action (P-06 kept those two apart deliberately), so a
+# failed-attempt row is `kind=failed-attempt phase=failure` and a retry is
+# `kind=retry phase=initiation`. Naming a kind `failure` would have folded the
+# phase vocabulary back into the column P-06 refused to overload.
+FAILED_ATTEMPT_KIND = "failed-attempt"
+RETRY_KIND = "retry"
+# Why the attempt ended. Both are claimed -> ready; they are not the same thing
+# and a reader must be able to tell them apart. `lease-expired` is the dead
+# worker the orphan sweep found; `released` is a live worker handing the item
+# back. Recording only the first would leave the honest hand-back looking like
+# no attempt ever happened.
+CAUSE_LEASE_EXPIRED = "lease-expired"
+CAUSE_RELEASED = "released"
+CLAIM_SUMMARY = "ready -> claimed"
+STALE_DEFAULT_DAYS = 3.0
+DUE_DEFAULT_WITHIN_DAYS = 3.0
+# P-08. Seven days is one of every weekday's runs, which is what makes a
+# weekday-shaped gap visible; the briefer passes its own window explicitly.
+RUNS_DEFAULT_DAYS = 7.0
+MEMORY_KINDS = ("lesson", "fact", "convention")
+MEMORY_LIVE = ("candidate", "active")
+MEMORY_RETIRED = ("superseded", "archived")
+# One definition, in lib/estate_memory.py, because P-05 makes the same word the
+# hinge of the recall contract every consumer now reads through.
+SHARED = estate_memory.SHARED
+# P-19: promotion is the Memory subsystem's own act, so its event is attributed
+# to Memory and not to whoever happened to run the command. Before this it
+# inherited actor() — usually the generic `cli` — which made the single most
+# consequential memory transition, the one that puts a fact into shared recall,
+# the one transition you could not attribute. Only promotion; `memory add` and
+# the retirement verbs still record who did them, because those ARE somebody's
+# judgment call. Existing `cli`-attributed rows stay exactly as they are: the
+# events table is append-only, and readers fold history rather than rewrite it.
+MEMORY_ACTOR = "memory"
+RENDER_WIDTH = 79
+# §6 mail. Every ask carries a TTL so nothing sits open
+# forever; a day is long enough for the slowest nightly loop to see one tick.
+ASK_TTL_DEFAULT = "24h"
+ASK_OPEN, ASK_ANSWERED, ASK_EXPIRED = "open", "answered", "expired"
+ASK_STATUSES = (ASK_OPEN, ASK_ANSWERED, ASK_EXPIRED)
+# An expired ask escalates into a follow-up rather than closing quietly, so
+# `bin/followups` — which reads its `followup:N` id out of a task's refs —
+# renders it. That envelope is the contract escalate() below writes.
+ESCALATION_KIND = "followup"
+LEGACY_FOLLOWUP_RE = re.compile(r"followup:(\d+)")
+# The preamble is docs/lessons.md's existing header, kept verbatim so an
+# M1 import renders the file it replaces. The marker is the only addition:
+# it appears the first time the file is actually rendered, never before.
+LESSONS_HEADER = """# Lessons
+
+Corrections and errors distilled from state/ledger.jsonl. Each entry: date,
+what happened, what changed (which skill or CLAUDE.md was edited).
+
+<!-- Rendered from state/estate.db by `bin/estate memory render`. Edit the
+     memories, not this file: `bin/estate memory --help`. -->
+"""
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT UNIQUE NOT NULL,
+  kind TEXT NOT NULL,
+  external_key TEXT UNIQUE,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  closed_at TEXT,
+  meta TEXT
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT UNIQUE NOT NULL,
+  project_id TEXT REFERENCES projects(id),
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  intent TEXT,
+  status TEXT NOT NULL,
+  stage TEXT,
+  lane TEXT,
+  created_by TEXT NOT NULL,
+  claimed_by TEXT,
+  claim_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at TEXT,
+  refs TEXT,
+  -- A work-item deadline (ISO8601 UTC, nullable). Deliberately NOT
+  -- claim_expires_at, which is a crash-recovery lease on a `claimed` row —
+  -- conflating the two would make "the worker died" and "the owner misses a date"
+  -- the same signal. Listed last so the column order matches a store that
+  -- picked it up through migrate()'s ALTER TABLE instead of this CREATE.
+  due_at TEXT
+);
+CREATE TABLE IF NOT EXISTS task_deps (
+  from_task TEXT NOT NULL REFERENCES tasks(id),
+  to_task TEXT NOT NULL REFERENCES tasks(id),
+  dep_kind TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (from_task, to_task, dep_kind)
+);
+CREATE TABLE IF NOT EXISTS events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  task_id TEXT REFERENCES tasks(id),
+  project_id TEXT REFERENCES projects(id),
+  kind TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  detail TEXT,
+  refs TEXT
+);
+CREATE TABLE IF NOT EXISTS memories (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT UNIQUE NOT NULL,
+  scope TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL,
+  protected INTEGER NOT NULL DEFAULT 0,
+  superseded_by TEXT REFERENCES memories(id),
+  source_refs TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  retired_at TEXT,
+  last_seen_at TEXT,
+  reactivations INTEGER NOT NULL DEFAULT 0
+);
+-- §6: one question, one addressee, one answer, a deadline, a thread link. Its
+-- own table rather than a task `kind` — an ask has no claim, no lease, and no
+-- place in `estate ready`, so reusing the task lifecycle would have meant
+-- suppressing most of it. expires_at is NOT NULL: a TTL is not optional.
+CREATE TABLE IF NOT EXISTS asks (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT UNIQUE NOT NULL,
+  thread_id TEXT NOT NULL,
+  reply_to TEXT REFERENCES asks(id),
+  from_actor TEXT NOT NULL,
+  to_actor TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  task_id TEXT REFERENCES tasks(id),
+  project_id TEXT REFERENCES projects(id),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  answered_at TEXT,
+  answered_by TEXT,
+  answer TEXT,
+  expired_at TEXT,
+  escalated_task TEXT REFERENCES tasks(id),
+  refs TEXT
+);
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+-- §5.3: a memory's body is immutable. Changing the text means a new row plus a
+-- supersede link, so re-consolidation always has the predecessor chain to read.
+-- Nothing is hard-deleted in any lane (§5.5) — retirement is a status, not a row
+-- going away, so 'not active' and 'does not exist' stay distinct forever.
+CREATE TRIGGER IF NOT EXISTS memories_body_immutable BEFORE UPDATE OF body ON memories
+  BEGIN SELECT RAISE(ABORT, 'memory bodies are immutable; supersede instead'); END;
+CREATE TRIGGER IF NOT EXISTS memories_no_delete BEFORE DELETE ON memories
+  BEGIN SELECT RAISE(ABORT, 'memories are never deleted; archive instead'); END;
+-- §6 step 4: an unanswered question must surface as a finding, never vanish.
+-- Deleting the row is the one way to lose one, so the row cannot be deleted —
+-- 'expired' is a status, exactly as retirement is for memories.
+CREATE TRIGGER IF NOT EXISTS asks_no_delete BEFORE DELETE ON asks
+  BEGIN SELECT RAISE(ABORT, 'asks are never deleted; they expire instead'); END;
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_claimed ON tasks(claimed_by);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, seq);
+CREATE INDEX IF NOT EXISTS idx_deps_to ON task_deps(to_task);
+CREATE INDEX IF NOT EXISTS idx_deps_from ON task_deps(from_task);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, status);
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by);
+-- §6 step 3 makes `estate inbox --actor <me>` a per-tick step in every loop's
+-- skill, so the addressee read is the one query that must stay one index hit.
+CREATE INDEX IF NOT EXISTS idx_asks_inbox ON asks(to_actor, status);
+CREATE INDEX IF NOT EXISTS idx_asks_from ON asks(from_actor, status);
+CREATE INDEX IF NOT EXISTS idx_asks_thread ON asks(thread_id, seq);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def migrate(conn) -> None:
+    """Bring a Phase-0 database up to the current schema.
+
+    `events` predates `memories` and `asks`, and CREATE TABLE IF NOT EXISTS
+    cannot add a column to a table that already exists. The events table is
+    append-only, so columns are added in place rather than by rewriting rows.
+
+    `session_id` (the actor taxonomy, docs/actor-taxonomy.md) arrives the same
+    way. Note what this migration deliberately does NOT do: it does not rewrite
+    the actor of a single existing row. The events_no_update trigger forbids it,
+    and it does not need doing — readers normalize, so history folds into the
+    taxonomy on the way out. ALTER TABLE ADD COLUMN is DDL, so it does not trip
+    the trigger.
+
+    `tasks.due_at` (P-31) arrives the same way, and for the same reason: the
+    table already exists on every live store, so CREATE TABLE IF NOT EXISTS is
+    a no-op there. Existing rows keep a NULL due date, which is exactly right —
+    an item filed before deadlines existed has no deadline, and `estate due`
+    ignores NULLs. Nothing is rewritten.
+
+    `events.run_id` / `events.run_outcome` (P-08) arrive the same way again. A
+    pre-P-08 row keeps NULL in both, and `run_id IS NULL` is the exact,
+    queryable definition of "nobody recorded this as a scheduled run" — which
+    is not the same as "the run did not happen", and `estate runs` is careful
+    about the difference. Nothing here stamps a run id onto an existing row;
+    the events_no_update trigger forbids it, and `estate_runs.run_id_of()`
+    derives the id of a P-06 pass row from the `refs.night` / `refs.morning`
+    that row already carries, so no history has to be rewritten to be found.
+
+    `events.subsystem` / `events.phase` / `events.fingerprint` (P-06) arrive
+    the same way once more. A row written before P-06 keeps NULL in all three,
+    and that is the honest reading: nobody recorded which of the nine acted or
+    what class of action it was, so nothing here invents it. `phase IS NULL` is
+    the exact, queryable definition of "not a qualifying event".
+
+    The fingerprint index is UNIQUE, which is what makes idempotence mechanical
+    rather than a convention every writer has to remember. SQLite treats NULLs
+    as distinct in a unique index, so the whole pre-P-06 history — every row
+    with no fingerprint — is unaffected by it.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "memory_id" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN memory_id TEXT REFERENCES memories(id)")
+    if "ask_id" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN ask_id TEXT REFERENCES asks(id)")
+    if "session_id" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN session_id TEXT")
+    if "subsystem" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN subsystem TEXT")
+    if "phase" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN phase TEXT")
+    if "fingerprint" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN fingerprint TEXT")
+    if "run_id" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
+    if "run_outcome" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN run_outcome TEXT")
+    task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "due_at" not in task_columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN due_at TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_memory ON events(memory_id, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ask ON events(ask_id, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_subsystem ON events(subsystem, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_phase ON events(phase, seq)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_fingerprint "
+                 "ON events(fingerprint)")
+    # P-08. NOT unique: a run legitimately holds several rows (its `started`
+    # and its terminal), and the fingerprint above is what keeps each of those
+    # single. This index exists so `estate runs` can pull one subsystem's whole
+    # run history without a table scan.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq)")
+    # After the ALTER above, never before it — the index names a column that
+    # does not exist on a store that has not been migrated yet.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at)")
+
+
+def init_db() -> None:
+    conn = connect()
+    try:
+        conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + "\nCOMMIT;")
+        migrate(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cmd_init(_args) -> int:
+    init_db()
+    print(f"initialized {DB_PATH}")
+    return 0
+
+
+def actor(args) -> str:
+    return getattr(args, "actor", None) or os.environ.get("ESTATE_ACTOR") or "cli"
+
+
+def session_id(args=None) -> str | None:
+    """The dispatch slug a worker traces its own rows by.
+
+    Only ephemeral sessions need one — a standing actor IS its own identity.
+    A dispatched worker exports ESTATE_SESSION_ID (or passes --session-id) so
+    `estate log` can still answer "what did that one worker do".
+    """
+    explicit = getattr(args, "session_id", None) if args is not None else None
+    return explicit or os.environ.get("ESTATE_SESSION_ID") or None
+
+
+def as_json(value: str | None, label: str = "JSON") -> str | None:
+    if value is None:
+        return None
+    try:
+        return json.dumps(json.loads(value), sort_keys=True)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid {label}: {exc.msg}") from exc
+
+
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_due(value):
+    """Normalize a --due argument to an ISO8601 UTC deadline, or raise.
+
+    v1 takes a plain ISO date (`2026-08-01`) or a full ISO8601 timestamp.
+    Relative sugar ("1w") is deliberately out — it is separable, and the first
+    cut should not guess.
+
+    A bare date lands at the END of that day in UTC. "Due Friday" means Friday
+    is still on time, so an item due today must not read as overdue at 09:00.
+    """
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("--due must be a date (YYYY-MM-DD) or an ISO8601 timestamp")
+    if DATE_ONLY_RE.match(text):
+        try:
+            day = dt.date.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"--due: {exc}") from exc
+        return dt.datetime.combine(
+            day, dt.time(23, 59, 59), tzinfo=dt.timezone.utc).isoformat()
+    stamp = parse_iso(text)
+    if stamp is None:
+        raise ValueError(
+            f"--due: could not read '{text}' as a date (YYYY-MM-DD) or ISO8601 timestamp")
+    return stamp.astimezone(dt.timezone.utc).isoformat()
+
+
+def ident(value: str, prefix: str) -> str:
+    return f"{prefix}-{value}" if value.isdigit() else value
+
+
+def event(conn, who: str, kind: str, summary: str, *, task_id=None,
+          project_id=None, memory_id=None, ask_id=None, detail=None,
+          refs=None, session=None, subsystem=None, phase=None,
+          fingerprint=None, at=None, run=None, run_outcome=None) -> bool:
+    """Append one row to the Ledger. True if it landed, False if it was a
+    fingerprint replay this store already holds.
+
+    `subsystem`/`phase` make it a QUALIFYING event (P-06, estate_ledger.py);
+    both or neither. `run`/`run_outcome` make it a SCHEDULED-RUN event (P-08,
+    estate_runs.py); again both or neither, and the phase must be the one that
+    outcome implies — a run recorded as `failed` under an `outcome` phase would
+    be counted as a success by every reader that groups by phase. `at`
+    overrides the timestamp, which only a backfill of something that already
+    happened has any business doing — a live writer records now, and NOW is the
+    default.
+    """
+    estate_ledger.check(subsystem, phase)
+    check_run(subsystem, phase, run, run_outcome)
+    # Normalize on the way in so new rows land canonical, and readers only ever
+    # have to fold the pre-taxonomy history. docs/actor-taxonomy.md.
+    whom = actors.normalize(who, session or session_id())
+    if fingerprint and conn.execute(
+            "SELECT 1 FROM events WHERE fingerprint=?", (fingerprint,)).fetchone():
+        # The replay case, checked rather than caught: the unique index would
+        # abort the whole transaction, and a caller doing this alongside a task
+        # transition needs the transition to stand.
+        return False
+    conn.execute("""INSERT INTO events
+        (ts, actor, session_id, task_id, project_id, memory_id, ask_id, kind,
+         summary, detail, refs, subsystem, phase, fingerprint, run_id,
+         run_outcome)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (at or NOW.isoformat(), whom.actor, whom.session_id, task_id, project_id,
+         memory_id, ask_id, kind, summary, detail, refs, subsystem, phase,
+         fingerprint, run, run_outcome))
+    return True
+
+
+def check_run(subsystem, phase, run, outcome) -> None:
+    """Raise unless this is a legal scheduled-run event, or none at all.
+
+    Three rules, each closing a way the run record could lie:
+
+      both or neither — a run id with no outcome cannot answer "did it
+        finish", and an outcome with no run id belongs to no run. Same shape,
+        same reason, as P-06's subsystem/phase pair.
+      the phase must match the outcome — `failed` is a `failure`, and the two
+        completions are `outcome`s. A mismatch would make `--phase failure`
+        and `--run-outcome failed` return different sets, and a reader has no
+        way to know which one lied.
+      the run id must name its own subsystem — `mechanic/2026-07-29` written
+        by the briefer would put a run in a history it does not belong to, and
+        `estate runs --subsystem mechanic` would then report someone else's
+        pass as the mechanic's.
+    """
+    if not run and not outcome:
+        return
+    if bool(run) != bool(outcome):
+        raise estate_ledger.ContractError(
+            "a scheduled-run event carries BOTH --run-id and --run-outcome "
+            f"(got run={run!r}, outcome={outcome!r})")
+    if outcome not in estate_runs.OUTCOMES:
+        raise estate_ledger.ContractError(
+            f"unknown run outcome {outcome!r}. The four are: "
+            + ", ".join(estate_runs.OUTCOMES))
+    want = estate_runs.PHASE_BY_OUTCOME[outcome]
+    if phase != want:
+        raise estate_ledger.ContractError(
+            f"a run recorded {outcome!r} is phase {want!r}, not {phase!r} — "
+            "the phase and the outcome must agree or the same run counts "
+            "differently depending on which column a reader groups by")
+    named, _ = estate_runs.split(run)
+    if named != subsystem:
+        raise estate_ledger.ContractError(
+            f"run id {run!r} names subsystem {named!r} but the event says "
+            f"{subsystem!r}; a run belongs to the subsystem that ran it")
+
+
+def begin(conn) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def fail(message: str) -> int:
+    print(f"[error] {message}", file=sys.stderr)
+    return 2
+
+
+def row_json(row) -> str:
+    return json.dumps(dict(row), indent=2, sort_keys=True)
+
+
+def row_get(row, key: str):
+    """Column value, or None on a store that predates the column."""
+    return row[key] if key in row.keys() else None
+
+
+def require(conn, table: str, value: str, prefix: str):
+    key = ident(value, prefix)
+    row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (key,)).fetchone()
+    if not row:
+        raise LookupError(key)
+    return row
+
+
+def cmd_project_add(args) -> int:
+    try:
+        meta = as_json(args.meta, "--meta JSON")
+    except ValueError as exc:
+        return fail(str(exc))
+    if not args.title.strip():
+        return fail("title must be non-empty")
+    init_db()
+    try:
+        with connect() as conn:
+            begin(conn)
+            # SQLite assigns a never-reused seq; the public text id is derived
+            # immediately in this same transaction so FKs retain readable IDs.
+            cur = conn.execute("""INSERT INTO projects
+                (id, kind, external_key, title, created_by, created_at, meta)
+                VALUES ('pending-'||lower(hex(randomblob(8))),?,?,?,?,?,?)""",
+                (args.kind, args.key, args.title.strip(), actor(args), NOW.isoformat(), meta))
+            key = f"p-{cur.lastrowid}"
+            conn.execute("UPDATE projects SET id=? WHERE seq=?", (key, cur.lastrowid))
+            event(conn, actor(args), "activity", "project created", project_id=key)
+        print(key)
+        return 0
+    except sqlite3.IntegrityError as exc:
+        return fail(str(exc))
+
+
+def cmd_project_list(args) -> int:
+    init_db()
+    sql, params = "SELECT * FROM projects", []
+    if args.status:
+        sql += " WHERE status=?"; params.append(args.status)
+    sql += " ORDER BY seq"
+    with connect() as conn:
+        for row in conn.execute(sql, params):
+            print(f"{row['id']:>8}  [{row['status']:<7}] {row['kind']:<10} {row['title']}")
+    return 0
+
+
+def print_events(conn, *, task_id=None, project_id=None, memory_id=None,
+                 ask_id=None) -> None:
+    field, value = next((f, v) for f, v in (("task_id", task_id),
+                                            ("project_id", project_id),
+                                            ("memory_id", memory_id),
+                                            ("ask_id", ask_id)) if v)
+    for row in conn.execute(f"SELECT * FROM events WHERE {field}=? ORDER BY seq", (value,)):
+        who = actors.normalize(row["actor"], row_get(row, "session_id")).label
+        print(f"{row['seq']:>6} {row['ts']} {who} [{row['kind']}] {row['summary']}")
+        if row["detail"]:
+            print(f"       {row['detail']}")
+        if row["refs"]:
+            print(f"       refs: {row['refs']}")
+
+
+def cmd_project_show(args) -> int:
+    init_db()
+    with connect() as conn:
+        try: row = require(conn, "projects", args.id, "p")
+        except LookupError as exc: return fail(f"no project matches '{exc.args[0]}'")
+        print(row_json(row)); print_events(conn, project_id=row["id"])
+    return 0
+
+
+def cmd_project_close(args) -> int:
+    init_db(); key = ident(args.id, "p")
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT status FROM projects WHERE id=?", (key,)).fetchone()
+        if not row: conn.rollback(); return fail(f"no project matches '{key}'")
+        if row["status"] != "active": conn.rollback(); return fail(f"{key} is already '{row['status']}'")
+        conn.execute("UPDATE projects SET status=?, closed_at=? WHERE id=?",
+                     (args.status, NOW.isoformat(), key))
+        event(conn, actor(args), "transition", f"active -> {args.status}",
+              project_id=key, detail=args.note or None)
+    print(f"{key}: active -> {args.status}"); return 0
+
+
+def cmd_task_add(args) -> int:
+    try: refs = as_json(args.refs, "--refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    try: due = parse_due(args.due) if getattr(args, "due", None) else None
+    except ValueError as exc: return fail(str(exc))
+    if not args.title.strip(): return fail("title must be non-empty")
+    init_db(); project = ident(args.project, "p") if args.project else None
+    status = "ready" if args.ready else "open"
+    try:
+        with connect() as conn:
+            begin(conn)
+            cur = conn.execute("""INSERT INTO tasks
+              (id, project_id, kind, title, intent, status, stage, lane,
+               created_by, created_at, updated_at, refs, due_at)
+              VALUES ('pending-'||lower(hex(randomblob(8))),?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (project, args.kind, args.title.strip(), args.intent, status,
+               args.stage, args.lane, actor(args), NOW.isoformat(), NOW.isoformat(),
+               refs, due))
+            key = f"t-{cur.lastrowid}"
+            conn.execute("UPDATE tasks SET id=? WHERE seq=?", (key, cur.lastrowid))
+            event(conn, actor(args), "activity", f"task created ({status})",
+                  task_id=key, project_id=project,
+                  detail=f"due {due}" if due else None)
+        print(key); return 0
+    except sqlite3.IntegrityError as exc: return fail(str(exc))
+
+
+def cmd_task_set_due(args) -> int:
+    """Retrofit (or clear) a deadline on an existing task.
+
+    Needed because the store predates due dates: everything in t-1..t-57 was
+    filed with the date, if any, buried in free `title` text. `--clear` exists
+    so a wrong date can be taken back without inventing a replacement.
+    """
+    if args.clear and args.due:
+        return fail("pass a date or --clear, not both")
+    if not args.clear and not args.due:
+        return fail("pass a date (YYYY-MM-DD or ISO8601) or --clear")
+    try: due = None if args.clear else parse_due(args.due)
+    except ValueError as exc: return fail(str(exc))
+    init_db()
+    with connect() as conn:
+        begin(conn)
+        try: row = require(conn, "tasks", args.id, "t")
+        except LookupError as exc:
+            conn.rollback(); return fail(f"no task matches '{exc.args[0]}'")
+        was = row_get(row, "due_at")
+        conn.execute("UPDATE tasks SET due_at=?, updated_at=? WHERE id=?",
+                     (due, NOW.isoformat(), row["id"]))
+        summary = f"due {was or 'unset'} -> {due or 'unset'}"
+        event(conn, actor(args), "activity", summary,
+              task_id=row["id"], project_id=row["project_id"],
+              detail=args.note or None)
+    print(f"{row['id']}: {summary}"); return 0
+
+
+def task_filters(args, base="SELECT * FROM tasks"):
+    clauses, params = [], []
+    for attr, col in (("status", "status"), ("kind", "kind"),
+                      ("stage", "stage"),
+                      ("project", "project_id"), ("claimed_by", "claimed_by")):
+        value = getattr(args, attr, None)
+        if value:
+            if attr == "project": value = ident(value, "p")
+            clauses.append(f"{col}=?"); params.append(value)
+    if getattr(args, "actor", None):
+        clauses.append("created_by=?"); params.append(args.actor)
+    return base + ((" WHERE " + " AND ".join(clauses)) if clauses else "") + " ORDER BY seq", params
+
+
+def task_line(row, blockers=()) -> str:
+    """One task line, with its computed blockers named (P-18).
+
+    `status` is deliberately untouched — a blocked task still reads `ready`,
+    because being blocked is a fact about its neighbours, not its own
+    lifecycle. The suffix is the visible half `estate ready` already acted on
+    silently.
+
+    A review `stage` prints alongside the status for the same reason (P-02): a
+    proposal awaiting the owner and one they approved are both `ready` rows, and
+    without the stage the list cannot say which is which.
+    """
+    owner = f" @{row['claimed_by']}" if row["claimed_by"] else ""
+    blocked = f"  ⛔ blocked by {', '.join(blockers)}" if blockers else ""
+    stage = f"({row_get(row, 'stage')}) " if row_get(row, "stage") else ""
+    return (f"{row['id']:>8}  [{row['status']:<10}] {row['kind']:<12} "
+            f"{stage}{row['title']}{owner}{blocked}")
+
+
+def cmd_task_list(args) -> int:
+    init_db(); sql, params = task_filters(args)
+    with connect() as conn:
+        rows = list(conn.execute(sql, params))
+        # Recomputed on every read, so a blocker finishing clears this with no
+        # write anywhere. Nothing caches it.
+        blockers = estate_deps.blocked_by(conn, {r["id"] for r in rows})
+        for row in rows: print(task_line(row, blockers.get(row["id"], ())))
+    return 0
+
+
+def cmd_task_find(args) -> int:
+    """Exact-match lookup by one key inside a task's `refs` JSON (P-01).
+
+    The *resolve* half of "create or resolve exactly one task per intent".
+    `task list` filters columns; the identity a caller already holds — a Slack
+    intake id, a PR key, a queue key, a dispatch title — lives in `refs`, which
+    no read command could reach. Without this, every would-be resolver either
+    re-reads the whole store itself or gives up and creates a duplicate, which
+    is precisely the split identity P-01 exists to close.
+
+    Matching is exact on a TOP-LEVEL refs key, never a substring: `pr` is
+    `acme/widgets#2040`, not "anything mentioning 2040". Output is task ids,
+    one per line, oldest first — so a caller can tell "exactly one" from
+    "somehow two" instead of silently taking the first.
+    """
+    try: key, _, value = args.ref.partition("=")
+    except ValueError: return fail("--ref takes KEY=VALUE")
+    if not _ or not key.strip():
+        return fail(f"--ref takes KEY=VALUE (got {args.ref!r})")
+    init_db()
+    with connect() as conn:
+        sql, params = task_filters(args)
+        hits = []
+        for row in conn.execute(sql, params):
+            try: refs = json.loads(row["refs"] or "{}")
+            except (json.JSONDecodeError, TypeError): continue
+            if isinstance(refs, dict) and refs.get(key.strip()) == value:
+                hits.append(row)
+        if args.json:
+            print(json.dumps([dict(r) for r in hits], indent=2, sort_keys=True))
+            return 0
+        for row in hits:
+            print(row["id"] if args.quiet else task_line(row))
+    return 0
+
+
+def cmd_task_show(args) -> int:
+    init_db()
+    with connect() as conn:
+        try: row = require(conn, "tasks", args.id, "t")
+        except LookupError as exc: return fail(f"no task matches '{exc.args[0]}'")
+        blockers = estate_deps.blocked_by(conn, {row["id"]})
+        # A derived field on the way out, not a column. `estate json` still
+        # dumps the raw table, so the store's own shape is unchanged.
+        item = estate_deps.annotate([row], blockers)[0]
+        print(json.dumps(item, indent=2, sort_keys=True))
+        print_events(conn, task_id=row["id"])
+    return 0
+
+
+def cmd_log(args) -> int:
+    init_db(); raw = args.id
+    with connect() as conn:
+        if raw.startswith("p-"):
+            key = ident(raw, "p")
+            if not conn.execute("SELECT 1 FROM projects WHERE id=?", (key,)).fetchone(): return fail(f"no project matches '{key}'")
+            print_events(conn, project_id=key)
+        elif raw.startswith("m-"):
+            key = ident(raw, "m")
+            if not conn.execute("SELECT 1 FROM memories WHERE id=?", (key,)).fetchone(): return fail(f"no memory matches '{key}'")
+            print_events(conn, memory_id=key)
+        elif raw.startswith("q-"):
+            key = ident(raw, "q")
+            if not conn.execute("SELECT 1 FROM asks WHERE id=?", (key,)).fetchone(): return fail(f"no ask matches '{key}'")
+            print_events(conn, ask_id=key)
+        else:
+            key = ident(raw, "t")
+            if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (key,)).fetchone(): return fail(f"no task matches '{key}'")
+            print_events(conn, task_id=key)
+    return 0
+
+
+def cmd_note(args) -> int:
+    init_db(); key = ident(args.id, "t")
+    try: refs = as_json(args.refs, "--refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    with connect() as conn:
+        begin(conn)
+        if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (key,)).fetchone(): conn.rollback(); return fail(f"no task matches '{key}'")
+        event(conn, actor(args), "note", args.summary, task_id=key,
+              detail=args.detail, refs=refs)
+    print(f"noted: {key}"); return 0
+
+
+def cmd_event(args) -> int:
+    init_db()
+    try: refs = as_json(args.refs, "--refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    task = ident(args.task, "t") if args.task else None
+    project = ident(args.project, "p") if args.project else None
+    memory = memory_key(args.memory) if args.memory else None
+    stamp = None
+    if args.at:
+        stamp = parse_iso(args.at)
+        if stamp is None:
+            return fail(f"--at: could not read '{args.at}' as an ISO8601 timestamp")
+        stamp = stamp.astimezone(dt.timezone.utc).isoformat()
+    try:
+        with connect() as conn:
+            begin(conn)
+            wrote = event(conn, args.actor, args.kind, args.summary,
+                          task_id=task, project_id=project, memory_id=memory,
+                          detail=args.detail, refs=refs,
+                          session=session_id(args), subsystem=args.subsystem,
+                          phase=args.phase, fingerprint=args.fingerprint,
+                          at=stamp, run=args.run_id,
+                          run_outcome=args.run_outcome)
+        # Both exit 0. A replay is the emitter doing its job after a crash, not
+        # an error — the caller asked for this event to be on file, and it is.
+        print("event recorded" if wrote else
+              f"event already recorded ({args.fingerprint})")
+        return 0
+    except estate_ledger.ContractError as exc: return fail(str(exc))
+    except sqlite3.IntegrityError as exc: return fail(str(exc))
+
+
+def event_line(row) -> str:
+    """One search-result line. Carries the item, since results span items."""
+    who = actors.normalize(row["actor"], row_get(row, "session_id")).label
+    target = (row["task_id"] or row["project_id"] or row_get(row, "memory_id")
+              or row_get(row, "ask_id") or "-")
+    # A qualifying event prints its subsystem and phase in place of the bare
+    # kind, because those are what P-06 made it searchable by; an untyped row
+    # prints exactly what it always did.
+    sub, phase = row_get(row, "subsystem"), row_get(row, "phase")
+    tag = f"{sub}/{phase}" if sub and phase else row["kind"]
+    return (f"{row['seq']:>6} {row['ts']} {target:>8} {who} "
+            f"[{tag}] {row['summary']}")
+
+
+def cmd_events(args) -> int:
+    """Read-only exact-match search across the whole events table (P-16).
+
+    `estate log <id>` answers "what happened to this item". This answers the
+    cross-item question — by actor, by kind, by session, or by any combination
+    — which is what an operator needs to audit one subsystem's whole history.
+    Nothing here writes: no init beyond the migration every read already does.
+    """
+    init_db()
+    filters = {
+        "actor": args.actor,
+        "task": ident(args.task, "t") if args.task else None,
+        "project": ident(args.project, "p") if args.project else None,
+        "memory": memory_key(args.memory) if args.memory else None,
+        "ask": ident(args.ask, "q") if args.ask else None,
+        "session": args.session,
+        "kind": args.kind,
+        "subsystem": args.subsystem,
+        "phase": args.phase,
+        "fingerprint": args.fingerprint,
+        "run": getattr(args, "run", None),
+        "run_outcome": getattr(args, "run_outcome", None),
+        # P-13. The interval pair: strictly after one sequence, up to and
+        # including another. `0` is a legitimate lower bound (the whole table),
+        # so these are read with `is not None` rather than truthiness.
+        "since_seq": getattr(args, "since_seq", None),
+        "until_seq": getattr(args, "until_seq", None),
+    }
+    with connect() as conn:
+        try:
+            rows = estate_events.select(conn, filters, args.limit)
+        except (estate_events.MissingColumn, KeyError) as exc:
+            return fail(str(exc).strip("'"))
+        if args.json:
+            print(json.dumps([dict(r) for r in rows], indent=2, sort_keys=True))
+            return 0
+        for row in rows:
+            print(event_line(row))
+            if args.detail and row["detail"]:
+                print(f"       {row['detail']}")
+            if args.detail and row["refs"]:
+                print(f"       refs: {row['refs']}")
+    return 0
+
+
+def cmd_json(_args) -> int:
+    init_db(); result = {}
+    with connect() as conn:
+        for table in TABLES:
+            result[table] = [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+    print(json.dumps(result, indent=2, sort_keys=True)); return 0
+
+
+# --------------------------------------------------------------------------- #
+# failed attempts and retries (gap audit P-12)
+# --------------------------------------------------------------------------- #
+# S33/S47/S55 all turn on one question: after a worker died and the item came
+# back, can anyone still tell that the first attempt happened and failed? Until
+# now the answer was no. The orphan sweep wrote `claimed -> ready (orphaned...)`
+# and nothing else, so the record held the requeue but not the failure, and a
+# second attempt looked exactly like a first one.
+#
+# The fix is append-only and needs no migration: from here on, every claimed ->
+# ready requeue writes a failed-attempt row FIRST, in the same transaction as
+# the requeue, and `estate retry` refuses to start a new attempt on work that
+# has no such record. Nothing is backfilled — a requeue that already happened
+# left no evidence of its cause, and inventing one would be fabrication.
+
+
+def attempt_count(conn, key: str) -> int:
+    """How many times this task has been claimed. A claim IS an attempt.
+
+    Counted from the Ledger rather than a counter column, deliberately: the
+    events table is append-only and already holds every claim, so the count
+    cannot drift from the history, and it is right for tasks claimed long
+    before P-12 existed.
+    """
+    row = conn.execute(
+        "SELECT count(*) AS n FROM events WHERE task_id=? AND kind='transition' "
+        "AND summary=?", (key, CLAIM_SUMMARY)).fetchone()
+    return row["n"] if row else 0
+
+
+def claim_event(conn, key: str):
+    """The most recent claim of this task, or None — the row that carries the
+    claimant's session id, which the task row itself does not keep."""
+    return conn.execute(
+        "SELECT * FROM events WHERE task_id=? AND kind='transition' AND summary=? "
+        "ORDER BY seq DESC LIMIT 1", (key, CLAIM_SUMMARY)).fetchone()
+
+
+def last_event_seq(conn, key: str):
+    """The sequence number of this task's newest event, or None.
+
+    P-12 asks a failed-attempt record to name the prior event sequence, so a
+    reader can go straight from the failure to whatever the attempt last
+    managed to record before it stopped.
+    """
+    row = conn.execute("SELECT seq FROM events WHERE task_id=? ORDER BY seq DESC "
+                       "LIMIT 1", (key,)).fetchone()
+    return row["seq"] if row else None
+
+
+def failed_attempts(conn, key: str):
+    """Every failed-attempt row on this task, oldest first."""
+    return conn.execute("SELECT * FROM events WHERE task_id=? AND kind=? "
+                        "ORDER BY seq", (key, FAILED_ATTEMPT_KIND)).fetchall()
+
+
+def prior_setback(conn, key: str):
+    """The newest event proving this task has already been tried and did not
+    finish, or None. Two things count, and only two:
+
+      * a failed-attempt row — the requeue cases (P-12), and
+      * a transition into `blocked` — an attempt that ran into something.
+
+    `needs-owner` is deliberately NOT one: it is a park awaiting the owner, not an
+    attempt that failed. Neither is a reopened `done`, which is a decision to
+    do more work rather than evidence the last try broke.
+    """
+    for row in conn.execute("SELECT * FROM events WHERE task_id=? ORDER BY seq DESC",
+                            (key,)):
+        if row["kind"] == FAILED_ATTEMPT_KIND:
+            return row
+        if row["kind"] == "transition" and row["summary"].endswith("-> blocked"):
+            return row
+    return None
+
+
+def record_failed_attempt(conn, row, *, cause: str, who=None, note=None) -> int:
+    """Append this task's failed-attempt row and return the attempt number.
+
+    Called INSIDE the caller's transaction and BEFORE the requeue, so the
+    record and the requeue land together or not at all — a failure that got
+    written while its requeue rolled back would be a lie in the other
+    direction.
+    """
+    key = row["id"]
+    claim = claim_event(conn, key)
+    # or 1: a task imported without its claim event still had an attempt, and
+    # "attempt 0 failed" is not a thing that can have happened.
+    attempt = attempt_count(conn, key) or 1
+    payload = {
+        "attempt": attempt,
+        "cause": cause,
+        "claimed_by": row["claimed_by"],
+        "session": row_get(claim, "session_id") if claim else None,
+        "claim_expires_at": row["claim_expires_at"],
+        "prior_event_seq": last_event_seq(conn, key),
+    }
+    event(conn, who or row["claimed_by"] or "cli", FAILED_ATTEMPT_KIND,
+          f"attempt {attempt} failed ({cause})", task_id=key,
+          project_id=row["project_id"], detail=note or None,
+          refs=json.dumps(payload, sort_keys=True),
+          subsystem="tasks", phase=estate_ledger.FAILURE,
+          fingerprint=estate_ledger.fingerprint(
+              subsystem="tasks", phase=estate_ledger.FAILURE,
+              source="estate.tasks", key=key, ts=NOW.isoformat(),
+              event=f"failed-attempt:{cause}:{attempt}"))
+    return attempt
+
+
+def claim_row(conn, row, who: str, expires: str) -> bool:
+    """The atomic ready -> claimed UPDATE and its transition event.
+
+    False means somebody else holds it (or it is not ready) and the caller
+    must roll back. Shared by `claim` and `retry` so the lock, the event and
+    the fingerprint cannot differ between the two ways of starting work.
+    """
+    key = row["id"]
+    cur = conn.execute("""UPDATE tasks SET claimed_by=?, status='claimed',
+        claim_expires_at=?, updated_at=?
+        WHERE id=? AND status='ready' AND claimed_by IS NULL""",
+        (who, expires, NOW.isoformat(), key))
+    if cur.rowcount == 0:
+        return False
+    # P-06: a claim moves a tracked item, so it is the `tasks` subsystem's
+    # transition exactly as the verbs routed through transition() are. It takes
+    # its own path here (the UPDATE is the lock), which is precisely why it has
+    # to be tagged here too rather than inherited.
+    event(conn, who, "transition", CLAIM_SUMMARY, task_id=key,
+          project_id=row["project_id"], subsystem="tasks",
+          phase=estate_ledger.TRANSITION,
+          fingerprint=estate_ledger.fingerprint(
+              subsystem="tasks", phase=estate_ledger.TRANSITION,
+              source="estate.tasks", key=key, ts=NOW.isoformat(),
+              event="ready->claimed"))
+    return True
+
+
+def transition(conn, key: str, verb: str, who: str, note=""):
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+    if not row: raise LookupError(f"no task matches '{key}'")
+    old = row["status"]; nxt = TRANSITIONS.get(old, {}).get(verb)
+    if not nxt:
+        allowed = ", ".join(sorted(TRANSITIONS.get(old, {}))) or "(none)"
+        raise ValueError(f"{key} is '{old}'; cannot {verb}. Allowed from here: {allowed}")
+    # P-12: claimed -> ready is a REQUEUE, and a requeue means an attempt ended
+    # without finishing. Recorded here rather than in the `release` verb so any
+    # future edge back to the pool inherits it, and before the UPDATE so the
+    # row still carries the claimant this is about.
+    if old == "claimed" and nxt == "ready":
+        record_failed_attempt(conn, row, cause=CAUSE_RELEASED, who=who, note=note)
+    return apply_status(conn, row, nxt, who, note,
+                        clear=verb in ("release", "reopen"))
+
+
+def apply_status(conn, row, nxt: str, who: str, note="", *, clear=False):
+    """Write a task's new status and record the event. transition()'s second
+    half, factored out because the proposal lifecycle (P-02) drives the same
+    write without going through the verb machine — see stage_status().
+
+    `clear` releases the lease, which is exactly the edges that hand a task
+    back to somebody else: `release`, `reopen`, and the reopen a review
+    decision implies. Closing does NOT clear it, so a task that was claimed
+    when it closed still says who held it, the same as `done`.
+    """
+    key, old = row["id"], row["status"]
+    closed = NOW.isoformat() if nxt in ("done", "dropped") else None
+    conn.execute("""UPDATE tasks SET status=?, updated_at=?, closed_at=?,
+        claimed_by=CASE WHEN ? THEN NULL ELSE claimed_by END,
+        claim_expires_at=CASE WHEN ? THEN NULL ELSE claim_expires_at END WHERE id=?""",
+        (nxt, NOW.isoformat(), closed, clear, clear, key))
+    # P-06: a task lifecycle change IS the `tasks` subsystem's qualifying
+    # event, so tagging it here is the whole of that subsystem's compliance —
+    # no second emitter, and every transition already recorded stays where it
+    # is. `done`/`dropped` are terminal, so they are outcomes; the rest move a
+    # tracked item without ending it.
+    event(conn, who, "transition", f"{old} -> {nxt}", task_id=key,
+          project_id=row["project_id"], detail=note or None,
+          subsystem="tasks",
+          phase=estate_ledger.OUTCOME if nxt in TERMINAL else estate_ledger.TRANSITION,
+          fingerprint=estate_ledger.fingerprint(
+              subsystem="tasks",
+              phase=estate_ledger.OUTCOME if nxt in TERMINAL else estate_ledger.TRANSITION,
+              source="estate.tasks", key=key, ts=NOW.isoformat(),
+              event=f"{old}->{nxt}"))
+    return old, nxt
+
+
+EVIDENCE_HELP = ("JSON object recorded as an `evidence` event in the SAME "
+                 "transaction as the status change (never a second command)")
+
+
+def cmd_transition(args) -> int:
+    """Move a task across one edge, optionally with the evidence for it.
+
+    `--evidence` is the same bargain `done` strikes (cmd_done): the typed
+    envelope is written INSIDE the transaction that moves the status, so the
+    two cannot come apart. A caller that appends its evidence afterwards, in a
+    second command, is one failed call away from a task parked in a state whose
+    precondition nothing on file can show was met — which is exactly what
+    `needs-owner` did with its top-level-post ts. If the
+    evidence cannot be recorded the transition does not happen either.
+    """
+    init_db(); key = ident(args.id, "t"); verb = args.verb
+    note = getattr(args, "note", "") or ""
+    try:
+        evidence = as_json(getattr(args, "evidence", None), "--evidence JSON")
+        if evidence is not None and not isinstance(json.loads(evidence), dict):
+            raise ValueError("--evidence JSON must be an object")
+    except ValueError as exc: return fail(str(exc))
+    try:
+        with connect() as conn:
+            begin(conn); who = actor(args)
+            old, nxt = transition(conn, key, verb, who, note)
+            if evidence is not None:
+                row = conn.execute("SELECT project_id FROM tasks WHERE id=?",
+                                   (key,)).fetchone()
+                event(conn, who, "evidence", f"{verb} evidence", task_id=key,
+                      project_id=row["project_id"], refs=evidence)
+        print(f"{key}: {old} -> {nxt}"); return 0
+    except (LookupError, ValueError) as exc: return fail(str(exc))
+
+
+def ttl_delta(value: str):
+    match = TTL_RE.fullmatch(value)
+    if not match: raise ValueError("TTL must match <number><s|m|h|d>")
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    seconds = int(match.group(1)) * units[match.group(2)]
+    # A zero TTL is a lease or a deadline that has already elapsed. Nothing
+    # wants that, and an ask created pre-expired would be swept before its
+    # addressee ever saw it.
+    if seconds <= 0: raise ValueError("TTL must be greater than zero")
+    return dt.timedelta(seconds=seconds)
+
+
+def cmd_claim(args) -> int:
+    init_db(); key = ident(args.id, "t")
+    try: expires = (NOW + ttl_delta(args.ttl)).isoformat()
+    except ValueError as exc: return fail(str(exc))
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        # The other half of the proposal gate (P-02). `ready` already omits an
+        # undecided proposal; this refuses one named directly, so a caller that
+        # knows an id cannot route around the review by skipping the list.
+        if row is not None and row_get(row, "stage") in GATED_STAGES:
+            conn.rollback()
+            return fail(f"{key} is a proposal at stage '{row['stage']}'; only "
+                        f"'{APPROVED}' proposals are claimable")
+        if row is None or not claim_row(conn, row, args.actor, expires):
+            conn.rollback(); return fail(f"{key} is already claimed or not ready")
+    print(f"{key}: ready -> claimed by {args.actor} until {expires}"); return 0
+
+
+def cmd_retry(args) -> int:
+    """Start a NEW attempt on work that has already been tried (P-12).
+
+    `claim`'s sibling, not its replacement. The difference is the gate and the
+    record: retry refuses a task with no failed or blocked attempt on file, and
+    it appends a retry row naming which failure it follows and which attempt
+    this is. That is what makes S47's "the original attempt and failure remain
+    observable, and the retry is distinct" true of the store rather than of a
+    reader's memory.
+
+    Retry deliberately does NOT reopen a parked task. `blocked` and
+    `needs-owner` leave through `reopen`, which is where a human decision
+    belongs; retry picks up from `ready` like every other claim, so the state
+    machine keeps exactly one edge back into the pool.
+    """
+    init_db(); key = ident(args.id, "t")
+    try: expires = (NOW + ttl_delta(args.ttl)).isoformat()
+    except ValueError as exc: return fail(str(exc))
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if row is None:
+            conn.rollback(); return fail(f"no task matches '{key}'")
+        if row_get(row, "stage") in GATED_STAGES:
+            conn.rollback()
+            return fail(f"{key} is a proposal at stage '{row['stage']}'; only "
+                        f"'{APPROVED}' proposals are claimable")
+        prior = prior_setback(conn, key)
+        if prior is None:
+            conn.rollback()
+            return fail(f"{key} has no failed or blocked attempt on record; "
+                        "retry is for work that has already been tried. Use "
+                        "`claim` for a first attempt.")
+        if not claim_row(conn, row, args.actor, expires):
+            conn.rollback(); return fail(f"{key} is already claimed or not ready")
+        # After claim_row, so the attempt it counts includes this one.
+        attempt = attempt_count(conn, key)
+        payload = {"attempt": attempt, "after_event_seq": prior["seq"],
+                   "after_cause": task_refs(prior).get("cause") or prior["summary"],
+                   "prior_attempts": len(failed_attempts(conn, key))}
+        event(conn, args.actor, RETRY_KIND,
+              f"retry: attempt {attempt}, after event {prior['seq']}",
+              task_id=key, project_id=row["project_id"], detail=args.note or None,
+              refs=json.dumps(payload, sort_keys=True),
+              subsystem="tasks", phase=estate_ledger.INITIATION,
+              fingerprint=estate_ledger.fingerprint(
+                  subsystem="tasks", phase=estate_ledger.INITIATION,
+                  source="estate.tasks", key=key, ts=NOW.isoformat(),
+                  event=f"retry:{attempt}"))
+    print(f"{key}: retry attempt {attempt} claimed by {args.actor} until {expires} "
+          f"(after event {prior['seq']})")
+    return 0
+
+
+def cmd_extend(args) -> int:
+    init_db(); key = ident(args.id, "t")
+    try: expires = (NOW + ttl_delta(args.ttl)).isoformat()
+    except ValueError as exc: return fail(str(exc))
+    with connect() as conn:
+        begin(conn)
+        cur = conn.execute("""UPDATE tasks SET claim_expires_at=?, updated_at=?
+            WHERE id=? AND status='claimed' AND claimed_by=?""",
+            (expires, NOW.isoformat(), key, args.actor))
+        if cur.rowcount == 0: conn.rollback(); return fail(f"{key} is not claimed by {args.actor}")
+        event(conn, args.actor, "note", f"lease extended until {expires}", task_id=key)
+    print(f"{key}: lease extended until {expires}"); return 0
+
+
+def cmd_done(args) -> int:
+    init_db(); key = ident(args.id, "t")
+    try:
+        extras = json.loads(args.refs) if args.refs else {}
+        if not isinstance(extras, dict): raise ValueError("--refs JSON must be an object")
+    except (json.JSONDecodeError, ValueError) as exc: return fail(str(exc))
+    envelope = {"summary": args.summary, "verification": args.verification,
+                "dependencies": args.dependencies, "retry_notes": args.retry_notes,
+                "residual_risk": args.residual_risk}
+    envelope.update(extras)
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if not row: conn.rollback(); return fail(f"no task matches '{key}'")
+        if row["claimed_by"] != args.actor:
+            conn.rollback(); return fail(f"{key} is not claimed by {args.actor}")
+        try: old, nxt = transition(conn, key, "done", args.actor)
+        except ValueError as exc: conn.rollback(); return fail(str(exc))
+        event(conn, args.actor, "evidence", "completion evidence", task_id=key,
+              project_id=row["project_id"], refs=json.dumps(envelope, sort_keys=True))
+    print(f"{key}: {old} -> {nxt}"); return 0
+
+
+# --------------------------------------------------------------------------- #
+# the proposal review lifecycle (gap audit P-02)
+# --------------------------------------------------------------------------- #
+# A Mechanic proposal used to live in exactly one place: the current text of
+# state/mechanic/REPORT.md, which is OVERWRITTEN every pass. Nothing recorded
+# whether the owner had seen one, agreed to one, or turned one down, so a recurring
+# condition came back every night looking brand new and a rejected proposal was
+# indistinguishable from an untouched one. The hub's end-of-day pass compensated
+# by scraping the report with awk and cross-referencing ledger text.
+#
+# This is that record, and it is NOT a second store. P-01 made one estate task
+# per unit of work mandatory; a proposal is a unit of work in its earliest
+# state, so it is a task here from the moment it is proposed, and `stage`
+# carries the review decision. A proposal that graduates does not become a
+# different row — it changes stage.
+#
+# IDENTIFIED BY STAGE, NOT BY KIND. A proposal filed fresh gets
+# kind=`proposal`; a proposal that turns out to ALREADY be a task (the hub
+# routed it to a follow-up months ago) is adopted in place and keeps its own
+# kind. Rewriting an existing row's kind would rewrite history to make the
+# lifecycle look tidier than it was. So every read here — the gate, the list,
+# the classify — keys on `stage`, which no other vocabulary uses.
+#
+# THE FINGERPRINT is what makes "have we seen this before" answerable without a
+# human reading two paragraphs. It is a hash of the normalized CONDITION text
+# (casefolded, punctuation collapsed), not of the proposal id: `P-16` means one
+# thing in the mechanic's own numbering and a completely different thing in the
+# gap audit's, which is the 2026-07-23 `task:4` collision wearing a new hat. A
+# caller that knows its condition by a stable name passes --fingerprint and
+# pins it; everything else derives one from the text.
+def fingerprint(text: str) -> str:
+    """Stable 12-char equivalence fingerprint for a proposal's condition.
+
+    Normalization is deliberately shallow — case and punctuation only. It is
+    NOT trying to recognize a rewritten proposal as the same one: a fingerprint
+    that matched loosely would silently merge two distinct findings, which is
+    worse than filing a duplicate a human can see and close.
+    """
+    words = FINGERPRINT_NORMALIZE_RE.sub(" ", (text or "").casefold()).split()
+    if not words:
+        raise ValueError("cannot fingerprint empty text")
+    return hashlib.sha256(" ".join(words).encode()).hexdigest()[:12]
+
+
+def proposal_by_fingerprint(conn, fp: str):
+    """The one task carrying this fingerprint, oldest first, or None."""
+    for row in conn.execute("SELECT * FROM tasks ORDER BY seq"):
+        try:
+            refs = json.loads(row["refs"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(refs, dict) and refs.get(FINGERPRINT_KEY) == fp:
+            return row
+    return None
+
+
+def resolve_fingerprint(args, fallback: str = "") -> str:
+    if getattr(args, "fingerprint", None):
+        return args.fingerprint.strip()
+    return fingerprint(getattr(args, "condition", None) or fallback)
+
+
+def cmd_proposal_fingerprint(args) -> int:
+    """Print the fingerprint of some text. No store, no write.
+
+    Exists so a caller can compute the same value this command family compares
+    on, instead of reimplementing the normalization and drifting from it.
+    """
+    try:
+        print(fingerprint(args.text))
+    except ValueError as exc:
+        return fail(str(exc))
+    return 0
+
+
+def task_refs(row) -> dict:
+    """A row's refs as a dict; {} for anything unparseable. Tasks carry the
+    proposal record here; events carry their own payload the same way."""
+    try:
+        refs = json.loads(row_get(row, "refs") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return refs if isinstance(refs, dict) else {}
+
+
+def review_fields(args) -> dict:
+    """The P-09 review record carried by this invocation, non-empty keys only.
+
+    `condition` doubles as the fingerprint source, but the fingerprint is a
+    hash — it answers "same condition?" and cannot answer "what condition?".
+    Keeping the text is what makes the record reviewable rather than merely
+    deduplicable.
+    """
+    supplied = {
+        CONDITION_KEY: getattr(args, "condition", None),
+        "desired_outcome": getattr(args, "desired_outcome", None),
+        "completion_check": getattr(args, "completion_check", None),
+    }
+    return {k: v.strip() for k, v in supplied.items() if (v or "").strip()}
+
+
+def fill_review_fields(conn, row, supplied: dict) -> list[str]:
+    """Add review fields the row does not have yet. Returns the keys filled.
+
+    Never overwrites: a proposal's condition is its identity, and quietly
+    rewriting it on a later night would move the record out from under the
+    decision the owner made against it.
+    """
+    refs = task_refs(row)
+    filled = [k for k in REVIEW_FIELDS
+              if supplied.get(k) and not str(refs.get(k) or "").strip()]
+    if not filled:
+        return []
+    refs.update({k: supplied[k] for k in filled})
+    conn.execute("UPDATE tasks SET refs=?, updated_at=? WHERE id=?",
+                 (json.dumps(refs, sort_keys=True), NOW.isoformat(), row["id"]))
+    return filled
+
+
+def cmd_proposal_show(args) -> int:
+    """The reviewable record for one proposal (S08), read-only.
+
+    `task show` prints the row as JSON, which is the right answer for a
+    machine and the wrong one for the person deciding. This is the decision
+    view: what was observed, what should be true afterwards, how anyone
+    checks, and how often the condition has come back.
+    """
+    init_db(); key = ident(args.id, "t")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if not row:
+            return fail(f"no task matches '{key}'")
+        stage = row_get(row, "stage")
+        if not stage:
+            return fail(f"{key} is not in the proposal review lifecycle; file "
+                        f"it with `estate proposal add --adopt-task {key} ...`")
+        recurrences = list(conn.execute(
+            """SELECT ts FROM events WHERE task_id=? AND kind='note'
+               AND summary LIKE 'condition observed again%' ORDER BY seq""",
+            (key,)))
+    refs = task_refs(row)
+    print(task_line(row))
+    print(f"  fingerprint       {refs.get(FINGERPRINT_KEY) or '(none)'}")
+    for field in REVIEW_FIELDS:
+        value = str(refs.get(field) or "").strip()
+        # A legacy proposal has to READ as legacy. Printing nothing where the
+        # completion check belongs would let an unreviewable record pass for a
+        # complete one, which is the defect P-09 is about.
+        label = field.replace("_", " ")
+        print(f"  {label:<17} {value or '(not recorded)'}")
+    if row_get(row, "intent"):
+        print(f"  intent            {row['intent']}")
+    if recurrences:
+        print(f"  recurrences       {len(recurrences)} "
+              f"(last {recurrences[-1]['ts']})")
+    return 0
+
+
+def cmd_proposal_add(args) -> int:
+    """File a proposal, or recognize one already on file (S10).
+
+    Three outcomes, and the caller can tell them apart from the printed id plus
+    the note on stderr:
+      new         nothing carried this fingerprint — a task is created
+      recurrence  a task already carries it — a note is recorded on THAT task
+                  and no second row is minted, whatever stage it is in
+      adopted     --adopt-task named an existing task; it gains the stage and
+                  the fingerprint in place, keeping its own kind and history
+    """
+    stage = args.stage or PENDING
+    if stage not in PROPOSAL_STAGES:
+        return fail(f"--stage must be one of {', '.join(PROPOSAL_STAGES)}")
+    if not (args.title or "").strip():
+        return fail("title must be non-empty")
+    try:
+        fp = resolve_fingerprint(args, args.title)
+        extra = json.loads(args.refs) if args.refs else {}
+        if not isinstance(extra, dict):
+            raise ValueError("--refs JSON must be an object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        return fail(str(exc))
+    extra.update(review_fields(args))
+    init_db()
+    who = actor(args)
+    adopt = ident(args.adopt_task, "t") if args.adopt_task else None
+    with connect() as conn:
+        begin(conn)
+        seen = proposal_by_fingerprint(conn, fp)
+        if seen is not None and seen["id"] != adopt:
+            # The recurrence path. Recorded, never re-filed: a condition that
+            # comes back is a fact about the EXISTING proposal, and creating a
+            # second row is exactly how "already resolved" gets presented as
+            # newly discovered.
+            #
+            # One thing a recurrence MAY do is fill a blank (P-09). A proposal
+            # filed before the review record existed carries no desired
+            # outcome or completion check, and a recurrence that supplies them
+            # is the only chance the store gets to hold them without a
+            # migration. Absent keys only — an existing value is never
+            # overwritten, so this can add to the record and never rewrite it.
+            filled = fill_review_fields(conn, seen, extra)
+            note = ("condition observed again" if not filled else
+                    f"condition observed again (review record filled in: "
+                    f"{', '.join(filled)})")
+            event(conn, who, "note", note,
+                  task_id=seen["id"], project_id=seen["project_id"],
+                  detail=(args.title or "").strip()[:500],
+                  refs=json.dumps({FINGERPRINT_KEY: fp}, sort_keys=True))
+            print(seen["id"])
+            print(f"recurrence of {seen['id']} (stage {seen['stage'] or 'none'}) "
+                  "— not re-filed", file=sys.stderr)
+            return 0
+        if adopt:
+            try:
+                row = require(conn, "tasks", adopt, "t")
+            except LookupError as exc:
+                conn.rollback(); return fail(f"no task matches '{exc.args[0]}'")
+            try:
+                refs = json.loads(row["refs"] or "{}")
+                if not isinstance(refs, dict):
+                    refs = {}
+            except (json.JSONDecodeError, TypeError):
+                refs = {}
+            held = refs.get(FINGERPRINT_KEY)
+            if held and held != fp:
+                conn.rollback()
+                return fail(f"{row['id']} already carries fingerprint {held}; "
+                            "one task is one proposal")
+            was = row_get(row, "stage")
+            refs.update(extra); refs[FINGERPRINT_KEY] = fp
+            conn.execute("UPDATE tasks SET stage=?, refs=?, updated_at=? WHERE id=?",
+                         (stage, json.dumps(refs, sort_keys=True),
+                          NOW.isoformat(), row["id"]))
+            event(conn, who, "transition", f"stage: {was or 'none'} -> {stage}",
+                  task_id=row["id"], project_id=row["project_id"],
+                  detail=args.note or "adopted into the proposal review lifecycle",
+                  refs=json.dumps({FINGERPRINT_KEY: fp}, sort_keys=True))
+            print(row["id"])
+            print(f"adopted {row['id']} at stage {stage}", file=sys.stderr)
+            return 0
+        refs = dict(extra); refs[FINGERPRINT_KEY] = fp
+        project = ident(args.project, "p") if args.project else None
+        # `ready` on purpose: a proposal has no blocker except the decision,
+        # and the decision is the stage. The gate in `ready`/`claim` is what
+        # keeps an undecided one out of anybody's hands.
+        cur = conn.execute("""INSERT INTO tasks
+          (id, project_id, kind, title, intent, status, stage, created_by,
+           created_at, updated_at, refs)
+          VALUES ('pending-'||lower(hex(randomblob(8))),?,?,?,?,'ready',?,?,?,?,?)""",
+          (project, PROPOSAL_KIND, args.title.strip()[:200], args.intent, stage,
+           who, NOW.isoformat(), NOW.isoformat(),
+           json.dumps(refs, sort_keys=True)))
+        key = f"t-{cur.lastrowid}"
+        conn.execute("UPDATE tasks SET id=? WHERE seq=?", (key, cur.lastrowid))
+        event(conn, who, "activity", f"proposal filed ({stage})", task_id=key,
+              project_id=project, detail=args.note or None,
+              refs=json.dumps({FINGERPRINT_KEY: fp}, sort_keys=True))
+    print(key)
+    print(f"new proposal {key} at stage {stage}", file=sys.stderr)
+    return 0
+
+
+def stage_status(was: str, stage: str):
+    """The task status this stage move implies, or None for the moves that
+    imply nothing.
+
+    Exactly two edges carry a side effect, and both involve a terminal stage:
+    arriving at one closes the task, leaving one reopens it. The claimable path
+    — pending-review <-> approved-backlog, and the initial filing — is
+    deliberately untouched: `approved-backlog` is where a `ready` task is
+    supposed to sit, waiting for somebody to claim it.
+    """
+    if stage in STAGE_CLOSES:
+        return STAGE_CLOSES[stage]
+    if was in STAGE_CLOSES:
+        return STAGE_REOPENS
+    return None
+
+
+def drive_task_status(conn, row, want: str, who: str, note: str):
+    """Apply the status a review decision implies. (old, new), or None if the
+    task is already where the decision wants it.
+
+    Deliberately NOT transition(). TRANSITIONS models what a WORKER may do to a
+    task it holds: only a claimant finishes one, and `dropped` has no exits at
+    all. A review decision is the owner's, it lands on a proposal nobody ever
+    claimed, and `ready -> done` has no verb — nor should it grow one, because
+    that would let any caller close unclaimed work. The guard here is
+    terminality instead: a decision closes a task that is still open, reopens
+    one an earlier decision closed, and does nothing at all otherwise. In
+    particular it never re-closes an already-closed task, so a `dropped` task
+    whose proposal is later marked resolved keeps the outcome it actually had.
+    """
+    old = row["status"]
+    if old == want:
+        return None
+    if want in TERMINAL:
+        return None if old in TERMINAL else apply_status(conn, row, want, who, note)
+    return apply_status(conn, row, want, who, note, clear=True) if old in TERMINAL else None
+
+
+def stage_detail(lead: str, note: str):
+    return f"{lead}: {note}" if note else lead
+
+
+class ProposalStageError(ValueError):
+    """A refused proposal decision; safe to show to a CLI or HTTP caller."""
+
+
+class ProposalStageConflict(ProposalStageError):
+    """The reviewer acted on a stage that changed after their snapshot."""
+
+
+def apply_proposal_stage(key: str, target: str, note: str, who: str,
+                         *, expected_stage: str | None = None) -> dict:
+    """Apply one audited proposal decision and return its resulting shape.
+
+    This is the one mutation path shared by ``estate proposal stage`` and the
+    dashboard's narrow POST endpoint.  The optional expected stage is an
+    optimistic lock for a browser acting on a periodically refreshed snapshot;
+    the CLI deliberately omits it and retains its historical behavior.
+    """
+    if target not in PROPOSAL_STAGES:
+        raise ProposalStageError(
+            f"stage must be one of {', '.join(PROPOSAL_STAGES)}")
+    key = ident(key, "t")
+    note = (note or "").strip()
+    moved = None
+    init_db()
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if not row:
+            conn.rollback(); raise ProposalStageError(f"no task matches '{key}'")
+        was = row_get(row, "stage")
+        if not was:
+            conn.rollback()
+            raise ProposalStageError(
+                f"{key} is not in the proposal review lifecycle; file it "
+                f"with `estate proposal add --adopt-task {key} ...`")
+        if expected_stage is not None and was != expected_stage:
+            conn.rollback()
+            raise ProposalStageConflict(
+                f"{key} changed from '{expected_stage}' to '{was}'; refresh before deciding")
+        if was == target:
+            # Re-affirming a decision is normally a no-op worth refusing. The
+            # one exception is a terminal decision whose task-closure never
+            # happened, because it was recorded before this side effect
+            # existed. Re-running the same decision is how those close, and
+            # once the task IS closed the same command refuses again — so this
+            # is a repair path, not a way to restage anything.
+            want = STAGE_CLOSES.get(target)
+            moved = want and drive_task_status(
+                conn, row, want, who,
+                stage_detail(f"retroactive close for proposal stage "
+                             f"'{target}' decided earlier", note))
+            if not moved:
+                conn.rollback(); raise ProposalStageError(f"{key} is already '{target}'")
+            return {"id": key, "from_stage": was, "stage": target,
+                    "task_status": moved[1], "task_transition": list(moved),
+                    "retroactive": True}
+        if target not in STAGE_TRANSITIONS.get(was, ()):
+            conn.rollback()
+            raise ProposalStageError(
+                f"{key} is '{was}'; cannot move to '{target}'. Allowed from here: "
+                f"{', '.join(STAGE_TRANSITIONS.get(was, ())) or '(none)'}")
+        conn.execute("UPDATE tasks SET stage=?, updated_at=? WHERE id=?",
+                     (target, NOW.isoformat(), key))
+        event(conn, who, "transition", f"stage: {was} -> {target}",
+              task_id=key, project_id=row["project_id"], detail=note or None)
+        # Same transaction as the stage write, on purpose: a decision that
+        # recorded the review but not the closure is precisely the state this
+        # exists to make impossible.
+        want = stage_status(was, target)
+        if want:
+            moved = drive_task_status(
+                conn, row, want, who,
+                stage_detail(f"proposal stage {was} -> {target}", note))
+    return {"id": key, "from_stage": was, "stage": target,
+            "task_status": moved[1] if moved else row["status"],
+            "task_transition": list(moved) if moved else None,
+            "retroactive": False}
+
+
+def cmd_proposal_stage(args) -> int:
+    """Record a review decision. The audited half of the lifecycle (S32)."""
+    try:
+        result = apply_proposal_stage(args.id, args.stage, args.note or "", actor(args))
+    except ProposalStageError as exc:
+        return fail(str(exc))
+    if result["retroactive"]:
+        moved = result["task_transition"]
+        print(f"{result['id']}: already '{result['stage']}'; "
+              f"task {moved[0]} -> {moved[1]}")
+        return 0
+    print(f"{result['id']}: {result['from_stage']} -> {result['stage']}")
+    moved = result["task_transition"]
+    if moved: print(f"{result['id']}: task {moved[0]} -> {moved[1]}")
+    return 0
+
+
+def cmd_proposal_list(args) -> int:
+    init_db()
+    if args.stage and args.stage not in PROPOSAL_STAGES:
+        return fail(f"--stage must be one of {', '.join(PROPOSAL_STAGES)}")
+    wanted = (args.stage,) if args.stage else (
+        PROPOSAL_STAGES if args.all else PROPOSAL_LIVE)
+    holes = ",".join("?" * len(wanted))
+    with connect() as conn:
+        rows = list(conn.execute(
+            f"SELECT * FROM tasks WHERE stage IN ({holes}) ORDER BY seq", wanted))
+        blockers = estate_deps.blocked_by(conn, {r["id"] for r in rows})
+        for row in rows:
+            print(task_line(row, blockers.get(row["id"], ())))
+    return 0
+
+
+def cmd_proposal_classify(args) -> int:
+    """new | <stage> <task-id> — the S10 answer, in one line.
+
+    The Mechanic runs this for each condition it is about to write up, so a
+    pending proposal and a previously resolved one are never presented as
+    newly discovered.
+    """
+    if not (args.fingerprint or args.condition):
+        return fail("pass --condition TEXT or --fingerprint FP")
+    try:
+        fp = resolve_fingerprint(args)
+    except ValueError as exc:
+        return fail(str(exc))
+    init_db()
+    with connect() as conn:
+        row = proposal_by_fingerprint(conn, fp)
+    if row is None:
+        print("new"); return 0
+    print(f"{row_get(row, 'stage') or 'none'} {row['id']}"); return 0
+
+
+def cmd_ready(args) -> int:
+    init_db()
+    # The proposal gate (P-02). A row whose review stage is anything other than
+    # approved-backlog is not claimable work, whatever its status says — that
+    # is what "Night shift claims only approved-backlog" means mechanically.
+    gate = f"(t.stage IS NULL OR t.stage NOT IN ({','.join('?' * len(GATED_STAGES))}))"
+    clauses = ["t.status='ready'", "NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks b ON b.id=d.from_task WHERE d.to_task=t.id AND d.dep_kind='blocks' AND b.status NOT IN ('done','dropped'))", gate]
+    params = list(GATED_STAGES)
+    if args.kind: clauses.append("t.kind=?"); params.append(args.kind)
+    # See UNPOOLED_KINDS. Named explicitly -> you get them; the open question
+    # "what should I pick up" -> you do not.
+    elif UNPOOLED_KINDS:
+        clauses.append(f"t.kind NOT IN ({','.join('?' * len(UNPOOLED_KINDS))})")
+        params.extend(UNPOOLED_KINDS)
+    if args.actor: clauses.append("t.created_by=?"); params.append(args.actor)
+    with connect() as conn:
+        for row in conn.execute("SELECT t.* FROM tasks t WHERE " + " AND ".join(clauses) + " ORDER BY t.seq", params): print(task_line(row))
+    return 0
+
+
+def cmd_dep_add(args) -> int:
+    init_db(); left, right = ident(args.from_task, "t"), ident(args.to_task, "t")
+    try:
+        with connect() as conn:
+            begin(conn)
+            conn.execute("INSERT INTO task_deps VALUES (?,?,?,?)", (left, right, args.kind, NOW.isoformat()))
+            event(conn, actor(args), "note", f"dependency added: {left} {args.kind} {right}", task_id=right)
+        print(f"{left} --{args.kind}--> {right}"); return 0
+    except sqlite3.IntegrityError as exc: return fail(str(exc))
+
+
+def cmd_dep_list(args) -> int:
+    init_db(); key = ident(args.id, "t")
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (key,)).fetchone(): return fail(f"no task matches '{key}'")
+        for row in conn.execute("SELECT * FROM task_deps WHERE from_task=? OR to_task=? ORDER BY created_at", (key, key)):
+            direction = "out" if row["from_task"] == key else "in"
+            print(f"{direction:>3} {row['from_task']} --{row['dep_kind']}--> {row['to_task']}")
+    return 0
+
+
+# --- memories (§5) ------------------------------------------------------------
+# Memories ride §4's rails — CLI-only access, DB-assigned never-reused ids, an
+# events row per mutation in the same transaction — but not the task lifecycle:
+# they are never claimed, never leased, never in `estate ready`.
+
+
+def memory_key(value: str) -> str:
+    return ident(value, "m")
+
+
+def require_memory(conn, value: str):
+    key = memory_key(value)
+    row = conn.execute("SELECT * FROM memories WHERE id=?", (key,)).fetchone()
+    if not row:
+        raise LookupError(f"no memory matches '{key}'")
+    return row
+
+
+def check_provenance(scope: str, status: str, refs) -> None:
+    # §5.3: promotion without provenance is the direct counter to manufactured
+    # confidence, so a shared active memory must cite what it generalizes from.
+    if scope == SHARED and status == "active" and not refs:
+        raise ValueError("a shared active memory must cite --source-refs (§5.3)")
+
+
+def check_retirable(row, force: bool) -> None:
+    if row["status"] in MEMORY_RETIRED:
+        raise ValueError(f"{row['id']} is already '{row['status']}'")
+    if row["protected"] and not force:
+        raise ValueError(f"{row['id']} is protected; retiring it is the owner's call "
+                         "(§5.6 review lane) — pass --force-protected once approved")
+
+
+def insert_memory(conn, who: str, *, scope: str, kind: str, body: str,
+                  status: str, refs=None, protected: int = 0,
+                  reactivations: int = 0) -> str:
+    check_provenance(scope, status, refs)
+    cur = conn.execute("""INSERT INTO memories
+        (id, scope, kind, body, status, protected, source_refs,
+         created_at, updated_at, reactivations)
+        VALUES ('pending-'||lower(hex(randomblob(8))),?,?,?,?,?,?,?,?,?)""",
+        (scope, kind, body, status, protected, refs,
+         NOW.isoformat(), NOW.isoformat(), reactivations))
+    key = f"m-{cur.lastrowid}"
+    conn.execute("UPDATE memories SET id=? WHERE seq=?", (key, cur.lastrowid))
+    # P-06: filing a fact is the Memory subsystem initiating work on it; the
+    # promotion and retirement verbs below are its transitions. `kind` stays
+    # what it has always been so nothing that reads these rows shifts.
+    event(conn, who, "activity", f"memory created ({status}, scope={scope})",
+          memory_id=key, refs=refs, subsystem="memory",
+          phase=estate_ledger.INITIATION,
+          fingerprint=memory_fingerprint(estate_ledger.INITIATION, key, "created"))
+    return key
+
+
+def memory_fingerprint(phase: str, key: str, event_name: str) -> str:
+    """One qualifying-event identity for the Memory subsystem.
+
+    The memory id plus the verb plus the moment: a memory can be archived and
+    reinstated repeatedly, and each of those is its own event.
+    """
+    return estate_ledger.fingerprint(
+        subsystem="memory", phase=phase, source="estate.memories", key=key,
+        ts=NOW.isoformat(), event=event_name)
+
+
+def retire(conn, row, who: str, status: str, successor=None, note="") -> None:
+    conn.execute("""UPDATE memories SET status=?, superseded_by=?, retired_at=?,
+        updated_at=? WHERE id=?""",
+        (status, successor, NOW.isoformat(), NOW.isoformat(), row["id"]))
+    tail = f" (replaced by {successor})" if successor else ""
+    event(conn, who, "transition", f"{row['status']} -> {status}{tail}",
+          memory_id=row["id"], detail=note or None, subsystem="memory",
+          phase=estate_ledger.OUTCOME,
+          fingerprint=memory_fingerprint(estate_ledger.OUTCOME, row["id"],
+                                         f"retire:{status}"))
+
+
+def memory_line(row) -> str:
+    text = " ".join(row["body"].split())
+    if len(text) > 68:
+        text = text[:67] + "..."
+    flag = " [protected]" if row["protected"] else ""
+    return (f"{row['id']:>8}  [{row['status']:<10}] {row['scope']:<10} "
+            f"{row['kind']:<10} {text}{flag}")
+
+
+def cmd_memory_add(args) -> int:
+    try: refs = as_json(args.source_refs, "--source-refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    body, scope = args.body.strip(), args.scope.strip()
+    if not body: return fail("body must be non-empty")
+    if not scope: return fail("--scope must be non-empty")
+    init_db()
+    try:
+        with connect() as conn:
+            begin(conn)
+            key = insert_memory(conn, actor(args), scope=scope, kind=args.kind,
+                                body=body, status=args.status, refs=refs,
+                                protected=int(args.protected))
+    except ValueError as exc: return fail(str(exc))
+    except sqlite3.IntegrityError as exc: return fail(str(exc))
+    print(key); return 0
+
+
+def memory_filters(args):
+    clauses, params = [], []
+    for attr, col in (("scope", "scope"), ("kind", "kind"), ("status", "status")):
+        value = getattr(args, attr, None)
+        if value: clauses.append(f"{col}=?"); params.append(value)
+    if not args.status and not getattr(args, "all", False):
+        # §5.5: retired rows stay queryable but are out of normal reads.
+        clauses.append("status IN (%s)" % ",".join("?" * len(MEMORY_LIVE)))
+        params.extend(MEMORY_LIVE)
+    if getattr(args, "protected", False): clauses.append("protected=1")
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+
+def cmd_memory_list(args) -> int:
+    init_db(); where, params = memory_filters(args)
+    with connect() as conn:
+        for row in conn.execute(f"SELECT * FROM memories{where} ORDER BY seq", params):
+            print(memory_line(row))
+    return 0
+
+
+def cmd_memory_query(args) -> int:
+    # Substring search over bodies. Defaults to --all because the first caller is
+    # dedup before minting a memory, and a match against a superseded or archived
+    # row is exactly the reactivation signal §5.5 wants surfaced, not hidden.
+    init_db(); where, params = memory_filters(args)
+    pattern = "%" + args.text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    joiner = " AND " if where else " WHERE "
+    sql = f"SELECT * FROM memories{where}{joiner}body LIKE ? ESCAPE '\\' ORDER BY seq"
+    with connect() as conn:
+        for row in conn.execute(sql, [*params, pattern]):
+            print(memory_line(row))
+    return 0
+
+
+def recall_rows(conn, scope: str, kind=None):
+    """Every ACTIVE memory at `scope` or `shared`, local first (P-05).
+
+    The whole query, and deliberately a small one: two scope sets, one status,
+    no ranking. See lib/estate_memory.py for why each of those is fixed.
+
+    Ordering is local-before-shared and then by `seq`, so a consumer reading
+    top-down meets its own context first and, inside each set, the oldest fact
+    first — the same order `memory list` and the lessons render already use.
+    """
+    scopes = estate_memory.recall_scopes(scope)
+    marks = ",".join("?" * len(scopes))
+    sql = (f"SELECT * FROM memories WHERE scope IN ({marks}) "
+           f"AND status IN ({','.join('?' * len(estate_memory.RECALLABLE))})")
+    params = [*scopes, *estate_memory.RECALLABLE]
+    if kind:
+        sql += " AND kind=?"; params.append(kind)
+    rows = list(conn.execute(sql + " ORDER BY seq", params))
+    rows.sort(key=lambda r: (r["scope"] == SHARED, r["seq"]))
+    return rows
+
+
+def recall_block(row) -> str:
+    """One recalled fact: a labelled header, then the body in full.
+
+    NOT memory_line() — that truncates at 68 characters, which is right for a
+    curator scanning a list and useless for a session that has to ACT on the
+    fact. The header carries the id and the scope the row is actually stored
+    at (S36: a global fact is visibly global at the moment it is used).
+    """
+    head = (f"{row['id']}  [{row['scope']}]  {row['kind']}"
+            + ("  [protected]" if row["protected"] else ""))
+    body = "\n\n".join(
+        textwrap.fill(" ".join(para.split()), width=RENDER_WIDTH,
+                      initial_indent="    ", subsequent_indent="    ",
+                      break_long_words=False, break_on_hyphens=False)
+        for para in re.split(r"\n\s*\n", row["body"].strip()) if para.strip())
+    return f"{head}\n{body}"
+
+
+def touch_seen(conn, rows) -> None:
+    """Mark the recalled rows seen. No event, on purpose.
+
+    `last_seen_at` is documented as "last time a pass matched/used it", and a
+    recall at intake is precisely that — it is what makes §5.9's "is this
+    lesson still earning its place" answerable from the store instead of from
+    a guess. It stays event-free for the same reason `memory seen` is: a row
+    per fact per tick would make the Ledger's volume a measure of polling.
+    """
+    conn.executemany("UPDATE memories SET last_seen_at=? WHERE id=?",
+                     [(NOW.isoformat(), row["id"]) for row in rows])
+
+
+def cmd_memory_recall(args) -> int:
+    """The ONE operational memory read path (gap audit P-05).
+
+    `memory list` and `memory query` remain, and remain useful — they are the
+    CURATOR's surface: whole-store scans, dedup before minting, retired rows.
+    They are not recall, and a consumer that reaches for them is asking a
+    question with no scope in it, which is exactly the leak S38 names.
+    """
+    try: scopes = estate_memory.recall_scopes(args.scope)
+    except estate_memory.ScopeError as exc: return fail(str(exc))
+    init_db()
+    with connect() as conn:
+        rows = recall_rows(conn, args.scope, args.kind)
+        if rows and not args.no_touch:
+            begin(conn)
+            touch_seen(conn, rows)
+    refs = estate_memory.envelope(args.scope, rows)
+    if args.refs:
+        print(json.dumps(refs, sort_keys=True)); return 0
+    if args.json:
+        print(json.dumps({
+            "scope": estate_memory.canonical(args.scope),
+            "scopes": list(scopes),
+            "count": len(rows),
+            "memories": [{"id": r["id"], "scope": r["scope"],
+                          "origin": estate_memory.origin(r["scope"]),
+                          "kind": r["kind"], "body": r["body"],
+                          "protected": bool(r["protected"])} for r in rows],
+            "refs": refs,
+        }, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        # Said out loud rather than printed as nothing: an empty recall is an
+        # answer ("the estate holds no active fact for you"), and a silent one
+        # is indistinguishable from a command that failed to run.
+        print(f"no active memories at scope {'/'.join(scopes)}")
+    for row in rows:
+        print(recall_block(row))
+    print(f"# refs: {json.dumps(refs, sort_keys=True)}")
+    return 0
+
+
+def chain_rows(conn, start):
+    """Every row reachable through supersede links, oldest first.
+
+    Merges make this a tree rather than a line — several losers can point at one
+    survivor — so it walks the connected component in both directions.
+    """
+    found, queue = {start["id"]: start}, [start["id"]]
+    while queue:
+        key = queue.pop()
+        rows = conn.execute("""SELECT * FROM memories WHERE superseded_by=?
+            OR id=(SELECT superseded_by FROM memories WHERE id=?)""", (key, key))
+        for row in rows:
+            if row["id"] not in found:
+                found[row["id"]] = row; queue.append(row["id"])
+    return sorted(found.values(), key=lambda r: r["seq"])
+
+
+def cmd_memory_show(args) -> int:
+    init_db()
+    with connect() as conn:
+        try: row = require_memory(conn, args.id)
+        except LookupError as exc: return fail(str(exc))
+        print(row_json(row)); print_events(conn, memory_id=row["id"])
+    return 0
+
+
+def cmd_memory_log(args) -> int:
+    init_db()
+    with connect() as conn:
+        try: row = require_memory(conn, args.id)
+        except LookupError as exc: return fail(str(exc))
+        for link in chain_rows(conn, row):
+            marker = " <-- asked" if link["id"] == row["id"] else ""
+            print(memory_line(link) + marker)
+            print_events(conn, memory_id=link["id"])
+    return 0
+
+
+def cmd_memory_promote(args) -> int:
+    """Promote a candidate to active. Always attributed to MEMORY_ACTOR (P-19).
+
+    `--actor` is still accepted so an existing caller does not break, but it
+    cannot change the attribution — a promotion event that reads `cli` tells
+    you nothing, and one that reads whichever loop happened to invoke it tells
+    you something false. Passing a different one says so on stderr rather than
+    being silently dropped.
+    """
+    init_db()
+    try: refs = as_json(args.source_refs, "--source-refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    if getattr(args, "actor", None) and args.actor != MEMORY_ACTOR:
+        print(f"[note] promotion is recorded as actor '{MEMORY_ACTOR}'; "
+              f"--actor {args.actor} does not change that", file=sys.stderr)
+    with connect() as conn:
+        begin(conn)
+        try:
+            row = require_memory(conn, args.id)
+            if row["status"] != "candidate":
+                raise ValueError(f"{row['id']} is '{row['status']}'; promote applies to candidates")
+            scope = (args.scope or row["scope"]).strip()
+            refs = refs or row["source_refs"]
+            check_provenance(scope, "active", refs)
+        except (LookupError, ValueError) as exc:
+            conn.rollback(); return fail(str(exc))
+        conn.execute("""UPDATE memories SET status='active', scope=?, source_refs=?,
+            updated_at=? WHERE id=?""", (scope, refs, NOW.isoformat(), row["id"]))
+        # MEMORY_ACTOR, never actor(args): see the constant's note. The event
+        # carries the fact id, the resulting scope, the timestamp and the
+        # provenance refs, which is the whole promotion record.
+        event(conn, MEMORY_ACTOR, "transition", f"candidate -> active (scope={scope})",
+              memory_id=row["id"], detail=args.note or None, refs=refs,
+              subsystem="memory", phase=estate_ledger.TRANSITION,
+              fingerprint=memory_fingerprint(estate_ledger.TRANSITION,
+                                             row["id"], f"promote:{scope}"))
+    print(f"{row['id']}: candidate -> active (scope={scope})"); return 0
+
+
+def cmd_memory_supersede(args) -> int:
+    """Close out a memory by pointing it at its replacement (§5.5 trigger 1)."""
+    init_db()
+    if bool(args.new) == bool(args.body):
+        return fail("supersede takes either a replacement id or --body, not both")
+    try: refs = as_json(args.source_refs, "--source-refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    who = actor(args)
+    with connect() as conn:
+        begin(conn)
+        try:
+            old = require_memory(conn, args.id)
+            check_retirable(old, args.force_protected)
+            if args.body:
+                if not args.body.strip(): raise ValueError("--body must be non-empty")
+                successor = insert_memory(conn, who, scope=(args.scope or old["scope"]).strip(),
+                                          kind=args.kind or old["kind"], body=args.body.strip(),
+                                          status="active", refs=refs or old["source_refs"],
+                                          protected=old["protected"])
+            else:
+                new = require_memory(conn, args.new)
+                if new["id"] == old["id"]: raise ValueError("a memory cannot supersede itself")
+                if new["status"] in MEMORY_RETIRED:
+                    raise ValueError(f"{new['id']} is '{new['status']}'; a replacement must be live")
+                if new["status"] == "candidate":
+                    check_provenance(new["scope"], "active", refs or new["source_refs"])
+                    conn.execute("""UPDATE memories SET status='active', source_refs=?,
+                        updated_at=? WHERE id=?""",
+                        (refs or new["source_refs"], NOW.isoformat(), new["id"]))
+                    event(conn, who, "transition", "candidate -> active (replacement)",
+                          memory_id=new["id"])
+                successor = new["id"]
+            retire(conn, old, who, "superseded", successor, args.note)
+        except (LookupError, ValueError) as exc:
+            conn.rollback(); return fail(str(exc))
+    print(f"{old['id']}: {old['status']} -> superseded (replaced by {successor})"); return 0
+
+
+def cmd_memory_merge(args) -> int:
+    """Fold near-duplicate memories into one survivor (§5.5 trigger 2)."""
+    init_db(); who = actor(args)
+    with connect() as conn:
+        begin(conn)
+        try:
+            survivor = require_memory(conn, args.into)
+            if survivor["status"] in MEMORY_RETIRED:
+                raise ValueError(f"{survivor['id']} is '{survivor['status']}'; a survivor must be live")
+            losers = [require_memory(conn, value) for value in args.losers]
+            for loser in losers:
+                if loser["id"] == survivor["id"]:
+                    raise ValueError(f"{survivor['id']} cannot merge into itself")
+                check_retirable(loser, args.force_protected)
+                if loser["scope"] != survivor["scope"] and not args.allow_cross_scope:
+                    # §5.6: a cross-scope merge is review-lane work, never automatic.
+                    raise ValueError(
+                        f"{loser['id']} is scope '{loser['scope']}' but {survivor['id']} is "
+                        f"'{survivor['scope']}'; cross-scope merges are the owner's call "
+                        "(§5.6) — pass --allow-cross-scope once approved")
+            for loser in losers:
+                retire(conn, loser, who, "superseded", survivor["id"], args.note)
+            event(conn, who, "note",
+                  "merged " + ", ".join(l["id"] for l in losers) + f" into {survivor['id']}",
+                  memory_id=survivor["id"], detail=args.note or None)
+        except (LookupError, ValueError) as exc:
+            conn.rollback(); return fail(str(exc))
+    print(f"merged {len(losers)} memory(ies) into {survivor['id']}"); return 0
+
+
+def cmd_memory_archive(args) -> int:
+    init_db()
+    with connect() as conn:
+        begin(conn)
+        try:
+            row = require_memory(conn, args.id)
+            check_retirable(row, args.force_protected)
+        except (LookupError, ValueError) as exc:
+            conn.rollback(); return fail(str(exc))
+        retire(conn, row, actor(args), "archived", None, args.note)
+    print(f"{row['id']}: {row['status']} -> archived"); return 0
+
+
+def cmd_memory_reinstate(args) -> int:
+    """Re-learn a retired memory: a fresh active row, linked, counter bumped.
+
+    §5.5 measures the design by reactivations and false retirements, so bringing
+    a lesson back is a recorded event, never a quiet un-archive. The judgment of
+    *what* to reinstate belongs to the curator (M2); this is only the mechanism.
+    """
+    init_db()
+    try: refs = as_json(args.source_refs, "--source-refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    who = actor(args)
+    with connect() as conn:
+        begin(conn)
+        try:
+            old = require_memory(conn, args.id)
+            if old["status"] not in MEMORY_RETIRED:
+                raise ValueError(f"{old['id']} is '{old['status']}'; only retired memories reinstate")
+            if old["superseded_by"]:
+                raise ValueError(f"{old['id']} was superseded by {old['superseded_by']}; "
+                                 "reinstate the end of the chain, not a closed link")
+            body = (args.body or old["body"]).strip()
+            if not body: raise ValueError("--body must be non-empty")
+            successor = insert_memory(conn, who, scope=(args.scope or old["scope"]).strip(),
+                                      kind=args.kind or old["kind"], body=body, status="active",
+                                      refs=refs or old["source_refs"], protected=old["protected"],
+                                      reactivations=old["reactivations"] + 1)
+        except (LookupError, ValueError) as exc:
+            conn.rollback(); return fail(str(exc))
+        conn.execute("UPDATE memories SET superseded_by=?, updated_at=? WHERE id=?",
+                     (successor, NOW.isoformat(), old["id"]))
+        event(conn, who, "note", f"reinstated as {successor} (reactivation "
+              f"{old['reactivations'] + 1})", memory_id=old["id"], detail=args.note or None)
+    print(f"{old['id']} reinstated as {successor}"); return 0
+
+
+def cmd_memory_seen(args) -> int:
+    # last_seen_at is metadata, not an operation: a nightly touch of every row
+    # would drown the audit stream, so this is the one memory write with no event.
+    init_db()
+    with connect() as conn:
+        begin(conn)
+        try: rows = [require_memory(conn, value) for value in args.ids]
+        except LookupError as exc: conn.rollback(); return fail(str(exc))
+        for row in rows:
+            conn.execute("UPDATE memories SET last_seen_at=? WHERE id=?",
+                         (NOW.isoformat(), row["id"]))
+    print(f"marked {len(rows)} memory(ies) seen at {NOW.isoformat()}"); return 0
+
+
+def render_bullet(body: str) -> str:
+    """One memory as one lessons.md bullet, wrapped the way the file already is."""
+    out = []
+    for index, para in enumerate(p for p in re.split(r"\n\s*\n", body.strip()) if p.strip()):
+        out.append(textwrap.fill(" ".join(para.split()), width=RENDER_WIDTH,
+                                 initial_indent="- " if index == 0 else "  ",
+                                 subsequent_indent="  ",
+                                 break_long_words=False, break_on_hyphens=False))
+    return "\n\n".join(out)
+
+
+def render_lessons(conn, scope: str = SHARED, kind=None) -> str:
+    """docs/lessons.md rendered from the active rows at `scope`.
+
+    Bodies pass through verbatim (only re-wrapped), so an untouched memory
+    renders byte-identically run to run — §5.8's no-drive-by-rewording guard.
+    """
+    sql = "SELECT * FROM memories WHERE scope=? AND status='active'"
+    params = [scope]
+    if kind: sql += " AND kind=?"; params.append(kind)
+    bullets = [render_bullet(row["body"]) for row in conn.execute(sql + " ORDER BY seq", params)]
+    return LESSONS_HEADER + ("\n" + "\n".join(bullets) + "\n" if bullets else "")
+
+
+def cmd_memory_render(args) -> int:
+    init_db()
+    with connect() as conn:
+        text = render_lessons(conn, args.scope, args.kind)
+    path = os.path.abspath(args.out) if args.out else LESSONS_PATH
+    if args.check:
+        try:
+            with open(path) as handle: current = handle.read()
+        except OSError as exc: return fail(f"cannot read {path}: {exc}")
+        if current == text:
+            print(f"{path} is up to date"); return 0
+        return fail(f"{path} is stale; re-render it with `estate memory render --write`")
+    if not args.write:
+        sys.stdout.write(text); return 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle: handle.write(text)
+    print(f"rendered {path}"); return 0
+
+
+# --- asks: inter-agent clarifying questions (§6) -------------------------------
+# Mail, not chat. A question is a row addressed to one actor, carrying one
+# deadline; delivery is a nudge the caller sends separately, so a lost nudge
+# costs nothing — `estate inbox` finds the question on the next tick anyway.
+#
+# Trust model: there is none between sessions, and that
+# is deliberate. Every session here is already trusted with the store, so an
+# auth layer between them would be ceremony. What the design actually needed was
+# a bound on how long an exchange can stay open, hence the mandatory TTL. Any
+# actor may answer any ask; answering as someone other than the addressee is
+# recorded in the event, because it is information, not an offence.
+
+
+def one_line(text: str, width: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[:width - 3] + "..."
+
+
+def resolve_actor(explicit) -> str:
+    return explicit or os.environ.get("ESTATE_ACTOR") or "cli"
+
+
+def require_ask(conn, value: str):
+    key = ident(value, "q")
+    row = conn.execute("SELECT * FROM asks WHERE id=?", (key,)).fetchone()
+    if not row:
+        raise LookupError(f"no ask matches '{key}'")
+    return row
+
+
+def ask_line(row) -> str:
+    when = {ASK_OPEN: f"expires {row['expires_at']}",
+            ASK_ANSWERED: f"answered by {row['answered_by']}",
+            ASK_EXPIRED: f"expired, escalated to {row['escalated_task']}"}
+    return (f"{row['id']:>8}  [{row['status']:<8}] {row['from_actor']} -> "
+            f"{row['to_actor']}  {one_line(row['body'], 56)}  "
+            f"({when.get(row['status'], row['status'])})")
+
+
+def next_followup_id(conn) -> str:
+    """The next `followup:N`, allocated the way bin/followups allocates it.
+
+    bin/followups reads that id straight out of a task's refs and raises without
+    one, so an escalated ask has to mint a real number or it would break the
+    very list it is trying to appear in.
+    """
+    numbers = []
+    for row in conn.execute("SELECT refs FROM tasks WHERE kind=?", (ESCALATION_KIND,)):
+        try:
+            legacy = json.loads(row["refs"] or "{}").get("legacy_id", "")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        match = LEGACY_FOLLOWUP_RE.fullmatch(str(legacy))
+        if match:
+            numbers.append(int(match.group(1)))
+    return f"followup:{1 + max(numbers, default=0)}"
+
+
+def escalate(conn, row, who: str) -> str:
+    """Turn an unanswered, past-deadline ask into a follow-up task.
+
+    The alternative was auto-close. Auto-close is exactly the silent loss §6
+    step 4 rules out: the asker was waiting on this answer to refine something,
+    and a row quietly flipping to 'expired' tells nobody. A follow-up is the
+    estate's existing "somebody still owes this" list, it already reaches the
+    morning read, and it puts the item on the *asker* — the actor who has to
+    decide whether to proceed without the answer or ask again.
+    """
+    legacy = next_followup_id(conn)
+    title = (f"unanswered ask {row['id']}: {one_line(row['body'], 90)}")
+    context = (f"{row['from_actor']} asked {row['to_actor']} on {row['created_at']}; "
+               f"deadline {row['expires_at']} passed with no answer. "
+               f"Question: {one_line(row['body'], 400)}")
+    refs = json.dumps({"legacy_id": legacy, "source": row["from_actor"],
+                       "ref": row["id"], "context": context, "resolution": None},
+                      sort_keys=True)
+    cur = conn.execute("""INSERT INTO tasks
+        (id, project_id, kind, title, status, created_by, created_at,
+         updated_at, refs)
+        VALUES ('pending-'||lower(hex(randomblob(8))),?,?,?,'open',?,?,?,?)""",
+        (row["project_id"], ESCALATION_KIND, title, row["from_actor"],
+         NOW.isoformat(), NOW.isoformat(), refs))
+    key = f"t-{cur.lastrowid}"
+    conn.execute("UPDATE tasks SET id=? WHERE seq=?", (key, cur.lastrowid))
+    event(conn, who, "activity", f"escalated {row['id']} ({legacy})",
+          task_id=key, project_id=row["project_id"], refs=refs)
+    return key
+
+
+def cmd_ask(args) -> int:
+    try: refs = as_json(args.refs, "--refs JSON")
+    except ValueError as exc: return fail(str(exc))
+    body = args.body.strip()
+    if not body: return fail("the question must be non-empty")
+    sender, addressee = resolve_actor(args.from_actor), args.to_actor.strip()
+    if not addressee: return fail("--to must name an actor")
+    try: expires = (NOW + ttl_delta(args.ttl)).isoformat()
+    except ValueError as exc: return fail(str(exc))
+    task_id = project_id = None
+    if args.about:
+        # Foreign keys are on, so a reference to something that does not exist
+        # fails the insert rather than creating a dangling ask.
+        if args.about.startswith("p-"): project_id = ident(args.about, "p")
+        else: task_id = ident(args.about, "t")
+    init_db()
+    try:
+        with connect() as conn:
+            begin(conn)
+            parent = None
+            if args.reply_to:
+                try: parent = require_ask(conn, args.reply_to)
+                except LookupError as exc: conn.rollback(); return fail(str(exc))
+            cur = conn.execute("""INSERT INTO asks
+                (id, thread_id, reply_to, from_actor, to_actor, body, status,
+                 task_id, project_id, created_at, expires_at, refs)
+                VALUES ('pending-'||lower(hex(randomblob(8))),'',?,?,?,?,?,?,?,?,?,?)""",
+                (parent["id"] if parent else None, sender, addressee, body,
+                 ASK_OPEN, task_id, project_id, NOW.isoformat(), expires, refs))
+            key = f"q-{cur.lastrowid}"
+            # A root ask threads under itself, so every exchange has a thread id
+            # from its first row and a follow-up simply inherits it.
+            thread = parent["thread_id"] if parent else key
+            conn.execute("UPDATE asks SET id=?, thread_id=? WHERE seq=?",
+                         (key, thread, cur.lastrowid))
+            tail = f" (follow-up to {parent['id']})" if parent else ""
+            event(conn, sender, "activity",
+                  f"asked {addressee}, expires {expires}{tail}", ask_id=key,
+                  task_id=task_id, project_id=project_id, detail=body, refs=refs)
+        print(key); return 0
+    except sqlite3.IntegrityError as exc: return fail(str(exc))
+
+
+def cmd_inbox(args) -> int:
+    """What is addressed to me and still worth answering.
+
+    Past-deadline asks are deliberately out of the default read. A loop's tick
+    step should not spend tokens on a question whose asker has already given up
+    on it. `expired-asks` is where those go.
+    """
+    init_db()
+    clauses, params = [], []
+    who = args.actor if args.actor is not None else os.environ.get("ESTATE_ACTOR")
+    if who: clauses.append("to_actor=?"); params.append(who)
+    if args.from_actor: clauses.append("from_actor=?"); params.append(args.from_actor)
+    if args.status:
+        clauses.append("status=?"); params.append(args.status)
+    elif not args.all:
+        clauses.append("status=?"); params.append(ASK_OPEN)
+        clauses.append("expires_at > ?"); params.append(NOW.isoformat())
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with connect() as conn:
+        rows = conn.execute(f"SELECT * FROM asks{where} ORDER BY seq", params).fetchall()
+    if args.json:
+        print(json.dumps([dict(row) for row in rows], indent=2, sort_keys=True)); return 0
+    for row in rows: print(ask_line(row))
+    return 0
+
+
+def cmd_answer(args) -> int:
+    init_db(); who = resolve_actor(args.actor)
+    body = args.answer.strip()
+    if not body: return fail("an answer must be non-empty")
+    with connect() as conn:
+        begin(conn)
+        try: row = require_ask(conn, args.id)
+        except LookupError as exc: conn.rollback(); return fail(str(exc))
+        if row["status"] == ASK_ANSWERED:
+            conn.rollback()
+            return fail(f"{row['id']} was already answered by {row['answered_by']} "
+                        f"at {row['answered_at']}")
+        if row["status"] == ASK_EXPIRED:
+            conn.rollback()
+            return fail(f"{row['id']} expired at {row['expired_at']} and was escalated "
+                        f"to {row['escalated_task']}; file a fresh ask rather than "
+                        "answering a closed one")
+        deadline = parse_iso(row["expires_at"])
+        # A real answer arriving a few minutes past the deadline is still a real
+        # answer, and throwing it away to honour a clock edge helps nobody. It
+        # lands, the lateness is recorded, and the sweep never sees the row.
+        late = deadline is not None and NOW > deadline
+        conn.execute("""UPDATE asks SET status=?, answer=?, answered_by=?,
+            answered_at=? WHERE id=?""",
+            (ASK_ANSWERED, body, who, NOW.isoformat(), row["id"]))
+        notes = []
+        if who != row["to_actor"]: notes.append(f"addressed to {row['to_actor']}")
+        if late: notes.append(f"after the {row['expires_at']} deadline")
+        tail = f" ({'; '.join(notes)})" if notes else ""
+        event(conn, who, "transition", f"open -> answered{tail}",
+              ask_id=row["id"], task_id=row["task_id"],
+              project_id=row["project_id"], detail=body)
+    if late:
+        print(f"[warn] {row['id']} was past its {row['expires_at']} deadline; "
+              "the answer was recorded anyway", file=sys.stderr)
+    print(f"{row['id']}: open -> answered by {who}"); return 0
+
+
+def overdue_asks(conn):
+    return conn.execute("""SELECT * FROM asks WHERE status=?
+        AND expires_at < ? ORDER BY seq""",
+        (ASK_OPEN, NOW.isoformat())).fetchall()
+
+
+def cmd_expired_asks(args) -> int:
+    """Report — or, with --sweep, escalate — asks whose deadline has passed.
+
+    Same split as `orphans`: the hub's health pass owns the mutating sweep,
+    everything else reads.
+    """
+    init_db()
+    with connect() as conn:
+        if not args.sweep:
+            for row in overdue_asks(conn):
+                print(f"{row['id']} {row['from_actor']} -> {row['to_actor']}; "
+                      f"unanswered, deadline passed {row['expires_at']}")
+            return 0
+        begin(conn)
+        # Re-read inside the transaction: two sweeps racing must not both
+        # escalate the same ask into two follow-ups.
+        rows = overdue_asks(conn)
+        for row in rows:
+            task_id = escalate(conn, row, "hub")
+            conn.execute("""UPDATE asks SET status=?, expired_at=?, escalated_task=?
+                WHERE id=?""", (ASK_EXPIRED, NOW.isoformat(), task_id, row["id"]))
+            event(conn, "hub", "transition",
+                  f"open -> expired (deadline {row['expires_at']}); "
+                  f"escalated to {task_id}", ask_id=row["id"], task_id=task_id)
+    print(f"escalated {len(rows)} expired ask(s)"); return 0
+
+
+def expired_rows(conn):
+    # Only 'claimed' tasks can orphan: a claimed task with an expired lease is the
+    # dead-worker case (§4.3, the task:4 restart). 'blocked'/'needs-owner' are
+    # deliberate parks that keep claimed_by for provenance but must NOT be swept
+    # back to 'ready' just because their old lease elapsed.
+    return conn.execute("""SELECT * FROM tasks WHERE status='claimed'
+        AND claim_expires_at IS NOT NULL AND claim_expires_at < ? ORDER BY seq""",
+        (NOW.isoformat(),)).fetchall()
+
+
+def cmd_orphans(args) -> int:
+    init_db()
+    with connect() as conn:
+        rows = expired_rows(conn)
+        if not args.sweep:
+            for row in rows: print(f"{row['id']} claimed by {row['claimed_by']}; lease expired {row['claim_expires_at']}")
+            return 0
+        # The hub's mutating health pass owns sweeping; reports use read-only mode.
+        begin(conn)
+        for row in rows:
+            summary = f"claimed -> ready (orphaned: lease expired {row['claim_expires_at']})"
+            # P-12: the failed attempt goes on file BEFORE the requeue, in this
+            # same transaction. An expired lease on a claimed task is a worker
+            # that died holding the item — the attempt happened and did not
+            # work, and the requeue alone never said so.
+            record_failed_attempt(conn, row, cause=CAUSE_LEASE_EXPIRED, who="hub")
+            conn.execute("""UPDATE tasks SET status='ready', claimed_by=NULL,
+                claim_expires_at=NULL, updated_at=? WHERE id=?""", (NOW.isoformat(), row["id"]))
+            # Tagged for P-06 like every other lifecycle change. This edge takes
+            # its own path (the sweep is a bulk UPDATE, not transition()), which
+            # is why it needs saying here rather than inheriting it.
+            event(conn, "hub", "transition", summary, task_id=row["id"],
+                  project_id=row["project_id"], subsystem="tasks",
+                  phase=estate_ledger.TRANSITION,
+                  fingerprint=estate_ledger.fingerprint(
+                      subsystem="tasks", phase=estate_ledger.TRANSITION,
+                      source="estate.tasks", key=row["id"], ts=NOW.isoformat(),
+                      event="claimed->ready:orphaned"))
+    print(f"swept {len(rows)} orphan(s)"); return 0
+
+
+def parse_iso(value):
+    """Every write here stamps NOW.isoformat() (aware UTC), but imported rows
+    carry whatever their source file held — normalize, treat naive as UTC."""
+    try:
+        stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.timezone.utc)
+
+
+def stale_rows(conn, days: float, kind=None):
+    # A DIFFERENT question from orphans (which asks "did a worker die holding
+    # this?"). Here nothing is wrong: the task is simply non-terminal and
+    # untouched for `days` — "correct and unattended" instead of "correct and
+    # attended". Claim state is deliberately not part of the filter; a consumer
+    # that cares can read claimed_by off the row.
+    placeholders = ",".join("?" * len(TERMINAL))
+    sql = f"SELECT * FROM tasks WHERE status NOT IN ({placeholders})"
+    params = list(TERMINAL)
+    if kind:
+        sql += " AND kind=?"
+        params.append(kind)
+    elif UNPOOLED_KINDS:
+        # See UNPOOLED_KINDS. "What is nobody looking at" is a question about
+        # the backlog; an open message the hub is mid-conversation about is not
+        # drift, and the briefer reads this list every morning.
+        sql += f" AND kind NOT IN ({','.join('?' * len(UNPOOLED_KINDS))})"
+        params.extend(UNPOOLED_KINDS)
+    out = []
+    for row in conn.execute(sql + " ORDER BY seq", params):
+        touched = parse_iso(row["updated_at"])
+        # An unreadable timestamp is not evidence of recent attention, so it
+        # reports as stale with an unknown age rather than silently dropping out.
+        idle = (NOW - touched).total_seconds() / 86400 if touched else None
+        if idle is None or idle >= days:
+            out.append((row, None if idle is None else round(idle, 1)))
+    out.sort(key=lambda pair: (-1 if pair[1] is None else -pair[1], pair[0]["seq"]))
+    return out
+
+
+def cmd_stale(args) -> int:
+    if args.days < 0:
+        return fail("--days must be >= 0")
+    init_db()
+    with connect() as conn:
+        rows = stale_rows(conn, args.days, args.kind)
+        blockers = estate_deps.blocked_by(conn, {row["id"] for row, _ in rows})
+        if args.json:
+            print(json.dumps([dict(dict(row), idle_days=idle,
+                                   blocked_by=blockers.get(row["id"], []))
+                              for row, idle in rows], indent=2, sort_keys=True))
+            return 0
+        for row, idle in rows:
+            print(f"{task_line(row, blockers.get(row['id'], ()))}  "
+                  f"(idle {'?' if idle is None else idle}d)")
+    return 0
+
+
+def due_rows(conn, within: float, kind=None):
+    # A SIBLING of stale, not a variant of it. stale asks "is anyone looking at
+    # this?" and reads updated_at; due asks "is the clock running out?" and
+    # reads a date somebody deliberately recorded. An item can be busy and due,
+    # or idle and undated — the two questions do not substitute for each other.
+    # Rows with no due_at are not "not due soon", they are unanswered, so they
+    # are absent rather than late.
+    placeholders = ",".join("?" * len(TERMINAL))
+    sql = (f"SELECT * FROM tasks WHERE status NOT IN ({placeholders}) "
+           "AND due_at IS NOT NULL AND trim(due_at) != ''")
+    params = list(TERMINAL)
+    if kind:
+        sql += " AND kind=?"
+        params.append(kind)
+    out = []
+    for row in conn.execute(sql + " ORDER BY seq", params):
+        deadline = parse_iso(row["due_at"])
+        # An unreadable deadline is not evidence of time to spare, so it
+        # surfaces with an unknown remaining time rather than dropping out —
+        # same call stale_rows() makes for an unreadable updated_at.
+        left = (deadline - NOW).total_seconds() / 86400 if deadline else None
+        if left is None or left <= within:
+            out.append((row, None if left is None else round(left, 1)))
+    # Overdue first, most overdue at the top; an unreadable deadline sorts
+    # ahead of everything, because "we cannot tell" needs a human either way.
+    out.sort(key=lambda pair: (0 if pair[1] is None else 1,
+                               pair[1] if pair[1] is not None else 0,
+                               pair[0]["seq"]))
+    return out
+
+
+def cmd_due(args) -> int:
+    if args.within < 0:
+        return fail("--within must be >= 0")
+    init_db()
+    with connect() as conn:
+        rows = due_rows(conn, args.within, args.kind)
+        blockers = estate_deps.blocked_by(conn, {row["id"] for row, _ in rows})
+        zone = estate_attention.local_zone()
+        if args.json:
+            # `due_state` is P-07's five-state reading of the same date this
+            # section already renders as a number. Purely additive: `days_left`
+            # and `overdue` are untouched, so a consumer written against P-31
+            # reads exactly what it always did.
+            print(json.dumps([dict(dict(row), days_left=left,
+                                   overdue=(None if left is None else left < 0),
+                                   due_state=estate_attention.classify(
+                                       row_get(row, "due_at"), NOW, args.within,
+                                       zone),
+                                   blocked_by=blockers.get(row["id"], []))
+                              for row, left in rows], indent=2, sort_keys=True))
+            return 0
+        for row, left in rows:
+            if left is None: when = "due ?"
+            elif left < 0: when = f"OVERDUE {abs(left)}d"
+            else: when = f"due in {left}d"
+            print(f"{task_line(row, blockers.get(row['id'], ()))}  ({when})")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# P-08: scheduled runs, reconciled against the schedule
+# --------------------------------------------------------------------------- #
+def reconcile_runs(conn, subsystems, days: float) -> list[dict]:
+    """One block per scheduled subsystem: its schedule, and a verdict per run.
+
+    Read-only and wholly derived. Nothing here writes a row for a run that did
+    not happen — a missing run is an ABSENCE, and the moment you file a row
+    saying so, a later reader cannot tell your inference from the loop's own
+    record. See estate_runs' WHAT ABSENCE MEANS.
+    """
+    until = NOW
+    since = until - dt.timedelta(days=days)
+    out = []
+    for subsystem in subsystems:
+        try:
+            sched = estate_runs.schedule(subsystem, STATE_DIR, REPO_ROOT)
+        except estate_runs.NoSchedule as exc:
+            out.append({"subsystem": subsystem, "schedule": None,
+                        "why": str(exc), "runs": [], "counts": {}})
+            continue
+        due = estate_runs.due_slots(subsystem, sched, since, until)
+        # Every qualifying row this subsystem ever wrote, not only the run
+        # rows and not only the window's. Two reasons, and both are load-
+        # bearing: an ordinary event inside a slot is what proves the subsystem
+        # ran when the run itself was never recorded, and the observability
+        # floor is the FIRST run record that exists anywhere — a floor computed
+        # from the window alone would report every slot before it as missing,
+        # which is precisely the invented verdict P-08 forbids. The rows P-06
+        # imported carry no run_id column, so no SQL predicate can select them;
+        # `run_id_of` recognizes them, and it needs to see them to do it.
+        rows = conn.execute(
+            "SELECT * FROM events WHERE subsystem=? ORDER BY seq",
+            (subsystem,)).fetchall()
+        verdicts = estate_runs.reconcile(subsystem, due, rows, sched)
+        out.append({"subsystem": subsystem, "schedule": sched,
+                    "runs": verdicts, "counts": estate_runs.tally(verdicts)})
+    return out
+
+
+def cmd_runs(args) -> int:
+    if args.days <= 0:
+        return fail("--days must be > 0")
+    init_db()
+    wanted = [args.subsystem] if args.subsystem else list(estate_runs.SCHEDULED)
+    with connect() as conn:
+        blocks = reconcile_runs(conn, wanted, args.days)
+    if args.attention:
+        for block in blocks:
+            block["runs"] = [r for r in block["runs"]
+                             if r["verdict"] in estate_runs.ATTENTION]
+    if args.json:
+        print(json.dumps(blocks, indent=2, sort_keys=True, default=str))
+        return 0
+    for block in blocks:
+        sched = block["schedule"]
+        if sched is None:
+            print(f"\n{block['subsystem']}: {block['why']}")
+            continue
+        if sched["kind"] == estate_runs.DATE:
+            window = f"{sched['start'] or '(off)'}–{sched['end'] or 'midnight'}"
+        else:
+            window = f"every {sched['minutes']}m"
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(block["counts"].items())
+                           if v)
+        print(f"\n{block['subsystem']}  {window}  ({counts or 'nothing due'})")
+        # The spotter is due 96 times a day, so listing every verdict would
+        # bury the three that need a person under a week of routine ones. The
+        # counts line above still states the whole reconciliation; `--all` and
+        # `--json` print it run by run.
+        shown = (block["runs"] if args.all else
+                 [r for r in block["runs"]
+                  if r["verdict"] in estate_runs.ATTENTION
+                  or r["verdict"] == estate_runs.ACTIVITY_ONLY])
+        for run in shown:
+            mark = "!" if run["verdict"] in estate_runs.ATTENTION else " "
+            print(f"  {mark} {run['verdict']:<14} {run['run']}"
+                  + (f"  {run['at']}" if run.get("at") else "")
+                  + (f"  — {run['why']}" if run.get("why") else ""))
+        hidden = len(block["runs"]) - len(shown)
+        if hidden:
+            print(f"    ({hidden} routine or unobservable runs not listed; "
+                  "--all shows them)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# P-07: the persistent attention view. A SIBLING of `due` and `stale` on the
+# same terms as they are siblings of each other, and the third distinct
+# question about a non-terminal row:
+#
+#   stale      is anyone looking at this?            (updated_at)
+#   due        is the clock running out?             (due_at, inside a window)
+#   attention  is this waiting on a PERSON?          (kind/status, any date)
+#
+# `due` cannot answer the third, and not by omission: it selects on `due_at`,
+# so an undated item is absent from it by construction — and an undated item
+# somebody must still act on is the single most common shape in this store
+# (62 of the 63 open follow-ups carried no date the day this was written).
+# That is the gap S24 falls through: "the summary includes the unresolved
+# attention item" is not a question about deadlines at all.
+#
+# Every row here also carries its `due_state`, so one read answers both "who is
+# waiting on me" and "which of those has a clock" — including `later`, which
+# `due` deliberately excludes and which a consumer must be able to see in order
+# NOT to report it as currently due (S24's negative).
+def attention_rows(conn, notice: float, states=(), kind=None):
+    placeholders = ",".join("?" * len(estate_attention.TERMINAL))
+    sql = f"SELECT * FROM tasks WHERE status NOT IN ({placeholders})"
+    params = list(estate_attention.TERMINAL)
+    if kind:
+        sql += " AND kind=?"
+        params.append(kind)
+    wanted = set(states or ())
+    # Once for the whole read, never per row: see local_zone()'s note — a
+    # per-row lookup can straddle a DST change and classify two rows in one
+    # listing under two different calendars.
+    zone = estate_attention.local_zone()
+    out = []
+    for row in conn.execute(sql + " ORDER BY seq", params):
+        if not estate_attention.is_attention(row["kind"], row["status"]):
+            continue
+        due = row_get(row, "due_at")
+        state = estate_attention.classify(due, NOW, notice, zone)
+        if wanted and state not in wanted:
+            continue
+        out.append((row, state, estate_attention.days_left(due, NOW)))
+    out.sort(key=lambda triple: estate_attention.sort_key(
+        triple[1], triple[2], triple[0]["seq"]))
+    return out
+
+
+def cmd_attention(args) -> int:
+    if args.notice < 0:
+        return fail("--notice must be >= 0")
+    try: states = estate_attention.parse_states(args.state or [])
+    except ValueError as exc: return fail(str(exc))
+    init_db()
+    with connect() as conn:
+        rows = attention_rows(conn, args.notice, states, args.kind)
+        blockers = estate_deps.blocked_by(conn, {row["id"] for row, _, _ in rows})
+        if args.json:
+            print(json.dumps([dict(dict(row), due_state=state, days_left=left,
+                                   blocked_by=blockers.get(row["id"], []))
+                              for row, state, left in rows],
+                             indent=2, sort_keys=True))
+            return 0
+        if args.counts:
+            counts = {state: 0 for state in estate_attention.ALL_STATES}
+            for _, state, _ in rows:
+                counts[state] = counts.get(state, 0) + 1
+            print(json.dumps(dict(counts, total=len(rows)), indent=2, sort_keys=True))
+            return 0
+        for row, state, left in rows:
+            when = "" if left is None else f" {left}d"
+            print(f"{task_line(row, blockers.get(row['id'], ()))}  "
+                  f"({state}{when})")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# V-05: the arrival RATE. `attention` says how much is waiting on a person now;
+# this says how fast it is arriving, from whom, and whether that is a trend or
+# one bad night. A fourth sibling of stale/due/attention and the same kind of
+# thing they are — wholly derived, writes nothing, and needs no store of its
+# own. The definitions of an arrival, a departure and an observability floor
+# all live in lib/estate_arrivals.py so that a second reader cannot invent a
+# second answer. See that module for why `trend_is_evidence` is a field.
+def arrival_series(conn, classes, period: str, count: int, zone):
+    """One block per class: its floor, its periods, and this-vs-last."""
+    days = estate_arrivals.recent_periods(NOW, period, count, zone)
+    blocks = []
+    for cls in classes:
+        streams = {}
+        for direction, sql in (("in", estate_arrivals.ARRIVALS[cls]),
+                               ("out", estate_arrivals.DEPARTURES[cls])):
+            # A stamp nothing can parse has no period to land in. It is carried
+            # through as None and COUNTED, never silently dropped, on the same
+            # grounds P-07 refuses to guess at an unreadable due date.
+            streams[direction] = [(estate_arrivals.parse_iso(row["ts"]),
+                                   row["producer"])
+                                  for row in conn.execute(sql)]
+        # The floor is the class's first ARRIVAL. A departure cannot precede
+        # one, and deriving the floor from both would let a mis-shaped exit row
+        # move the boundary that decides what counts as evidence.
+        arrivals = [pair for pair in streams["in"] if pair[0] is not None]
+        unreadable = sum(1 for pair in streams["in"] if pair[0] is None)
+        floor = estate_arrivals.floor_of(arrivals)
+        got_in = estate_arrivals.bucket(arrivals, period, zone)
+        got_out = estate_arrivals.bucket(
+            [pair for pair in streams["out"] if pair[0] is not None], period, zone)
+        rows = []
+        for day in days:
+            came = got_in.get(day, {"total": 0, "by_producer": {}})
+            went = got_out.get(day, {"total": 0, "by_producer": {}})
+            rows.append({
+                "period": day.isoformat(),
+                "arrivals": came["total"],
+                "departures": went["total"],
+                "net": came["total"] - went["total"],
+                "by_producer": came["by_producer"],
+                "verdict": estate_arrivals.classify_period(
+                    day, period, floor, NOW, zone),
+            })
+
+        def against_previous(i):
+            if i is None or i < 1:
+                return None
+            now_row, was_row = rows[i], rows[i - 1]
+            return dict(estate_arrivals.compare(
+                now_row["arrivals"], was_row["arrivals"],
+                now_row["verdict"], was_row["verdict"]),
+                current_period=now_row["period"],
+                previous_period=was_row["period"])
+
+        blocks.append({
+            "class": cls,
+            "floor": floor.isoformat() if floor else None,
+            "unreadable_stamps": unreadable,
+            "periods": rows,
+            # The literal question ("this week vs last week"), and the one that
+            # can be evidence. They differ for most of every week and the
+            # second is usually the one worth reading; both are printed so
+            # neither has to be reconstructed.
+            "latest_vs_previous": against_previous(len(rows) - 1),
+            "comparable_pair": against_previous(estate_arrivals.last_comparable(
+                [row["verdict"] for row in rows])),
+        })
+    return blocks
+
+
+def producer_totals(blocks, period: str) -> dict:
+    """Every producer's arrivals in one period, summed across the classes asked
+    for. The 'from which producer' half of the question, and the number a
+    component that doubled its output is visible in."""
+    out: dict = {}
+    for block in blocks:
+        for row in block["periods"]:
+            if row["period"] != period:
+                continue
+            for name, n in row["by_producer"].items():
+                out[name] = out.get(name, 0) + n
+    return out
+
+
+def producer_pair(blocks):
+    """Which two periods the producer table compares, and why that pair.
+
+    The newest pair every class agrees is `observed` when there is one, so the
+    per-producer numbers carry the same claim the class blocks do.
+
+    Failing that, the newest pair whose current period has at least ENDED. A
+    producer table with no pair at all would answer "from which producer" with
+    nothing, and defaulting to the in-progress bucket is worse than useless: at
+    9am Monday every producer reads -100%. Ending is not evidence — the pair is
+    still flagged false — but it is a week rather than an hour.
+    """
+    grid = [[row["verdict"] for row in block["periods"]] for block in blocks]
+    for i in range(len(grid[0]) - 1, 0, -1):
+        if all(estate_arrivals.trend_is_evidence(col[i], col[i - 1])
+               for col in grid):
+            return i, True
+    for i in range(len(grid[0]) - 1, 0, -1):
+        if all(col[i] != estate_arrivals.IN_PROGRESS for col in grid):
+            return i, False
+    return len(grid[0]) - 1, False
+
+
+def cmd_arrivals(args) -> int:
+    if args.periods < 2:
+        return fail("--periods must be at least 2; one period cannot be "
+                    "compared with anything")
+    try: classes = estate_arrivals.parse_classes(args.klass or [])
+    except ValueError as exc: return fail(str(exc))
+    classes = classes or list(estate_arrivals.CLASSES)
+    init_db()
+    # Once for the whole read, for the reason estate_attention.local_zone()
+    # gives: a per-row lookup can straddle a DST change and bucket two rows in
+    # one listing under two different calendars.
+    zone = estate_attention.local_zone()
+    with connect() as conn:
+        blocks = arrival_series(conn, classes, args.period, args.periods, zone)
+    index, comparable = producer_pair(blocks)
+    labels = [row["period"] for row in blocks[0]["periods"]]
+    current = producer_totals(blocks, labels[index])
+    previous = producer_totals(blocks, labels[index - 1])
+    if args.json:
+        print(json.dumps({
+            "period": args.period,
+            "periods": args.periods,
+            "zone": str(zone),
+            "as_of": NOW.isoformat(),
+            "classes": blocks,
+            "producers": {
+                "current_period": labels[index],
+                "previous_period": labels[index - 1],
+                "trend_is_evidence": comparable,
+                "current": current, "previous": previous,
+            },
+        }, indent=2, sort_keys=True))
+        return 0
+    span = "week (Monday start)" if args.period == estate_arrivals.WEEK else "day"
+    print(f"arrivals — work that entered a state waiting on the owner\n"
+          f"{args.periods} periods of one {span}, {zone}, as of {NOW.isoformat()}")
+    for block in blocks:
+        floor = block["floor"] or "never recorded"
+        print(f"\n{block['class']}   (first ever recorded: {floor})")
+        print(f"  {'period':<12} {'in':>4} {'out':>5} {'net':>5}   verdict")
+        for row in block["periods"]:
+            print(f"  {row['period']:<12} {row['arrivals']:>4} "
+                  f"{row['departures']:>5} {row['net']:>+5}   {row['verdict']}")
+        if block["unreadable_stamps"]:
+            print(f"  ({block['unreadable_stamps']} rows carry a timestamp "
+                  "nothing could parse and are in no period)")
+        for label, cmp_ in (("latest", block["latest_vs_previous"]),
+                            ("comparable", block["comparable_pair"])):
+            if not cmp_:
+                if label == "comparable":
+                    print("  comparable pair: none — no two adjacent periods "
+                          "are both 'observed', so nothing here is a trend")
+                continue
+            if (label == "comparable"
+                    and cmp_["current_period"]
+                    == block["latest_vs_previous"]["current_period"]):
+                continue  # the same pair; printing it twice says nothing new
+            pct = "" if cmp_["pct"] is None else f", {cmp_['pct']:+}%"
+            print(f"  {cmp_['current_period']} vs {cmp_['previous_period']}: "
+                  f"{cmp_['current']} vs {cmp_['previous']} "
+                  f"({cmp_['change']:+}{pct})   "
+                  f"trend_is_evidence={str(cmp_['trend_is_evidence']).lower()}")
+            if not cmp_["trend_is_evidence"]:
+                print(f"    not a trend: {cmp_['current_period']} is "
+                      f"{cmp_['current_verdict']}, {cmp_['previous_period']} "
+                      f"is {cmp_['previous_verdict']} — only two 'observed' "
+                      "periods compare")
+    print(f"\nproducers   {labels[index]} vs {labels[index - 1]}"
+          f"   (classes: {', '.join(classes)}"
+          f", trend_is_evidence={str(comparable).lower()})")
+    for name in sorted(set(current) | set(previous),
+                       key=lambda k: (-current.get(k, 0), k)):
+        now_n, was_n = current.get(name, 0), previous.get(name, 0)
+        print(f"  {name:<24} {now_n:>4}   prev {was_n:>4}   {now_n - was_n:+}")
+    return 0
+
+
+# P-06: the Ledger subsystem's own qualifying actions. Export and backup are
+# the two things it DOES — they are what makes S45's "all earlier records remain
+# retrievable after a failure and a restart" true rather than hoped for — so
+# they are what it records. The event lands after the bytes do, so a row saying
+# the export happened is only ever written by an export that happened.
+def ledger_event(kind: str, summary: str, detail: str, name: str) -> None:
+    """Record one Ledger-subsystem action. Best-effort, and deliberately so:
+    the export IS the durable artifact, and refusing to finish because the
+    note about it could not be written would trade the thing for the receipt."""
+    try:
+        with connect() as conn:
+            begin(conn)
+            event(conn, "estate", kind, summary, detail=detail,
+                  subsystem="ledger", phase=estate_ledger.OUTCOME,
+                  fingerprint=estate_ledger.fingerprint(
+                      subsystem="ledger", phase=estate_ledger.OUTCOME,
+                      source="estate.ledger", key=name, ts=NOW.isoformat(),
+                      event=kind))
+    except sqlite3.Error as exc:
+        print(f"[warn] could not record the {kind} event: {exc}", file=sys.stderr)
+
+
+def cmd_export(args) -> int:
+    init_db(); out = os.path.abspath(args.out or EXPORT_DIR); os.makedirs(out, exist_ok=True)
+    with connect() as conn:
+        for table in TABLES:
+            path = os.path.join(out, f"{table}.jsonl")
+            with open(path, "w") as f:
+                for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid"):
+                    f.write(json.dumps(dict(row), sort_keys=True) + "\n")
+    ledger_event("export", f"exported {len(TABLES)} tables", out, out)
+    print(f"exported {len(TABLES)} tables to {out}"); return 0
+
+
+def cmd_backup(args) -> int:
+    if not os.path.exists(DB_PATH): return fail("estate store does not exist; run `estate init`")
+    out = os.path.abspath(args.out or BACKUP_DIR); os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, f"estate-{NOW.date().isoformat()}.db")
+    source = connect()
+    try:
+        target = sqlite3.connect(path)
+        try: source.backup(target)
+        finally: target.close()
+    finally: source.close()
+    ledger_event("backup", "database backed up", path, path)
+    print(f"backed up to {path}"); return 0
+
+
+def newest_age(path: str, suffix=None):
+    try:
+        files = [os.path.join(path, n) for n in os.listdir(path)
+                 if os.path.isfile(os.path.join(path, n)) and (suffix is None or n.endswith(suffix))]
+        return time.time() - max(os.path.getmtime(p) for p in files)
+    except (OSError, ValueError): return None
+
+
+def cmd_doctor(_args) -> int:
+    if not os.path.exists(DB_PATH):
+        print("skip estate store (no DB)"); return 0
+    # An existing store may predate a schema addition; every other subcommand
+    # migrates on entry, so doctor does too rather than reporting a store red
+    # for a table the next command would have created anyway.
+    init_db()
+    checks, shared, rendered = [], [], None
+    try:
+        with connect() as conn:
+            checks.append(("WAL mode on", conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"))
+            triggers = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            checks.append(("events triggers present", {"events_no_update", "events_no_delete"} <= triggers))
+            checks.append(("memory triggers present",
+                           {"memories_body_immutable", "memories_no_delete"} <= triggers))
+            checks.append(("ask trigger present", "asks_no_delete" in triggers))
+            # The design answer was "no auth model, but a TTL on everything", so
+            # a deadline-less ask is the one thing this table must never hold.
+            checks.append(("asks carry a deadline", not conn.execute(
+                "SELECT 1 FROM asks WHERE expires_at IS NULL OR trim(expires_at)=''"
+            ).fetchone()))
+            # Ordinary lag is fine; a day past the deadline means the hub's
+            # sweep has stopped running and expired asks are piling up unseen.
+            checks.append(("expired asks swept", not conn.execute(
+                "SELECT 1 FROM asks WHERE status=? AND expires_at < ?",
+                (ASK_OPEN, (NOW - dt.timedelta(seconds=FRESH_SECONDS)).isoformat())
+            ).fetchone()))
+            # P-02's whole promise in one query: nothing may be worked on
+            # before it is approved. `ready` and `claim` both enforce it, so a
+            # hit here means something wrote the table directly.
+            checks.append(("no unapproved proposal is claimed", not conn.execute(
+                "SELECT 1 FROM tasks WHERE status='claimed' AND stage IN "
+                f"({','.join('?' * len(GATED_STAGES))})", GATED_STAGES).fetchone()))
+            checks.append(("proposal stages are in the vocabulary", not conn.execute(
+                "SELECT 1 FROM tasks WHERE stage IS NOT NULL AND stage NOT IN "
+                f"({','.join('?' * len(PROPOSAL_STAGES))})", PROPOSAL_STAGES).fetchone()))
+            # P-06. Two invariants, both about the rows written since the
+            # contract existed — a pre-P-06 row has all three columns NULL and
+            # is untouched by either. What is deliberately NOT checked here is
+            # "every one of the nine has an event": several are nightly, so an
+            # honest quiet day would turn the whole estate red. `estate events
+            # --subsystem <s>` answers that question on demand, and the
+            # mechanic's own nine-subsystem checklist is where it belongs.
+            checks.append(("qualifying events name a known subsystem", not conn.execute(
+                "SELECT 1 FROM events WHERE subsystem IS NOT NULL AND subsystem "
+                f"NOT IN ({','.join('?' * len(estate_ledger.SUBSYSTEMS))})",
+                estate_ledger.SUBSYSTEMS).fetchone()))
+            checks.append(("qualifying events carry subsystem and phase together",
+                           not conn.execute(
+                               "SELECT 1 FROM events WHERE (subsystem IS NULL) "
+                               "!= (phase IS NULL)").fetchone()))
+            # P-08, the same shape one level down. Deliberately NOT checked
+            # here: "every scheduled run has a record". That is a real question
+            # and it has a real answer, but the answer is a reconciliation with
+            # three honest absences in it, not a boolean — `estate runs` is
+            # where it belongs, and turning a quiet Sunday red would train
+            # everyone to ignore doctor.
+            checks.append(("run events carry an id and a matching outcome",
+                           not conn.execute(
+                               "SELECT 1 FROM events WHERE (run_id IS NULL) "
+                               "!= (run_outcome IS NULL)").fetchone()))
+            checks.append(("run outcomes agree with their phase", not conn.execute(
+                "SELECT 1 FROM events WHERE run_outcome IS NOT NULL AND phase IS NOT "
+                "(CASE run_outcome " + " ".join(
+                    f"WHEN '{o}' THEN '{p}'"
+                    for o, p in estate_runs.PHASE_BY_OUTCOME.items())
+                + " ELSE NULL END)").fetchone()))
+            shared = conn.execute("""SELECT id, source_refs FROM memories
+                WHERE scope=? AND status='active' ORDER BY seq""", (SHARED,)).fetchall()
+            # §5.3: no active shared memory may exist without provenance.
+            checks.append(("shared memories cite provenance",
+                           all((row["source_refs"] or "").strip() for row in shared)))
+            if shared:
+                rendered = render_lessons(conn)
+    except sqlite3.Error:
+        reached = {label for label, _ in checks}
+        checks.extend((label, False) for label in
+                      ("WAL mode on", "events triggers present", "memory triggers present",
+                       "ask trigger present", "asks carry a deadline",
+                       "expired asks swept", "no unapproved proposal is claimed",
+                       "proposal stages are in the vocabulary",
+                       "qualifying events name a known subsystem",
+                       "qualifying events carry subsystem and phase together",
+                       "run events carry an id and a matching outcome",
+                       "run outcomes agree with their phase",
+                       "shared memories cite provenance")
+                      if label not in reached)
+    if rendered is None:
+        # Until M1 imports docs/lessons.md, the file is still hand-maintained and
+        # the store has nothing to render — not staleness, so not a failure.
+        print("skip lessons.md render check (no active shared memories yet)")
+    else:
+        try:
+            with open(LESSONS_PATH) as handle: current = handle.read()
+        except OSError: current = None
+        checks.append(("rendered lessons.md fresh", current == rendered))
+    wal = DB_PATH + "-wal"
+    checks.append(("WAL file not unbounded", not os.path.exists(wal) or os.path.getsize(wal) < WAL_MAX_BYTES))
+    age = newest_age(EXPORT_DIR, ".jsonl")
+    checks.append(("nightly JSONL export fresh", age is not None and age <= FRESH_SECONDS))
+    age = newest_age(BACKUP_DIR, ".db")
+    checks.append(("DB backup fresh", age is not None and age <= FRESH_SECONDS))
+    failed = False
+    for label, ok in checks:
+        print(f"{'ok  ' if ok else 'FAIL'} {label}"); failed |= not ok
+    return 1 if failed else 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="estate — shared project/task store")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("init").set_defaults(func=cmd_init)
+    project = sub.add_parser("project").add_subparsers(dest="project_cmd")
+    p = project.add_parser("add"); p.add_argument("title"); p.add_argument("--kind", required=True)
+    p.add_argument("--key"); p.add_argument("--meta"); p.add_argument("--actor"); p.set_defaults(func=cmd_project_add)
+    p = project.add_parser("list"); p.add_argument("--status"); p.set_defaults(func=cmd_project_list)
+    p = project.add_parser("show"); p.add_argument("id"); p.set_defaults(func=cmd_project_show)
+    p = project.add_parser("close"); p.add_argument("id"); p.add_argument("--status", choices=("done", "dropped"), default="done")
+    p.add_argument("note", nargs="?", default=""); p.add_argument("--actor"); p.set_defaults(func=cmd_project_close)
+    task = sub.add_parser("task").add_subparsers(dest="task_cmd")
+    p = task.add_parser("add"); p.add_argument("title"); p.add_argument("--kind", required=True)
+    p.add_argument("--project"); p.add_argument("--intent"); p.add_argument("--lane"); p.add_argument("--stage")
+    p.add_argument("--refs"); p.add_argument("--ready", action="store_true"); p.add_argument("--actor")
+    p.add_argument("--due", help="deadline: YYYY-MM-DD (end of that day, UTC) or full ISO8601")
+    p.set_defaults(func=cmd_task_add)
+    p = task.add_parser("show"); p.add_argument("id"); p.set_defaults(func=cmd_task_show)
+    # The retrofit path for everything filed before due dates existed, and the
+    # landing spot for a human-reviewed date the mechanic merely PROPOSES after
+    # spotting one in free text. Nothing infers a deadline on its own.
+    p = task.add_parser("set-due"); p.add_argument("id"); p.add_argument("due", nargs="?")
+    p.add_argument("--clear", action="store_true", help="remove the deadline")
+    p.add_argument("--note"); p.add_argument("--actor"); p.set_defaults(func=cmd_task_set_due)
+    p = task.add_parser("list"); p.add_argument("--status"); p.add_argument("--kind"); p.add_argument("--actor")
+    p.add_argument("--stage"); p.add_argument("--project"); p.add_argument("--claimed-by")
+    p.set_defaults(func=cmd_task_list)
+    p = task.add_parser("find", help="exact match on a key inside a task's refs")
+    p.add_argument("--ref", required=True, metavar="KEY=VALUE")
+    p.add_argument("--status"); p.add_argument("--kind"); p.add_argument("--project")
+    p.add_argument("--quiet", action="store_true", help="print ids only")
+    p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_task_find)
+    # P-02. A proposal is an ordinary task with a review `stage`; this group is
+    # the vocabulary and the fingerprint dedupe, not a separate store.
+    proposal = sub.add_parser("proposal", help="the proposal review lifecycle").add_subparsers(dest="proposal_cmd")
+    p = proposal.add_parser("add", help="file a proposal, or recognize one already on file")
+    p.add_argument("title")
+    p.add_argument("--condition", help="what was observed; the text the fingerprint is derived from (default: the title)")
+    p.add_argument("--desired-outcome", help="what is true once this is settled (P-09)")
+    p.add_argument("--completion-check", help="how anyone tells that it is (P-09)")
+    p.add_argument("--fingerprint", help="pin the fingerprint instead of deriving one")
+    p.add_argument("--adopt-task", metavar="t-N", help="attach the lifecycle to an EXISTING task instead of creating one")
+    p.add_argument("--stage", choices=PROPOSAL_STAGES, help=f"default {PENDING}")
+    p.add_argument("--intent"); p.add_argument("--project"); p.add_argument("--refs")
+    p.add_argument("--note"); p.add_argument("--actor"); p.set_defaults(func=cmd_proposal_add)
+    p = proposal.add_parser("show", help="the reviewable record for one proposal")
+    p.add_argument("id"); p.set_defaults(func=cmd_proposal_show)
+    p = proposal.add_parser("list"); p.add_argument("--stage", choices=PROPOSAL_STAGES)
+    p.add_argument("--all", action="store_true", help="include rejected/resolved/stopped")
+    p.set_defaults(func=cmd_proposal_list)
+    p = proposal.add_parser("stage", help="record a review decision")
+    p.add_argument("id"); p.add_argument("stage", choices=PROPOSAL_STAGES)
+    p.add_argument("note", nargs="?", default=""); p.add_argument("--actor")
+    p.set_defaults(func=cmd_proposal_stage)
+    p = proposal.add_parser("classify", help="new | <stage> <task-id>")
+    p.add_argument("--condition"); p.add_argument("--fingerprint")
+    p.set_defaults(func=cmd_proposal_classify)
+    p = proposal.add_parser("fingerprint"); p.add_argument("text")
+    p.set_defaults(func=cmd_proposal_fingerprint)
+    p = sub.add_parser("log"); p.add_argument("id"); p.set_defaults(func=cmd_log)
+    p = sub.add_parser("note"); p.add_argument("id"); p.add_argument("summary"); p.add_argument("--detail"); p.add_argument("--refs"); p.add_argument("--actor"); p.set_defaults(func=cmd_note)
+    p = sub.add_parser("event"); p.add_argument("--actor", required=True); p.add_argument("--kind", required=True); p.add_argument("--summary", required=True)
+    p.add_argument("--task"); p.add_argument("--project"); p.add_argument("--memory")
+    p.add_argument("--detail"); p.add_argument("--refs")
+    p.add_argument("--session-id", dest="session_id",
+                   help="dispatch slug for an ephemeral worker (or ESTATE_SESSION_ID)")
+    p.add_argument("--subsystem", choices=estate_ledger.SUBSYSTEMS,
+                   help="P-06: which of the nine acted. Requires --phase")
+    p.add_argument("--phase", choices=estate_ledger.PHASES,
+                   help="P-06: the class of qualifying action. Requires --subsystem")
+    p.add_argument("--fingerprint",
+                   help="stable identity; a repeat is a no-op, not a duplicate")
+    p.add_argument("--at", help="ISO8601 time this happened. For backfilling "
+                                "something already recorded elsewhere; a live "
+                                "writer leaves it off and records now")
+    p.add_argument("--run-id", dest="run_id",
+                   help="P-08: the scheduled run this belongs to, "
+                        "<subsystem>/<slot>. Requires --run-outcome")
+    p.add_argument("--run-outcome", dest="run_outcome",
+                   choices=estate_runs.OUTCOMES,
+                   help="P-08: started, or the one terminal verdict. "
+                        "Requires --run-id")
+    p.set_defaults(func=cmd_event)
+    p = sub.add_parser("events", help="search events (read-only, exact match)")
+    p.add_argument("--actor"); p.add_argument("--task"); p.add_argument("--project")
+    p.add_argument("--memory"); p.add_argument("--ask"); p.add_argument("--session")
+    p.add_argument("--kind"); p.add_argument("--limit", type=int)
+    p.add_argument("--subsystem"); p.add_argument("--phase")
+    p.add_argument("--fingerprint")
+    p.add_argument("--run", help="one scheduled run id, exact")
+    p.add_argument("--run-outcome", dest="run_outcome")
+    # P-13. The interval pair — the only non-exact filters here. Low end
+    # exclusive, high end inclusive, so two consecutive intervals cover the
+    # history exactly once between them (lib/estate_events.RANGE_FILTERS).
+    p.add_argument("--since-seq", dest="since_seq", type=int,
+                   help="P-13: events STRICTLY after this sequence")
+    p.add_argument("--until-seq", dest="until_seq", type=int,
+                   help="P-13: events up to and INCLUDING this sequence")
+    p.add_argument("--detail", action="store_true", help="print detail/refs too")
+    p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_events)
+    # P-08. Read-only and derived: it computes which runs were DUE from each
+    # subsystem's own schedule file and asks the Ledger what happened to each.
+    p = sub.add_parser("runs", help="reconcile scheduled runs against the "
+                                    "schedule (read-only)")
+    p.add_argument("--subsystem", choices=estate_runs.SCHEDULED,
+                   help="one of the four scheduled subsystems (default: all)")
+    p.add_argument("--days", type=float, default=RUNS_DEFAULT_DAYS,
+                   help=f"how far back to reconcile (default {RUNS_DEFAULT_DAYS})")
+    p.add_argument("--attention", action="store_true",
+                   help="only runs that failed, never finished, or are missing")
+    p.add_argument("--all", action="store_true",
+                   help="list every run, not just the ones needing a person")
+    p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_runs)
+    p = sub.add_parser("ready"); p.add_argument("--kind"); p.add_argument("--actor"); p.set_defaults(func=cmd_ready)
+    for name, verb in (("mark-ready", "ready"), ("release", "release"),
+                       ("needs-owner", "needs-owner"), ("reopen", "reopen"),
+                       ("drop", "drop")):
+        p = sub.add_parser(name); p.add_argument("id"); p.add_argument("note", nargs="?", default="")
+        p.add_argument("--actor"); p.add_argument("--evidence", help=EVIDENCE_HELP)
+        p.set_defaults(func=cmd_transition, verb=verb)
+    p = sub.add_parser("block"); p.add_argument("id"); p.add_argument("note"); p.add_argument("--actor")
+    p.add_argument("--evidence", help=EVIDENCE_HELP); p.set_defaults(func=cmd_transition, verb="block")
+    p = sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--actor", required=True); p.add_argument("--ttl", default="90m"); p.set_defaults(func=cmd_claim)
+    p = sub.add_parser("extend"); p.add_argument("id"); p.add_argument("--actor", required=True); p.add_argument("--ttl", default="90m"); p.set_defaults(func=cmd_extend)
+    # P-12. `claim` for a first attempt, `retry` for every one after a recorded
+    # failure — same lock, same lease, plus the gate and the retry row.
+    p = sub.add_parser("retry", help="claim work that has already failed or blocked")
+    p.add_argument("id"); p.add_argument("--actor", required=True)
+    p.add_argument("--ttl", default="90m")
+    p.add_argument("--note", help="why this attempt should go differently")
+    p.set_defaults(func=cmd_retry)
+    p = sub.add_parser("done"); p.add_argument("id"); p.add_argument("--actor", required=True)
+    p.add_argument("--summary"); p.add_argument("--verification"); p.add_argument("--dependencies")
+    p.add_argument("--retry-notes"); p.add_argument("--residual-risk"); p.add_argument("--refs"); p.set_defaults(func=cmd_done)
+    dep = sub.add_parser("dep").add_subparsers(dest="dep_cmd")
+    p = dep.add_parser("add"); p.add_argument("from_task"); p.add_argument("to_task"); p.add_argument("--kind", choices=DEP_KINDS, required=True); p.add_argument("--actor"); p.set_defaults(func=cmd_dep_add)
+    p = dep.add_parser("list"); p.add_argument("id"); p.set_defaults(func=cmd_dep_list)
+    p = sub.add_parser("orphans"); p.add_argument("--sweep", action="store_true"); p.set_defaults(func=cmd_orphans)
+    # Sibling to orphans, not a widening of it: read-only, policy-free, and the
+    # only supported way for a consumer to ask "what is nobody looking at?"
+    p = sub.add_parser("stale"); p.add_argument("--days", type=float, default=STALE_DEFAULT_DAYS)
+    p.add_argument("--kind"); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_stale)
+    # Sibling to stale on the same terms: read-only, policy-free. The window
+    # (`--within`) is the consumer's policy, exactly as `stale --days` is.
+    p = sub.add_parser("due"); p.add_argument("--within", type=float, default=DUE_DEFAULT_WITHIN_DAYS)
+    p.add_argument("--kind"); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_due)
+    # P-07. Third sibling: rows waiting on a PERSON, dated or not, each with
+    # its five-state `due_state`. `--notice` is the advance-notice interval
+    # that separates due_soon from later — the same policy knob `due --within`
+    # is, named for what it means here.
+    p = sub.add_parser("attention", help="unresolved items waiting on a person")
+    p.add_argument("--notice", type=float, default=estate_attention.NOTICE_DEFAULT_DAYS)
+    p.add_argument("--state", action="append",
+                   help="only these due states (comma-separated, repeatable): "
+                        + ", ".join(estate_attention.ALL_STATES))
+    p.add_argument("--kind"); p.add_argument("--json", action="store_true")
+    p.add_argument("--counts", action="store_true",
+                   help="one JSON object of per-state counts instead of rows")
+    p.set_defaults(func=cmd_attention)
+    # V-05. Fourth sibling: not "how much is waiting" but "how fast is it
+    # arriving, from whom, and is that a trend". Every count carries the
+    # verdict that says whether it may be compared with anything.
+    p = sub.add_parser("arrivals",
+                       help="the rate work arrives in a state waiting on the owner")
+    p.add_argument("--period", choices=estate_arrivals.PERIODS,
+                   default=estate_arrivals.WEEK)
+    p.add_argument("--periods", type=int, default=4,
+                   help="how many periods back, including the current one")
+    p.add_argument("--class", dest="klass", action="append",
+                   help="only these arrival classes (comma-separated, "
+                        "repeatable): " + ", ".join(estate_arrivals.CLASSES))
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_arrivals)
+    memory = sub.add_parser("memory").add_subparsers(dest="memory_cmd")
+    # P-05. The operational read path, and the only one: active facts at the
+    # caller's own scope plus `shared`, each labelled with where it is stored.
+    # `--scope` is required because recall is always FROM somewhere — a default
+    # would quietly mean "shared only" and hide every local fact from the loop
+    # that learned it. `list`/`query` below stay the curator's surface.
+    p = memory.add_parser("recall", help="active facts at this scope + shared")
+    p.add_argument("--scope", required=True)
+    p.add_argument("--kind", choices=MEMORY_KINDS)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--refs", action="store_true",
+                   help="print only the refs envelope to record on the "
+                        "resulting task or Ledger row")
+    p.add_argument("--no-touch", action="store_true",
+                   help="do not update last_seen_at (inspection, not a pass)")
+    p.set_defaults(func=cmd_memory_recall)
+    p = memory.add_parser("add"); p.add_argument("body"); p.add_argument("--scope", required=True)
+    p.add_argument("--kind", choices=MEMORY_KINDS, default="lesson")
+    p.add_argument("--status", choices=MEMORY_LIVE, default="candidate")
+    p.add_argument("--source-refs"); p.add_argument("--protected", action="store_true")
+    p.add_argument("--actor"); p.set_defaults(func=cmd_memory_add)
+    p = memory.add_parser("list"); p.add_argument("--scope"); p.add_argument("--kind", choices=MEMORY_KINDS)
+    p.add_argument("--status", choices=MEMORY_LIVE + MEMORY_RETIRED)
+    p.add_argument("--protected", action="store_true"); p.add_argument("--all", action="store_true")
+    p.set_defaults(func=cmd_memory_list)
+    p = memory.add_parser("query"); p.add_argument("text"); p.add_argument("--scope")
+    p.add_argument("--kind", choices=MEMORY_KINDS); p.add_argument("--status", choices=MEMORY_LIVE + MEMORY_RETIRED)
+    p.add_argument("--protected", action="store_true"); p.set_defaults(func=cmd_memory_query, all=True)
+    p = memory.add_parser("show"); p.add_argument("id"); p.set_defaults(func=cmd_memory_show)
+    p = memory.add_parser("log"); p.add_argument("id"); p.set_defaults(func=cmd_memory_log)
+    p = memory.add_parser("promote"); p.add_argument("id"); p.add_argument("note", nargs="?", default="")
+    p.add_argument("--scope"); p.add_argument("--source-refs"); p.add_argument("--actor")
+    p.set_defaults(func=cmd_memory_promote)
+    p = memory.add_parser("supersede"); p.add_argument("id"); p.add_argument("new", nargs="?")
+    p.add_argument("--body"); p.add_argument("--scope"); p.add_argument("--kind", choices=MEMORY_KINDS)
+    p.add_argument("--source-refs"); p.add_argument("--note", default="")
+    p.add_argument("--force-protected", action="store_true"); p.add_argument("--actor")
+    p.set_defaults(func=cmd_memory_supersede)
+    p = memory.add_parser("merge"); p.add_argument("losers", nargs="+"); p.add_argument("--into", required=True)
+    p.add_argument("--note", default=""); p.add_argument("--allow-cross-scope", action="store_true")
+    p.add_argument("--force-protected", action="store_true"); p.add_argument("--actor")
+    p.set_defaults(func=cmd_memory_merge)
+    p = memory.add_parser("archive"); p.add_argument("id"); p.add_argument("note", nargs="?", default="")
+    p.add_argument("--force-protected", action="store_true"); p.add_argument("--actor")
+    p.set_defaults(func=cmd_memory_archive)
+    p = memory.add_parser("reinstate"); p.add_argument("id"); p.add_argument("--body")
+    p.add_argument("--scope"); p.add_argument("--kind", choices=MEMORY_KINDS)
+    p.add_argument("--source-refs"); p.add_argument("--note", default=""); p.add_argument("--actor")
+    p.set_defaults(func=cmd_memory_reinstate)
+    p = memory.add_parser("seen"); p.add_argument("ids", nargs="+"); p.set_defaults(func=cmd_memory_seen)
+    p = memory.add_parser("render"); p.add_argument("--scope", default=SHARED)
+    p.add_argument("--kind", choices=MEMORY_KINDS); p.add_argument("--out")
+    p.add_argument("--write", action="store_true"); p.add_argument("--check", action="store_true")
+    p.set_defaults(func=cmd_memory_render)
+    # §6 mail. Top-level verbs rather than an `ask` noun group: `estate inbox`
+    # is a per-tick step in every loop's skill and should read as one.
+    p = sub.add_parser("ask"); p.add_argument("body")
+    p.add_argument("--to", dest="to_actor", required=True)
+    p.add_argument("--from", dest="from_actor", help="defaults to $ESTATE_ACTOR")
+    p.add_argument("--about", help="task or project this question refines (t-N or p-N)")
+    p.add_argument("--reply-to", help="ask this one follows up on, e.g. q-3")
+    p.add_argument("--ttl", default=ASK_TTL_DEFAULT); p.add_argument("--refs")
+    p.set_defaults(func=cmd_ask)
+    p = sub.add_parser("inbox")
+    p.add_argument("--actor", help="addressee; defaults to $ESTATE_ACTOR, else all")
+    p.add_argument("--from", dest="from_actor", help="only asks this actor sent")
+    p.add_argument("--status", choices=ASK_STATUSES)
+    p.add_argument("--all", action="store_true", help="include answered and expired")
+    p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_inbox)
+    p = sub.add_parser("answer"); p.add_argument("id"); p.add_argument("answer")
+    p.add_argument("--actor"); p.set_defaults(func=cmd_answer)
+    p = sub.add_parser("expired-asks"); p.add_argument("--sweep", action="store_true")
+    p.set_defaults(func=cmd_expired_asks)
+    p = sub.add_parser("export"); p.add_argument("--out"); p.set_defaults(func=cmd_export)
+    p = sub.add_parser("backup"); p.add_argument("--out"); p.set_defaults(func=cmd_backup)
+    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    sub.add_parser("json").set_defaults(func=cmd_json)
+    args = ap.parse_args(argv)
+    if hasattr(args, "func"):
+        return args.func(args)
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
