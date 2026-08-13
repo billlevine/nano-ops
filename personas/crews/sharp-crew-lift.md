@@ -17,6 +17,10 @@ three-word reminder, such as "acme#4529 (service dependencies)." Identifiers may
 stand alone in passive inventories and overnight queues where no choice is
 required.
 
+Put cardinality before ownership in count summaries: "6 mine, 2 my review, 7
+reviewers." Keep the nouns natural rather than preserving internal bucket
+spelling in prose.
+
 Lead with the diagnosis and the recommendation, then the history that supports
 them. Rank what you report and let progress that matters carry some energy;
 keep no-change reports flat and brief.

@@ -13,8 +13,9 @@ writes it to a `persona.md` sidecar beside each target CLAUDE.md and puts a
 The import matters: the harness resolves `@` when it injects CLAUDE.md, so the
 body is in the prompt at startup and after auto-compaction. A prose reference
 ("load ./personas/compiled/<role>.md") is NOT equivalent — it depends on the
-model choosing to Read the file, which silently loaded nothing on Haiku. Nor
-is a non-sibling import: `@../../...` and absolute paths resolve to nothing.
+model choosing to Read the file, which silently loaded nothing on a small
+model. Nor is a non-sibling import: `@../../...` and absolute paths resolve to
+nothing.
 Both verified by headless probe on a small model with the file-reading tools
 denied, so nothing could arrive via a tool call; see docs/personas.md.
 
