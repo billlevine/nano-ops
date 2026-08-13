@@ -7,30 +7,38 @@ it. It NEVER writes to any loop's state — its only outputs (all under state/):
 
     state/dashboard.json       the aggregated data model + pre-rendered section
                                HTML (single source of truth; polled by the shell)
-    state/dashboard.html       the Tier-1 LIVE SHELL — static + self-contained;
-                               its only network call is same-origin dashboard.json,
-                               which it re-polls ~30s and re-renders in place
-                               (no reload — scroll + theme preserved)
+    state/index.html           the Tier-1 LIVE SHELL, generated separately by
+                               bin/dashboard-index; its only network call
+                               is same-origin dashboard.json
     state/dashboard.body.html  data-inlined body fragment for the Artifact tool
                                (static snapshot; no fetch)
 
 Modes:
-    bin/dashboard          (re)write all three: json + live shell + fragment
+    bin/dashboard          (re)write json + static Artifact fragment
     bin/dashboard --json   write state/dashboard.json ONLY — deterministic and
                            token-free; this is what the local regenerator runs
 
-Serve locally (Tier-1, 127.0.0.1 only):  bin/ops dashboard up
-    -> http://127.0.0.1:8422/dashboard.html   (host/port in loops.toml [dashboard])
+Serve it (Tier-1):  flox activate --start-services   (`bin/ops dashboard`
+    prints the URL) -> http://<host>:<port>/   (host/port in loops.toml [dashboard];
+       default 127.0.0.1:8422 — see that file for what the configured host exposes)
 
 Reads:
     loops.toml                          loop registry (persona/interval/model)
+    state/estate.db                     shared tasks/events/memories (read-only)
+    state/extraction/candidates.json    extraction lifecycle
+    docs/lessons.md                     rendered lesson count
+    ~/.claude/projects/<cwd>/memory/MEMORY.md
+                                        private Claude memory for the hub and
+                                        each configured loop directory
+    state/usage/budget.json             account usage-cap signal
     state/<loop>/last_tick              heartbeat epoch -> freshness
     state/hub/doorbell_alive            doorbell poll-liveness epoch (separate
                                         from last_tick — proves the wake-on-
                                         activity poller is up even when the
                                         hub itself has been idle a while)
-    agent-deck session show "<title>"   live status (running/idle/waiting) + model
-    agent-deck ls --json                hub ephemeral sessions in flight NOW
+    agent-deck ls --json                ONE read serving both live per-loop status
+                                        (running/idle/waiting) + model, and the hub
+                                        ephemeral sessions in flight NOW
                                         (loops.toml [hub].group, title
                                         "ephemeral - …")
     ~/.claude/projects/*/*.jsonl        local Claude Code token usage, current
@@ -39,10 +47,25 @@ Reads:
                                         account-wide %-of-limit /usage reports)
     state/pr-tracker/state.json         PR board buckets (the tracker's own
                                         `derived` classification — never re-derived)
+    state/dashboard-acks.json           per-PR "seen" marks (written only by
+                                        dashboard-server when the operator
+                                        clicks a ✳)
     state/pr-tracker/DASHBOARD.md       board metadata (scanned repos, updated)
     state/pr-reviewer/queue.json        night-shift queue
     state/pr-reviewer/NIGHT-REPORT.md   last night's outcome
     state/morning-brief/reports/*.md    latest daily digest (placeholder if none)
+    state/morning-brief/publications.json
+                                        per-date generation/delivery record —
+                                        did that digest actually reach Slack
+                                        (P-10; the report file is unchanged)
+    state/morning-brief/manifests/*.json
+                                        per-date SOURCE manifest — what each of
+                                        the briefer's nine gatherers could
+                                        actually see (P-11). The Daily Digest
+                                        panel's source strip is rendered FROM
+                                        this, never re-derived from raw producer
+                                        state, so the panel and the summary
+                                        cannot disagree about what happened
     state/mechanic/REPORT.md            pending self-optimization proposals
     state/ledger.jsonl                  recent estate activity (tail)
 """
@@ -51,24 +74,39 @@ from __future__ import annotations
 
 import base64
 import glob
+import hashlib
 import html
 import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tomllib
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+
+import actors  # noqa: E402  (lib path is established above)
+import brief_manifest  # noqa: E402
+import estate_deps  # noqa: E402
+import estate_events  # noqa: E402
+import estate_work  # noqa: E402
+
 STATE = ROOT / "state"
 E = html.escape
 
 LEDGER_TAIL = 14          # ledger lines to surface
 ACTFIRST_CAP = 12         # PR act-first rows before "+N more"
+
+# Per-PR "you have seen this" marks, written by dashboard-server when the
+# operator clicks a row's ✳. Dashboard-owned runtime state (gitignored, like
+# every other state/ file); pr-tracker never reads or writes it.
+ACKS_FILE = STATE / "dashboard-acks.json"
 
 # Self-contained favicon so the operator can spot the dashboard's browser tab —
 # a cat emoji rendered as an inline SVG data-URI. Base64-encoded so the
@@ -144,6 +182,7 @@ def human_tokens(n: float | None) -> str:
 
 
 MODEL_PRETTY = {
+    "claude-opus-5": "Opus 5",
     "claude-opus-4-8": "Opus 4.8",
     "claude-sonnet-5": "Sonnet 5",
     "claude-haiku-4-5": "Haiku 4.5",
@@ -165,6 +204,7 @@ def pretty_model(raw: str | None) -> str:
 # (post-intro) rate here; it carries a $2/$10 introductory rate through
 # 2026-08-31 — this estimate runs slightly high until then.
 MODEL_PRICING_PER_MTOK = {
+    "claude-opus-5": {"input": 5.00, "output": 25.00},
     "claude-opus-4-8": {"input": 5.00, "output": 25.00},
     "claude-opus-4-7": {"input": 5.00, "output": 25.00},
     "claude-opus-4-6": {"input": 5.00, "output": 25.00},
@@ -265,44 +305,18 @@ ESTATE = HUB.get("estate") or "ops"
 
 # The loop sessions live under one agent-deck profile (same as the doorbell's
 # DOORBELL_DECK_PROFILE). Pass it explicitly so the read works regardless of the
-# ambient default profile — in particular under a supervised service whose
-# default profile is `default` and would otherwise see nothing.
+# ambient default profile — in particular under a supervised dashboard-refresh
+# service, whose default profile is `default` and would otherwise see nothing.
 DECK_PROFILE = (os.environ.get("DASHBOARD_DECK_PROFILE")
                 or HUB.get("deck_profile") or "ops")
 
 
-def deck_session(title: str) -> dict:
-    """Read live status+model for one session title. Read-only; never mutates."""
-    try:
-        r = subprocess.run(
-            ["agent-deck", "-p", DECK_PROFILE, "session", "show", title],
-            capture_output=True, text=True, timeout=12,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {"present": False, "status": None, "model": None}
-    if r.returncode != 0 or "Session:" not in r.stdout:
-        return {"present": False, "status": None, "model": None}
-    status = model = None
-    for line in r.stdout.splitlines():
-        if line.startswith("Status:"):
-            words = re.sub(r"[^A-Za-z ]", "", line.split(":", 1)[1]).split()
-            status = words[-1].lower() if words else None
-        elif line.startswith("Model:"):
-            model = line.split(":", 1)[1].strip()
-    return {"present": True, "status": status, "model": model}
-
-
-# ── ephemeral queue (hub sessions dispatched RIGHT NOW) ──────────────────────
-# What is in flight this moment — distinct from the night-shift queue (which is
-# QUEUED PR/task work). The hub names each dispatched worker "ephemeral - <slug>"
-# under HUB_GROUP; one `agent-deck ls --json` read surfaces them all.
-# Read-only; never mutates a session.
-
-EPH_PREFIX = "ephemeral - "
-EPH_ORDER = {"running": 0, "waiting": 1, "idle": 2}
-
-
-def build_ephemeral(now: datetime) -> list[dict]:
+def deck_ls() -> list[dict]:
+    """One `agent-deck ls --json` — the single live-session read for the whole
+    snapshot. Read-only; [] on any failure (each lookup then reads as an absent
+    session, exactly as a failed per-title `session show` did). The `status` and
+    `model` fields here are identical to what `session show` printed, so this
+    replaces the former one-`session show`-per-loop sweep with a single call."""
     try:
         r = subprocess.run(
             ["agent-deck", "-p", DECK_PROFILE, "ls", "--json"],
@@ -316,10 +330,47 @@ def build_ephemeral(now: datetime) -> list[dict]:
         data = json.loads(r.stdout)
     except (json.JSONDecodeError, ValueError):
         return []
-    if not isinstance(data, list):
-        return []
+    return data if isinstance(data, list) else []
+
+
+def deck_index(sessions: list[dict]) -> dict:
+    """Title -> session, for O(1) per-loop lookups off one deck_ls() read."""
+    idx: dict = {}
+    for s in sessions:
+        if isinstance(s, dict) and s.get("title"):
+            idx.setdefault(s["title"], s)  # first wins on duplicate titles
+    return idx
+
+
+def deck_session(title: str, index: dict) -> dict:
+    """Live status+model for one session title, from a prefetched deck_index().
+    Read-only; byte-for-byte the same {present,status,model} the old per-title
+    `agent-deck session show` produced (verified: ls `status`/`model` equal the
+    Status:/Model: lines show printed)."""
+    s = index.get(title)
+    if not s:
+        return {"present": False, "status": None, "model": None}
+    status = s.get("status")
+    status = status.lower() if isinstance(status, str) and status else None
+    return {"present": True, "status": status, "model": s.get("model") or None}
+
+
+# ── ephemeral queue (hub sessions dispatched RIGHT NOW) ──────────────────────
+# What is in flight this moment — distinct from the night-shift queue (which is
+# QUEUED PR/task work). The hub names each dispatched worker "ephemeral - <slug>"
+# under HUB_GROUP; one `agent-deck ls --json` read surfaces them all.
+# Read-only; never mutates a session.
+
+EPH_PREFIX = "ephemeral - "
+EPH_ORDER = {"running": 0, "waiting": 1, "idle": 2}
+
+
+def build_ephemeral(now: datetime, sessions: list[dict]) -> list[dict]:
+    dispatches = read_json(STATE / "hub" / "dispatches.json")
+    if not isinstance(dispatches, dict):
+        dispatches = {}
     out = []
-    for s in data:
+    for s in sessions:
         if not isinstance(s, dict):
             continue
         title = s.get("title") or ""
@@ -333,11 +384,17 @@ def build_ephemeral(now: datetime) -> list[dict]:
                 age = max(0.0, now.timestamp() - datetime.fromisoformat(ca).timestamp())
             except ValueError:
                 age = None
-        out.append({
+        item = {
             "slug": slug, "status": (s.get("status") or "").lower(),
             "substate": s.get("substate"), "age": age,
             "path": s.get("path"), "id": s.get("id"),
-        })
+        }
+        dispatch = dispatches.get(EPH_PREFIX + slug)
+        if isinstance(dispatch, dict):
+            for field in ("kind", "ref", "task_id"):
+                if dispatch.get(field) is not None:
+                    item[field] = dispatch[field]
+        out.append(item)
     # running first, then longest-alive first — the ones burning time now on top
     out.sort(key=lambda x: (EPH_ORDER.get(x["status"], 3), -(x["age"] or 0)))
     return out
@@ -345,7 +402,7 @@ def build_ephemeral(now: datetime) -> list[dict]:
 
 # ── loops (registry + heartbeat + live session) ──────────────────────────────
 
-def build_loops(registry: dict, now: float) -> list[dict]:
+def build_loops(registry: dict, now: float, index: dict) -> list[dict]:
     loops = []
 
     def heartbeat(name: str):
@@ -357,7 +414,7 @@ def build_loops(registry: dict, now: float) -> list[dict]:
 
     # hub — the operator; not in [loops.*]
     tick, age = heartbeat("hub")
-    hub_sess = deck_session(HUB_SESSION)
+    hub_sess = deck_session(HUB_SESSION, index)
     db_raw = read_text(STATE / "hub" / "doorbell_alive")
     db_tick = int(db_raw.strip()) if db_raw and db_raw.strip().isdigit() else None
     db_age = max(0.0, now - db_tick) if db_tick is not None else None
@@ -386,7 +443,7 @@ def build_loops(registry: dict, now: float) -> list[dict]:
         interval = cfg.get("interval", "")
         isec = parse_interval_seconds(interval)
         tick, age = heartbeat(name)
-        sess = deck_session(f"{persona} ({name})")
+        sess = deck_session(f"{persona} ({name})", index)
         loops.append({
             "name": name, "persona": persona, "interval": interval,
             "interval_seconds": isec, "model": cfg.get("model"),
@@ -405,6 +462,18 @@ def build_loops(registry: dict, now: float) -> list[dict]:
 BUCKET_OF = {"me": "waiting_you", "my_review": "my_review",
              "reviewers": "on_reviewers", "forge": "in_progress"}
 
+# Estate task kinds that mean "a worker is actively reworking this PR". Kept to
+# an explicit list rather than "any task with refs.pr", and that distinction
+# matters more since P-01 made shared identity mandatory: pr-reviewer now files
+# a `pr-review` task carrying `refs.pr` for everything merely *queued* for
+# tonight. Queued is a different claim from in-flight and must not quiet a row
+# that still needs the operator.
+PR_WORK_KINDS = ("pr-action",)
+# Non-terminal statuses that still mean the store owns the work. `blocked` and
+# `needs-owner` are deliberate parks that hand the PR straight back to the
+# operator, so they belong in their court, not in "in progress".
+PR_WORK_STATUSES = ("open", "ready", "claimed")
+
 
 def split_note(note: str | None) -> tuple[str | None, str]:
     """Split a manual note into its leading YYYY-MM-DD date (if any) and body."""
@@ -414,31 +483,157 @@ def split_note(note: str | None) -> tuple[str | None, str]:
     return None, re.sub(r"\s+", " ", note or "").strip()
 
 
+def activity_sig(entry: dict) -> tuple[str, str | None]:
+    """Fingerprint one pr-tracker entry's activity, plus when it last moved.
+
+    Built only from signals pr-tracker already records — GitHub's own
+    ``updatedAt`` (which moves on any commit/comment/review/label), the review
+    and check verdicts, the comment count, the issue tracker's
+    status/``updatedAt``, the operator's manual note, and the tracker's own classification. Deliberately excludes
+    everything time-derived (``idle_days``, ``age_days``, ``last_seen``) and the
+    fields that flap to UNKNOWN between scans (``mergeable``,
+    ``mergeStateStatus``), so a genuinely quiet PR keeps a stable signature for
+    as long as it stays quiet — that stability is what makes an acknowledgment
+    last. Returns (signature, last-activity ISO timestamp or None).
+    """
+    pr = entry.get("pr") or {}
+    lin = entry.get("linear") or {}
+    der = entry.get("derived") or {}
+    parts = [
+        pr.get("updatedAt"), pr.get("state"), pr.get("isDraft"),
+        pr.get("reviewDecision"), pr.get("comments"), pr.get("checks"),
+        lin.get("updatedAt"), lin.get("status"),
+        (entry.get("manual") or {}).get("note"),
+        der.get("waiting_on"), sorted(der.get("flags") or []),
+    ]
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    sig = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+    stamps = [s for s in (pr.get("updatedAt"), lin.get("updatedAt")) if s]
+    return sig, (max(stamps) if stamps else None)
+
+
+def read_acks() -> dict:
+    """{entry id -> acknowledged activity signature}. Absent file = nothing acked."""
+    doc = read_json(ACKS_FILE) or {}
+    acks = doc.get("acks")
+    if not isinstance(acks, dict):
+        return {}
+    return {k: v.get("sig") for k, v in acks.items() if isinstance(v, dict)}
+
+
+def active_pr_work() -> dict:
+    """{PR key -> estate task id} for PRs a worker is on RIGHT NOW.
+
+    ``derive()`` in pr-tracker is re-computed from live GitHub state every run,
+    and GitHub never lets an author hold a formal review decision on their own
+    PR — so one of the operator's own PRs with self-review comments reads
+    ``waiting_on: "me"`` both before anyone touches it and while a dispatched
+    worker is actively fixing it. Nothing in GitHub's
+    data distinguishes the two. The estate's shared task store does: the hub
+    files a ``pr-action`` task when it dispatches the rework worker and closes
+    it when it collects the result, so a live task IS the missing signal.
+
+    Reads ``state/estate.db`` directly, the same read-only shape
+    ``build_estate_activity`` and ``bin/dashboard-index`` already use. Any
+    failure — absent DB, locked, schema drift — degrades to "nothing is in
+    flight", which is the pre-P-33 behavior, never an error page.
+    """
+    out: dict[str, str] = {}
+    db = STATE / "estate.db"
+    if not db.exists():
+        return out
+    kinds = ",".join("?" * len(PR_WORK_KINDS))
+    statuses = ",".join("?" * len(PR_WORK_STATUSES))
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        rows = conn.execute(
+            f"SELECT id, refs FROM tasks WHERE kind IN ({kinds}) "
+            f"AND status IN ({statuses}) ORDER BY seq",
+            (*PR_WORK_KINDS, *PR_WORK_STATUSES)).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return out
+    for task_id, refs in rows:
+        try:
+            parsed = json.loads(refs or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        key = parsed.get("pr") if isinstance(parsed, dict) else None
+        if isinstance(key, str) and key:
+            out[key] = task_id      # last (highest seq) task wins
+    return out
+
+
+SPOTTER_UNOBSERVED = "unobserved"
+
+
+def pr_freshness(entry: dict) -> dict:
+    """How old this row's numbers are, and whether the spotter is holding it.
+
+    Gap audit P-03. `merge_state` no longer archives an item just because a
+    fetch failed — it carries the previous entry forward untouched and stamps
+    it. That makes a held row indistinguishable from a live one by inspection,
+    so the stamp travels onto EVERY row here, not only the held ones.
+
+    `last_seen` is the pre-P-03 spelling of the same fact and is the fallback
+    for state an older spotter wrote: it only ever advanced on a refresh that
+    had the entry in hand.
+    """
+    obs = entry.get("observation") or {}
+    held = obs.get("status") == SPOTTER_UNOBSERVED
+    return {
+        "last_successful_observation_at": (
+            entry.get("last_successful_observation_at")
+            or entry.get("last_seen")),
+        "unobserved": held,
+        "unobserved_misses": obs.get("misses") if held else None,
+        "unobserved_sources": list(obs.get("sources") or []) if held else [],
+        "unobserved_outcome": obs.get("outcome") if held else None,
+    }
+
+
 def build_pr_board() -> dict:
     st = read_json(STATE / "pr-tracker" / "state.json") or {}
     entries = st.get("entries", {})
+    acked = read_acks()
+    working = active_pr_work()
     buckets = {"going_astray": 0, "waiting_you": 0, "my_review": 0,
                "on_reviewers": 0, "in_progress": 0}
     act_first = []
     notes_other = []
+    snoozed = 0
     for eid, e in entries.items():
         der = e.get("derived", {}) or {}
+        # `track.py snooze <id> <days>` already drops an entry from pr-tracker's
+        # own active view, buckets and counts (track.py:1453). The board read
+        # none of it until the ack path existed — suppression existed and the
+        # surface he actually looks at ignored it.
+        if der.get("snoozed"):
+            snoozed += 1
+            continue
         flags = der.get("flags", []) or []
         wait = der.get("waiting_on")
-        astray = "astray" in flags
-        if astray:
+        pr = e.get("pr") or {}
+        lin = e.get("linear") or {}
+        key = pr.get("key")
+        # A live estate task outranks every derived bucket: whatever GitHub says
+        # the PR is waiting on, somebody is on it, so it is not the operator's move.
+        # That includes `astray` — a PR with a worker attached is not stalled.
+        task = working.get(key) if key else None
+        astray = "astray" in flags and not task
+        if task:
+            buckets["in_progress"] += 1
+        elif astray:
             buckets["going_astray"] += 1
         elif wait in BUCKET_OF:
             buckets[BUCKET_OF[wait]] += 1
-        pr = e.get("pr") or {}
-        lin = e.get("linear") or {}
-        # The operator's memory-trail note — last manual action recorded per PR.
+        # The operator's memory-trail note — the last manual action per PR.
         note = (e.get("manual") or {}).get("note") or None
         title = pr.get("title") or lin.get("title") or eid
         url = pr.get("url") or lin.get("url") or ""
-        key = pr.get("key")
         repo = pr.get("repo") or (key.split("#")[0] if key else "")
         number = pr.get("number")
+        sig, moved_at = activity_sig(e)
         rec = {
             "id": eid, "key": key, "url": url, "title": title,
             "repo": repo, "number": number, "note": note,
@@ -446,9 +641,21 @@ def build_pr_board() -> dict:
             "comments": pr.get("comments"), "flags": flags,
             "linear_id": lin.get("id"), "project": lin.get("project"),
             "astray": astray, "waiting_on": wait,
+            # waiting_on stays the honest derived value; in_progress is the
+            # override the board renders on, with the task id as its evidence.
+            "in_progress": bool(task), "estate_task": task,
+            # Unseen until the operator has acknowledged *this* signature. One they have
+            # never acked reads as unseen, which is the honest default.
+            "sig": sig, "activity_at": moved_at, "unseen": acked.get(eid) != sig,
+            # P-03: on every row, live or held. See pr_freshness().
+            **pr_freshness(e),
         }
-        # act-first = things in *our* court: astray (nudge) + waiting-on-you
-        if astray or wait == "me":
+        # act-first = things in *our* court: astray (nudge) + waiting-on-you,
+        # minus anything a worker currently owns.
+        if task:
+            if note:
+                notes_other.append(rec)
+        elif astray or wait == "me":
             act_first.append(rec)
         elif note:
             # noted PR that won't get an act-first row — still surface its note
@@ -466,13 +673,30 @@ def build_pr_board() -> dict:
     if m:
         meta = {"updated": m.group(1) + " UTC", "active": int(m.group(2)),
                 "ignored": int(m.group(3)), "scanning": m.group(4)}
+    # P-03, board-level: how much of the board is a held copy, and which source
+    # the spotter could not read. Counted over every entry, including the ones
+    # that never earn a row — a blind spot is not less real for landing on a
+    # PR that is quietly waiting on reviewers.
+    held = [eid for eid, e in entries.items()
+            if (e.get("observation") or {}).get("status") == SPOTTER_UNOBSERVED]
+    unreadable = sorted(
+        ({"source": r.get("source"), "outcome": r.get("outcome")}
+         for r in (st.get("sources") or {}).values()
+         if isinstance(r, dict) and not r.get("ok")),
+        key=lambda r: str(r["source"]))
     return {"buckets": buckets, "act_first": act_first,
-            "notes_other": notes_other, "meta": meta}
+            "notes_other": notes_other, "meta": meta, "snoozed": snoozed,
+            "in_progress_tasks": working,
+            "unobserved": len(held), "unobserved_ids": sorted(held),
+            "unreadable_sources": unreadable}
 
 
 # ── night-shift queue + last-night report ────────────────────────────────────
 
-STATUS_RANK = {"needs-you": 0, "queued": 1, "in-progress": 2, "running": 2, "done": 3}
+# `failed` sorts right behind `needs-you` (P-04): both are outcomes somebody
+# has to look at, and an unranked status would fall to the bottom of the card.
+STATUS_RANK = {"needs-you": 0, "failed": 1, "queued": 2, "in-progress": 3,
+               "running": 3, "done": 4}
 
 
 def build_night() -> dict:
@@ -489,14 +713,19 @@ def build_night() -> dict:
         })
     items.sort(key=lambda r: (STATUS_RANK.get(r["status"], 5), r["id"]))
 
-    report = {"date": None, "done": None, "needs_you": None}
+    report = {"date": None, "done": None, "needs_you": None, "failed": None}
     nr = read_text(STATE / "pr-reviewer" / "NIGHT-REPORT.md") or ""
     dm = re.search(r"night report \((.+?)\)", nr)
-    cm = re.search(r"\*\*done\*\*\s*(\d+)\s*·\s*\*\*needs-you\*\*\s*(\d+)", nr)
     if dm:
         report["date"] = dm.group(1)
-    if cm:
-        report["done"], report["needs_you"] = int(cm.group(1)), int(cm.group(2))
+    # One pattern per count, not one pattern spanning them: the report's count
+    # line is alphabetical, so `failed` now lands BETWEEN done and needs-you
+    # (P-04) and a single spanning regex silently matched nothing.
+    for key, label in (("done", "done"), ("needs_you", "needs-you"),
+                       ("failed", "failed")):
+        found = re.search(rf"\*\*{re.escape(label)}\*\*\s*(\d+)", nr)
+        if found:
+            report[key] = int(found.group(1))
     return {"queue": items, "report": report}
 
 
@@ -504,26 +733,102 @@ def build_night() -> dict:
 
 def build_focus() -> dict:
     """Read the focus-projects engine's data model (state/focus/focus.json).
-    Pure consumer — that loop owns all tracker access and scoring; the dashboard
-    only renders. Absent/empty file (the case with no such loop registered)
-    => not available."""
+    Pure consumer — the focus engine owns all issue-tracker access + scoring;
+    the dashboard only renders. Absent/empty file => not available."""
     model = read_json(STATE / "focus" / "focus.json")
     if not model or not model.get("projects"):
         return {"available": False, "projects": []}
+    # The engine's generated model is intentionally focused on momentum data;
+    # its small declaration file remains authoritative for project URLs. Join
+    # those URLs by stable project key for consumers that want navigation.
+    urls = {}
+    projects_file = STATE / "focus" / "projects.toml"
+    try:
+        with projects_file.open("rb") as f:
+            declared = tomllib.load(f).get("projects", {})
+        urls = {key: p.get("url") for key, p in declared.items()
+                if isinstance(p, dict) and p.get("url")}
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    projects = [{**p, "url": urls.get(p.get("key"))}
+                for p in model.get("projects", [])]
     return {"available": True, "generated_at": model.get("generated_at"),
             "batch_cap": model.get("batch_cap"),
-            "projects": model.get("projects", [])}
+            "projects": projects}
 
 
-# ── morning brief (latest report or placeholder) ─────────────────────────────
+# ── morning brief (recent reports; latest retained for snapshot consumers) ──
+
+def brief_delivery(date: str) -> dict | None:
+    """Did this date's brief reach Slack? (gap audit P-10.)
+
+    The report file on disk says a brief was WRITTEN. Until the publication
+    record existed, nothing said whether the operator ever received it — a relay that
+    failed looked exactly like one that worked, from here. Read-only, and a
+    missing/unreadable record degrades to None rather than claiming anything.
+    """
+    data = read_json(STATE / "morning-brief" / "publications.json")
+    if not isinstance(data, dict):
+        return None
+    rec = (data.get("dates") or {}).get(date)
+    if not isinstance(rec, dict):
+        return None
+    dlv = rec.get("delivery") or {}
+    gen = rec.get("generation") or {}
+    return {"generation": gen.get("status"), "status": dlv.get("status"),
+            "delivered_at": dlv.get("delivered_at"),
+            "reason": dlv.get("reason"),
+            "attempts": len(dlv.get("attempts") or [])}
+
+
+def spotter_snapshot_now() -> str | None:
+    """The content hash of the spotter board AS IT IS NOW.
+
+    Not a freshness opinion — one number, compared against the one the brief's
+    manifest recorded. The PR-board panel above is live on purpose (it answers
+    "what is true now"), and the digest panel is a morning's snapshot; before
+    P-11 the two could show different boards with nothing saying so.
+    """
+    try:
+        return hashlib.sha256(
+            (STATE / "pr-tracker" / "state.json").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def brief_manifest_for(date: str) -> dict:
+    """What the brief for `date` could see (gap audit P-11).
+
+    Read through lib/brief_manifest so the reader and the writer share one
+    vocabulary, and so a report with no manifest — every one written before
+    P-11 — gets the legacy stub rather than nine invented `completed` sources.
+    """
+    return brief_manifest.load(STATE / "morning-brief", date)
+
 
 def build_brief() -> dict:
     reports = sorted(glob.glob(str(STATE / "morning-brief" / "reports" / "*.md")))
     if not reports:
-        return {"available": False}
-    latest = Path(reports[-1])
-    return {"available": True, "name": latest.name,
-            "body": read_text(latest) or ""}
+        return {"available": False, "reports": []}
+    recent = []
+    for report in reversed(reports[-5:]):
+        path = Path(report)
+        recent.append({"name": path.name, "date": path.stem,
+                       "body": read_text(path) or "",
+                       "delivery": brief_delivery(path.stem),
+                       "manifest": brief_manifest_for(path.stem)})
+    latest = recent[0]
+    snapshot = (latest["manifest"].get("spotter_snapshot") or {}).get("sha256")
+    live = spotter_snapshot_now()
+    return {"available": True, "name": latest["name"],
+            "body": latest["body"], "delivery": latest["delivery"],
+            "manifest": latest["manifest"],
+            # True only when BOTH hashes are known and differ. Unknown is not
+            # drift: a legacy manifest and an unreadable board both mean we
+            # cannot compare, and saying "the board moved" on that would be
+            # the same invented finding P-03 removed from the spotter.
+            "board_moved": bool(snapshot and live and snapshot != live),
+            "reports": recent}
 
 
 # ── mechanic proposals ───────────────────────────────────────────────────────
@@ -591,18 +896,58 @@ def build_mechanic() -> dict:
 
 # ── ledger tail ──────────────────────────────────────────────────────────────
 
-def build_ledger() -> list[dict]:
-    txt = read_text(STATE / "ledger.jsonl") or ""
-    rows = []
-    for line in txt.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return rows[-LEDGER_TAIL:][::-1]
+def tail_jsonl(path: Path, n: int) -> list[dict]:
+    """The last `n` valid JSON objects from a JSONL file, newest-first, read
+    from the end in blocks so an ever-growing append-only ledger costs O(tail)
+    not O(file). Blank/malformed lines are skipped exactly as a full parse
+    skips them, so the result equals `[full-parse][-n:][::-1]`. [] if unreadable."""
+    if n <= 0:
+        return []
+    out: list[dict] = []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b""
+            while pos > 0 and len(out) < n:
+                step = min(65536, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+                # buf[0] may be a mid-line fragment (more bytes precede it), so
+                # hold it back for the next earlier block; parse the rest, newest
+                # (nearest EOF) first.
+                parts = buf.split(b"\n")
+                buf = parts[0]
+                for raw in reversed(parts[1:]):
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    try:
+                        out.append(json.loads(s))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if len(out) >= n:
+                        break
+            if len(out) < n:  # reached BOF — the held-back fragment is line 1
+                s = buf.strip()
+                if s:
+                    try:
+                        out.append(json.loads(s))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+    except OSError:
+        return []
+    return out[:n]
+
+
+def build_ledger(loops: list[str] | None = None) -> list[dict]:
+    # Folded into the actor taxonomy on the way out (docs/actor-taxonomy.md) —
+    # `hub` and the hub persona are the same session, and every dispatched worker
+    # reads as `ephemeral` with its slug in session_id.
+    rows = tail_jsonl(STATE / "ledger.jsonl", LEDGER_TAIL)
+    return [actors.normalize_row(r, loops) if isinstance(r, dict) else r
+            for r in rows]
 
 
 # ── Claude Code usage (local, token-free rolling-window aggregate) ────────────
@@ -619,6 +964,128 @@ def build_ledger() -> list[dict]:
 # window, a substring test skips non-usage lines before any JSON parse, and the
 # whole thing is wrapped so a failure degrades to a graceful "unavailable" — it
 # can never break the token-free regen. Disable entirely with DASHBOARD_USAGE=0.
+#
+# Incremental accounting (the expensive part made cheap): the active transcripts
+# are long-lived append-only JSONL, so re-reading each in-window file from byte
+# zero every 45s reparsed hundreds of MiB of unchanged prefix. Instead we keep a
+# per-file checkpoint (inode + byte offset + the parsed in-window usage records)
+# in state/usage/transcript_cache.json and, on each pass, seek to the checkpoint
+# and parse only the bytes appended since. Unchanged files cost one stat; the
+# aggregation then runs over the same record set a full scan would have produced,
+# so the numbers are byte-identical — only the I/O is avoided. The cache is a
+# pure optimization: any inconsistency (rotation, truncation, corrupt cache)
+# falls back to a full reparse of that file, never a wrong number.
+
+
+def _transcript_base() -> Path:
+    override = os.environ.get("DASHBOARD_TRANSCRIPT_BASE")
+    return Path(override) if override else (Path.home() / ".claude" / "projects")
+
+
+def _transcript_cache_path() -> Path:
+    override = os.environ.get("DASHBOARD_TRANSCRIPT_CACHE")
+    return Path(override) if override else (STATE / "usage" / "transcript_cache.json")
+
+
+def _iter_usage_records(raw: bytes):
+    """Yield one record per usage-bearing complete JSONL line in `raw`.
+    Mirrors the original inline parse exactly (substring prefilter, timestamp +
+    non-empty usage requirement); the caller applies the window cutoff so old
+    lines can be cached and pruned without changing any total."""
+    for line in raw.decode("utf-8", "ignore").splitlines():
+        if '"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        ts = d.get("timestamp")
+        if not ts:
+            continue
+        try:
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError):
+            continue
+        message = d.get("message") or {}
+        u = message.get("usage") or {}
+        if not u:
+            continue
+        # [t, usage, model, loop, sid] — compact list keeps the cache small.
+        yield [t, u, message.get("model"),
+               _cwd_to_loop(d.get("cwd")), d.get("sessionId") or d.get("session_id")]
+
+
+def _write_cache(path: Path, data: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass  # cache is best-effort; a failed write just re-reads next pass
+
+
+def _scan_records(cutoff_ts: float, byte_cap: int) -> list[list]:
+    """Return all in-window usage records ([t, usage, model, loop, sid]) across
+    the transcript tree, reading only bytes appended since the last pass. Applies
+    the same mtime pre-filter as before (files last touched before the cutoff hold
+    no in-window line) and refreshes the on-disk checkpoint cache."""
+    base = _transcript_base()
+    cache_path = _transcript_cache_path()
+    cached = read_json(cache_path)
+    files_cache = cached.get("files") if isinstance(cached, dict) else None
+    if not isinstance(files_cache, dict):
+        files_cache = {}
+
+    records: list[list] = []
+    new_cache: dict[str, dict] = {}
+    read_bytes = 0
+    for p in sorted(base.glob("*/*.jsonl")):
+        try:
+            stt = p.stat()
+        except OSError:
+            continue
+        if stt.st_mtime < cutoff_ts:
+            continue  # entirely out of window — and dropped from the cache
+        key = str(p)
+        prev = files_cache.get(key)
+        # Reuse the checkpoint only when the file is the same inode and hasn't
+        # shrunk below our offset (rotation/truncation → full reparse from 0).
+        if (isinstance(prev, dict) and prev.get("inode") == stt.st_ino
+                and isinstance(prev.get("offset"), int)
+                and 0 <= prev["offset"] <= stt.st_size):
+            offset = prev["offset"]
+            lines = list(prev.get("lines") or [])
+        else:
+            offset, lines = 0, []
+
+        if offset < stt.st_size and read_bytes < byte_cap:
+            try:
+                with p.open("rb") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+            except OSError:
+                chunk = b""
+            read_bytes += len(chunk)
+            # Only consume through the last complete line; a partial trailing
+            # line (mid-append) stays unconsumed so it is counted once, later.
+            nl = chunk.rfind(b"\n")
+            if nl >= 0:
+                for rec in _iter_usage_records(chunk[:nl + 1]):
+                    lines.append(rec)
+                offset += nl + 1
+
+        # Prune to the window for both the returned set and what we re-cache.
+        kept = [ln for ln in lines if ln[0] >= cutoff_ts]
+        records.extend(kept)
+        new_cache[key] = {"inode": stt.st_ino, "size": stt.st_size,
+                          "mtime": stt.st_mtime, "offset": offset, "lines": kept}
+        if read_bytes >= byte_cap:
+            break  # safety ceiling; steady-state appends never approach it
+
+    _write_cache(cache_path, {"version": 1, "files": new_cache})
+    return records
+
 
 def build_usage(now: datetime, registry: dict) -> dict:
     cfg = (registry.get("dashboard") or {})
@@ -637,76 +1104,45 @@ def build_usage(now: datetime, registry: dict) -> dict:
     from datetime import timedelta
     cutoff = now - timedelta(hours=hours)
     cutoff_ts = cutoff.timestamp()
-    base = Path.home() / ".claude" / "projects"
-    BYTE_CAP = 400 * 1024 * 1024  # safety ceiling; window mtime-filter keeps us far under
+    BYTE_CAP = 400 * 1024 * 1024  # safety ceiling on bytes read per pass
 
-    tok_in = tok_out = cc = cr = msgs = files = read = 0
+    try:
+        records = _scan_records(cutoff_ts, BYTE_CAP)
+    except OSError:
+        return {"available": False, "reason": "no local transcripts"}
+
+    tok_in = tok_out = cc = cr = msgs = 0
     cost_total = 0.0
     sessions: set[str] = set()
     cost_by_loop: dict[str, dict] = defaultdict(lambda: {"tokens": 0, "cost_usd": 0.0})
     cost_by_session: dict[str, dict] = defaultdict(
         lambda: {"tokens": 0, "cost_usd": 0.0, "loop": "other"})
-    try:
-        for p in base.glob("*/*.jsonl"):
-            try:
-                stt = p.stat()
-            except OSError:
-                continue
-            if stt.st_mtime < cutoff_ts:
-                continue
-            read += stt.st_size
-            if read > BYTE_CAP:
-                break
-            files += 1
-            try:
-                with p.open(encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if '"usage"' not in line:
-                            continue
-                        try:
-                            d = json.loads(line)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        ts = d.get("timestamp")
-                        if not ts:
-                            continue
-                        try:
-                            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        except ValueError:
-                            continue
-                        if t < cutoff:
-                            continue
-                        message = d.get("message") or {}
-                        u = message.get("usage") or {}
-                        if not u:
-                            continue
-                        msgs += 1
-                        sid = d.get("sessionId") or d.get("session_id")
-                        if sid:
-                            sessions.add(sid)
-                        line_in = u.get("input_tokens", 0) or 0
-                        line_out = u.get("output_tokens", 0) or 0
-                        line_cc = u.get("cache_creation_input_tokens", 0) or 0
-                        line_cr = u.get("cache_read_input_tokens", 0) or 0
-                        tok_in += line_in
-                        tok_out += line_out
-                        cc += line_cc
-                        cr += line_cr
-                        line_cost = _line_cost_usd(message.get("model"), u)
-                        cost_total += line_cost
-                        loop = _cwd_to_loop(d.get("cwd"))
-                        lb = cost_by_loop[loop]
-                        lb["tokens"] += line_in + line_out + line_cc + line_cr
-                        lb["cost_usd"] += line_cost
-                        if sid:
-                            sb = cost_by_session[sid]
-                            sb["tokens"] += line_in + line_out + line_cc + line_cr
-                            sb["cost_usd"] += line_cost
-                            sb["loop"] = loop
-            except OSError:
-                continue
-    except OSError:
-        return {"available": False, "reason": "no local transcripts"}
+    # records are [t, usage, model, loop, sid], already in glob+append order and
+    # window-filtered by _scan_records; the accumulation below is unchanged.
+    for t, u, model, loop, sid in records:
+        if t < cutoff_ts:
+            continue
+        msgs += 1
+        if sid:
+            sessions.add(sid)
+        line_in = u.get("input_tokens", 0) or 0
+        line_out = u.get("output_tokens", 0) or 0
+        line_cc = u.get("cache_creation_input_tokens", 0) or 0
+        line_cr = u.get("cache_read_input_tokens", 0) or 0
+        tok_in += line_in
+        tok_out += line_out
+        cc += line_cc
+        cr += line_cr
+        line_cost = _line_cost_usd(model, u)
+        cost_total += line_cost
+        lb = cost_by_loop[loop]
+        lb["tokens"] += line_in + line_out + line_cc + line_cr
+        lb["cost_usd"] += line_cost
+        if sid:
+            sb = cost_by_session[sid]
+            sb["tokens"] += line_in + line_out + line_cc + line_cr
+            sb["cost_usd"] += line_cost
+            sb["loop"] = loop
 
     total = tok_in + tok_out + cc + cr
     pct = None
@@ -749,19 +1185,156 @@ def build_usage(now: datetime, registry: dict) -> dict:
 def build_cap_signal() -> dict | None:
     return read_json(STATE / "usage" / "budget.json")
 
+def build_estate_activity(registry: dict | None = None) -> dict:
+    # Loop names from the live registry, so a loop added to loops.toml is
+    # classified as a loop without editing lib/actors.py.
+    loop_names = sorted((registry or {}).get("loops", {}))
+    out = {"available": False, "tasks": [], "task_counts": {}, "kind_counts": {}, "stage_counts": {}, "events": [], "task_events": {}, "project_events": {}, "projects": [], "project_counts": {}, "dependencies": [], "dep_counts": {}, "attention": [], "attention_counts": {}, "followups": [], "followup_counts": {}, "proposals": [], "proposal_counts": {}, "inbox_messages": [], "inbox_message_counts": {}, "extractions": {"available": False, "items": [], "counts": {}}, "memories": {"available": False, "items": [], "counts": {}, "phase": "M0 not initialized"}}
+    db = STATE / "estate.db"
+    if db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            conn.row_factory = sqlite3.Row
+            # ONE composed read for tasks, projects, edges, attention and
+            # decoded follow-ups (t-135, lib/estate_work.py). Every field it
+            # adds is derived on this read and none is stored: `blocked_by`
+            # keeps a blocked task at status='ready' because being blocked is a
+            # fact about its neighbours (P-18), `due_state` moves with the
+            # clock and not with any row (P-07), and a project rollup is
+            # counted from the task rows rather than kept in a column that has
+            # to be re-written every time a task moves.
+            work = estate_work.build(conn)
+            out["tasks"] = work["tasks"]
+            for key in ("projects", "project_counts", "dependencies",
+                        "dep_counts", "attention", "attention_counts",
+                        "followups", "followup_counts", "proposals",
+                        "proposal_counts", "inbox_messages",
+                        "inbox_message_counts"):
+                out[key] = work[key]
+            out["notice_days"] = work["notice_days"]
+            out["events"] = [actors.normalize_row(dict(r), loop_names) for r in conn.execute("SELECT * FROM events ORDER BY seq DESC LIMIT 80")]
+            # Drill-down runs off the AUTHORITATIVE table, not the 80-row slice
+            # above (P-16). The panel's recent-activity list is a tail by
+            # design; a task's own history is not, and reading it out of that
+            # tail silently emptied the drill-down of every task whose events
+            # had scrolled off. Same query surface `estate events` uses, so the
+            # CLI and the page can never answer this differently. One indexed
+            # lookup per task (idx_events_task).
+            try:
+                out["task_events"] = {
+                    task["id"]: [actors.normalize_row(dict(r), loop_names)
+                                 for r in estate_events.select(conn, {"task": task["id"]})]
+                    for task in out["tasks"]}
+            except estate_events.MissingColumn:
+                # A store too old to link events to tasks has no drill-down to
+                # show. Same rule as blocked_by: a derived view must never take
+                # down the panel that carries it.
+                out["task_events"] = {}
+            # A project's OWN history, from the same authoritative table
+            # (§4.9 of t-124's report) — and ONLY the rows no task already
+            # carries. An event written against a project's task names both
+            # ids, so an unfiltered `--project p-1` read would ship every one
+            # of those rows a second time; on the live store that was 55kB of
+            # exact duplicate. The page composes the project's own rows with
+            # its tasks' histories client-side, where the join is free (§4.10 —
+            # this snapshot is append-only and already grows on its own).
+            try:
+                out["project_events"] = {
+                    project["id"]: [actors.normalize_row(dict(r), loop_names)
+                                    for r in estate_events.select(conn, {"project": project["id"]})
+                                    if not r["task_id"]]
+                    for project in out["projects"] if not project.get("unprojected")}
+            except estate_events.MissingColumn:
+                out["project_events"] = {}
+            out["task_counts"] = {r["status"]: r["n"] for r in conn.execute("SELECT status, count(*) n FROM tasks GROUP BY status")}
+            out["kind_counts"] = {r["kind"]: r["n"] for r in conn.execute("SELECT kind, count(*) n FROM tasks GROUP BY kind")}
+            # P-02: the retained review state, counted by stage. Separate from
+            # task_counts on purpose — a proposal's review decision and its
+            # work status are different facts, and one grid showing both would
+            # imply they are alternatives. A store without the column predates
+            # the lifecycle and simply has no stages to count — same rule as
+            # blocked_by, a derived view never takes down the panel.
+            try:
+                out["stage_counts"] = {r["stage"]: r["n"] for r in conn.execute(
+                    "SELECT stage, count(*) n FROM tasks WHERE stage IS NOT NULL GROUP BY stage")}
+            except sqlite3.OperationalError:
+                out["stage_counts"] = {}
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "memories" in tables:
+                memories = [dict(r) for r in conn.execute("SELECT * FROM memories ORDER BY updated_at DESC")]
+                memory_counts = defaultdict(int)
+                for memory in memories: memory_counts[memory.get("status", "candidate")] += 1
+                out["memories"] = {"available": True, "items": memories, "counts": dict(memory_counts), "phase": "shared memory store active"}
+            out["available"] = True
+            conn.close()
+        except sqlite3.Error as exc: out["error"] = str(exc)
+    store = read_json(STATE / "extraction" / "candidates.json")
+    if isinstance(store, dict) and isinstance(store.get("items"), dict):
+        items = sorted(store["items"].values(), key=lambda i: i.get("updated_at", ""), reverse=True)
+        counts = defaultdict(int)
+        for item in items: counts[item.get("status", "candidate")] += 1
+        out["extractions"] = {"available": True, "items": items, "counts": dict(counts), "updated_at": store.get("updated_at")}
+    ledger_rows = []
+    raw_ledger = read_text(STATE / "ledger.jsonl")
+    if raw_ledger is not None:
+        for line in raw_ledger.splitlines():
+            try: row = json.loads(line)
+            except json.JSONDecodeError: continue
+            if isinstance(row, dict): ledger_rows.append(actors.normalize_row(row, loop_names))
+    # Counted on the canonical actor, so the operator is ONE total rather than a
+    # `hub` total and a hub-persona total, and the ephemeral tail collapses into
+    # a single chip instead of ~20 one-row chips. by_class is the coarse read;
+    # by_session traces which dispatches wrote the ephemeral rows.
+    by_actor, by_kind, by_class = defaultdict(int), defaultdict(int), defaultdict(int)
+    by_session = defaultdict(int)
+    for row in ledger_rows:
+        by_actor[row["actor"]] += 1
+        by_class[row["actor_class"]] += 1
+        by_kind[str(row.get("kind") or "unknown")] += 1
+        if row["session_id"]: by_session[row["session_id"]] += 1
+    out["ledger_health"] = {"available": raw_ledger is not None, "count": len(ledger_rows), "by_actor": dict(by_actor), "by_class": dict(by_class), "by_session": dict(by_session), "by_kind": dict(by_kind), "recent": list(reversed(ledger_rows[-50:]))}
+    lessons = read_text(ROOT / "docs" / "lessons.md")
+    out["memories"]["manual_lessons"] = sum(1 for line in (lessons or "").splitlines() if line.startswith("- **"))
+    out["memories"]["curator_configured"] = (ROOT / "loops" / "curator").exists()
+    private = []
+    scopes = [("hub", ROOT)]
+    for name, cfg in (registry or {}).get("loops", {}).items():
+        scopes.append((name, ROOT / cfg.get("dir", f"loops/{name}")))
+    for name, cwd in scopes:
+        encoded = str(cwd.resolve()).replace("/", "-")
+        path = Path.home() / ".claude" / "projects" / encoded / "memory" / "MEMORY.md"
+        body = read_text(path)
+        private.append({"scope": name, "available": body is not None,
+                        "body": body or "", "path": str(path),
+                        "bytes": len((body or "").encode("utf-8"))})
+    out["memories"]["private"] = private
+    return out
+
 
 # ── assemble snapshot ────────────────────────────────────────────────────────
 
 def build_snapshot() -> dict:
     now_dt = datetime.now(timezone.utc)
     now = now_dt.timestamp()
-    registry = tomllib.loads(read_text(ROOT / "loops.toml") or "")
-    loops = build_loops(registry, now)
+    # Fail loudly on an unreadable registry. `or ""` used to make this parse to
+    # an empty dict, so the dashboard rendered a healthy-looking page with zero
+    # loops — the same "green but sees no data" shape as the ab77cc8 state-dir
+    # bug. dashboard-refresh logs the non-zero exit instead.
+    raw = read_text(ROOT / "loops.toml")
+    if raw is None:
+        sys.exit(f"dashboard: cannot read {ROOT / 'loops.toml'}")
+    registry = tomllib.loads(raw)
+    dashboard_config = registry.get("dashboard", {})
+    # One agent-deck read for the whole snapshot — the per-loop status sweep and
+    # the ephemeral list both index into it (was one `session show` per loop plus
+    # a separate `ls --json`).
+    deck = deck_ls()
+    loops = build_loops(registry, now, deck_index(deck))
     pr_board = build_pr_board()
     night = build_night()
     focus = build_focus()
     mechanic = build_mechanic()
-    ephemeral = build_ephemeral(now_dt)
+    ephemeral = build_ephemeral(now_dt, deck)
     usage = build_usage(now_dt, registry)
     usage["cap"] = build_cap_signal()
 
@@ -775,8 +1348,11 @@ def build_snapshot() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "generated_epoch": int(now),
         "host": socket.gethostname(),
-        "estate": ESTATE,
-        "operator": HUB_PERSONA,
+        # Header identity, in the order an install is most likely to have set
+        # it: the dashboard's own labels, else the [hub] identity every other
+        # component already reads, else the neutral default.
+        "estate": dashboard_config.get("estate_name") or ESTATE,
+        "operator": dashboard_config.get("operator_name") or HUB_PERSONA,
         "loops": loops,
         "ephemeral": ephemeral,
         "usage": usage,
@@ -785,7 +1361,8 @@ def build_snapshot() -> dict:
         "focus": focus,
         "brief": build_brief(),
         "mechanic": mechanic,
-        "ledger": build_ledger(),
+        "ledger": build_ledger(sorted(registry.get("loops", {}))),
+        "estate_activity": build_estate_activity(registry),
         "vitals": {
             "loops_live": live,
             "loops_ondemand": ondemand,
@@ -924,6 +1501,12 @@ a{color:inherit;text-decoration:none}
 .pbody{padding:14px 18px 18px}
 .pbody.tight{padding:8px 10px 12px}
 .scroll{overflow-x:auto}
+.panel-subhead{display:flex;align-items:center;gap:10px;margin:0 10px;padding:13px 8px 8px;
+  border-top:1px solid var(--edge)}
+.panel-subhead .k{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim);font-weight:600}
+.panel-subhead .tick{font-size:10px;color:var(--faint);letter-spacing:.06em}
+.panel-subhead .grow{flex:1}
+.pbody.ephemeral-body{padding-top:4px}
 
 /* ── loops rack ─────────────────────────── */
 .loop{display:grid;grid-template-columns:16px 1fr auto;gap:12px;align-items:center;
@@ -976,6 +1559,25 @@ a{color:inherit;text-decoration:none}
 .prrow.astray{border-left-color:var(--crit)}
 .prrow.mine{border-left-color:var(--warn)}
 .prrow .r1{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+/* new-activity mark: same accent wash the panel heads use, so an unseen row
+   reads as "lit" without competing with the astray/mine left rails */
+.prrow.unseen,.pno.unseen{background:linear-gradient(90deg,var(--accent-soft),transparent 62%)}
+.prrow.unseen:hover,.pno.unseen:hover{background:linear-gradient(90deg,var(--accent-soft),var(--surface-2) 62%)}
+.ack{flex:none;align-self:center;font-family:var(--mono);font-size:12px;
+  line-height:1;color:var(--accent);cursor:pointer;border-radius:5px;
+  padding:3px 4px;margin:-3px 0 -3px -4px;transition:background .12s,color .12s}
+.ack:hover{background:var(--accent-soft);color:var(--ink)}
+.ack:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.prrow:not(.unseen) .ack,.pno:not(.unseen) .ack{visibility:hidden}
+.ackbar{display:flex;align-items:center;gap:9px;margin:0 2px 10px;
+  font-size:10.5px;color:var(--accent)}
+.ackbar[hidden]{display:none}
+.ackbar .ackn{font-family:var(--mono)}
+.ackall{font:inherit;font-size:10px;line-height:1;color:var(--faint);
+  border:1px solid var(--edge);background:var(--surface-2);border-radius:6px;
+  padding:5px 8px;cursor:pointer}
+.ackall:hover{color:var(--ink);border-color:var(--accent)}
+.ackall:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .prkey{font-size:12px;color:var(--accent);font-weight:600;white-space:nowrap}
 .prttl{font-size:13px;color:var(--ink);flex:1;min-width:0;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
@@ -986,6 +1588,16 @@ a{color:inherit;text-decoration:none}
   border:1px solid var(--edge);color:var(--dim);text-transform:lowercase}
 .tag.astray{color:var(--crit);border-color:rgba(242,89,76,.45);background:var(--crit-soft)}
 .tag.draft{color:var(--dim)} .tag.blocked{color:var(--crit)}
+/* a worker holds a live estate task on this PR — it left the act-first list on
+   purpose, and the tag is what says so instead of the row just disappearing */
+.tag.working{color:var(--info);border-color:rgba(90,169,255,.45);background:var(--info-soft)}
+/* P-03: the spotter could not re-read this item, so the row is the last real
+   observation rather than live state. Warn, not crit — nothing is wrong with
+   the PR, we just cannot currently see it. */
+.tag.held{color:var(--warn);border-color:rgba(226,169,60,.45);background:var(--warn-soft)}
+.heldbar{font-size:10.5px;color:var(--warn);background:var(--warn-soft);
+  border:1px solid rgba(226,169,60,.35);border-radius:7px;padding:6px 9px;
+  margin:0 2px 8px;line-height:1.45}
 .idle-d{font-variant-numeric:tabular-nums}
 .idle-d.hot{color:var(--crit)} .idle-d.warm{color:var(--warn)}
 /* the operator's manual last-action note (memory trail) */
@@ -1056,6 +1668,41 @@ a{color:inherit;text-decoration:none}
 .brief-body b{color:var(--ink);font-weight:600}
 .brief-body a{color:var(--accent);text-decoration:underline}
 
+/* ── P-11: the brief's source manifest ──────
+   One chip per gatherer. The dot carries the STATUS (did the fetch answer),
+   the age carries the FRESHNESS (how old what it answered is), and they are
+   deliberately separate marks: a completed source can be hours stale and a
+   failed one has no age at all. Both come from the manifest; neither is
+   re-derived from the producers' own files. */
+.srcstrip{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.srcstrip.legacy{font-size:10.5px;color:var(--faint);font-style:italic;
+  padding:5px 2px}
+.srcchip{display:inline-flex;align-items:center;gap:5px;font-size:9.5px;
+  letter-spacing:.03em;padding:3px 7px;border-radius:6px;
+  border:1px solid var(--edge);color:var(--dim);background:var(--surface-2)}
+.srcchip .srcdot{width:6px;height:6px;border-radius:50%;background:var(--good);
+  flex:none}
+.srcchip .srcn{font-variant-numeric:tabular-nums;color:var(--ink)}
+.srcchip .srcage{color:var(--faint);font-variant-numeric:tabular-nums}
+/* a fetch that ran and broke, and one that never ran — kept apart, because
+   "GitHub refused" and "gh is not installed" are different mornings */
+.srcchip.s-failed{color:var(--crit);border-color:rgba(242,89,76,.45);
+  background:var(--crit-soft)}
+.srcchip.s-failed .srcdot{background:var(--crit)}
+.srcchip.s-unavailable{color:var(--faint);border-style:dashed}
+.srcchip.s-unavailable .srcdot{background:var(--faint)}
+/* completed, but only partly read: the emptiness still is not evidence */
+.srcchip.deg{border-color:rgba(226,169,60,.45);background:var(--warn-soft)}
+.srcchip.deg .srcdot{background:var(--warn)}
+/* the freshness half, re-ticked in the browser from data-asof/data-maxage */
+.srcchip.f-stale .srcage{color:var(--warn)}
+.srcchip.f-unknown .srcage{color:var(--faint)}
+.srcwarn{font-size:10.5px;color:var(--warn);background:var(--warn-soft);
+  border:1px solid rgba(226,169,60,.35);border-radius:7px;padding:6px 9px;
+  margin:0 0 8px;line-height:1.45}
+.srccut{font-size:10px;color:var(--faint);margin:0 0 8px;
+  font-variant-numeric:tabular-nums}
+
 /* ── ledger ───────────────────────────────── */
 .led{display:grid;grid-template-columns:auto auto 1fr;gap:9px 12px;align-items:baseline;
   font-size:12px;padding:7px 2px;border-bottom:1px solid var(--hair)}
@@ -1077,9 +1724,13 @@ a{color:inherit;text-decoration:none}
 .ephcard .es-body{min-width:0}
 .ephcard .es-slug{font-weight:600;color:var(--ink);font-size:13.5px;white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis;max-width:34ch}
+.ephcard .es-ref{font-size:11px;color:var(--dim);margin-top:2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:34ch}
 .ephcard .es-meta{display:flex;align-items:center;gap:8px;margin-top:4px;
   font-size:10.5px;color:var(--faint)}
 .ephcard .es-age{font-variant-numeric:tabular-nums}
+.ephcard .es-kind{font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--violet);
+  border:1px solid var(--violet);background:var(--violet-soft);border-radius:5px;padding:1px 5px}
 .status.waiting{color:var(--warn);background:var(--warn-soft);border:1px solid rgba(242,171,53,.35)}
 .status.idle{color:var(--dim);background:var(--surface-2);border:1px solid var(--edge)}
 
@@ -1092,6 +1743,9 @@ a{color:inherit;text-decoration:none}
 .usage .sep{color:var(--edge)}
 .usage .est{color:var(--faint);font-style:italic}
 .usage .pct{color:var(--accent);font-weight:600}
+.usage .pace.good{color:var(--good)}
+.usage .pace.warn{color:var(--warn)}
+.usage .pace.crit{color:var(--crit)}
 .usage.na{color:var(--faint)}
 
 .foot{margin-top:26px;padding-top:16px;border-top:1px solid var(--edge);
@@ -1108,6 +1762,37 @@ a{color:inherit;text-decoration:none}
 .stat b{color:var(--ink);font-weight:600}
 .stat.stale{color:var(--warn)} .stat.stale .sdot{background:var(--warn);box-shadow:0 0 8px var(--warn)}
 .stat.offline{color:var(--crit)} .stat.offline .sdot{background:var(--crit);box-shadow:0 0 8px var(--crit)}
+"""
+
+# P-11. The freshness half of every source chip, re-derived in the browser from
+# the two numbers the MANIFEST carries — `as_of` (when that source's data was
+# true) and `max_age_seconds` (its budget). Nothing here reads producer state or
+# invents a threshold: the page ticks the clock, the brief owns the policy. Both
+# the live shell and the static Artifact fragment run it, so a page left open
+# all day tells the truth without a regeneration.
+SOURCE_JS = r"""
+(function(){
+  function human(s){s=Math.max(0,Math.floor(s));
+    return s<90?s+'s':s<5400?Math.round(s/60)+'m':s<172800?Math.round(s/3600)+'h':Math.round(s/86400)+'d';}
+  function tick(){
+    var chips=document.querySelectorAll('.srcchip[data-asof]');
+    for(var i=0;i<chips.length;i++){
+      var c=chips[i], asof=c.getAttribute('data-asof');
+      var max=parseFloat(c.getAttribute('data-maxage'))||0;
+      var age=asof?(Date.now()-Date.parse(asof))/1000:NaN;
+      var out=c.querySelector('.srcage');
+      if(!isFinite(age)){c.classList.remove('f-current','f-stale');
+        c.classList.add('f-unknown');if(out)out.textContent='—';continue;}
+      if(age<0)age=0;
+      if(out)out.textContent=human(age);
+      c.classList.remove('f-unknown');
+      c.classList.toggle('f-stale',age>max);
+      c.classList.toggle('f-current',age<=max);
+    }
+  }
+  tick();setInterval(tick,15000);
+  window.OPS_TICK_SOURCES=tick;
+})();
 """
 
 JS = r"""
@@ -1158,7 +1843,7 @@ SHELL_JS = r"""
     var cur=root.getAttribute('data-theme')||'dark',next=cur==='dark'?'light':'dark';
     applyTheme(next);try{localStorage.setItem(KEY,next);}catch(e){}});
 
-  var SEC={loops:'sec-loops',ephemeral:'sec-ephemeral',night:'sec-night',
+  var SEC=window.OPS_DASH_SECTIONS||{loops:'sec-loops',ephemeral:'sec-ephemeral',night:'sec-night',
            focus:'sec-focus',pr_board:'sec-pr',mechanic:'sec-mech',
            brief:'sec-brief',ledger:'sec-ledger'};
   var cache={}, genEpoch=0, lastOk=0, everOk=false;
@@ -1180,6 +1865,11 @@ SHELL_JS = r"""
     setText('mech-date',(d.mechanic&&d.mechanic.date)||'—');
     setText('eph-count',String((d.ephemeral||[]).length));
     setText('led-count',String((d.ledger||[]).length));
+    /* The brief section may have just been swapped in with server-rendered
+       freshness classes as of the LAST regeneration — re-tick them from the
+       manifest's own as_of/max-age so the chips are right immediately. */
+    if(window.OPS_TICK_SOURCES)window.OPS_TICK_SOURCES();
+    document.dispatchEvent(new CustomEvent('ops-dashboard-data',{detail:d}));
   }
 
   function tick(){
@@ -1200,6 +1890,116 @@ SHELL_JS = r"""
       .catch(function(){tick();});
   }
   refresh();setInterval(refresh,30000);setInterval(tick,1000);
+})();
+"""
+
+# PR-board "new activity" marks for the LIVE SHELL. The section HTML in
+# dashboard.json already carries a per-row activity signature and the tracker's
+# rendered guess at unseen-ness, but that JSON is up to ~45s stale — so the
+# client treats acks.json (served straight off disk, always current) as the
+# authority and re-derives unseen = acked[id] !== sig after every section swap.
+# That ordering is what stops a just-acknowledged row from re-lighting on the
+# next poll. Acks POST to /ack and persist server-side, so they survive reload,
+# server restart, and regeneration. Not included in the static Artifact
+# fragment, which has no server to talk to.
+ACK_JS = r"""
+(function(){
+  var acked={}, loaded=false, inflight=false;
+  /* Write endpoints may be token-protected (state/secrets/dashboard-write-token
+     on the server). The token is prompted once on the first write, cached in
+     localStorage, and attached to every /ack POST. A 401 (rotation / "log out")
+     clears the cached value and re-prompts cleanly, so a stale token can't wedge
+     the board. Reads never carry it. If the server has no token file, it ignores
+     the header and every write just succeeds — back-compat with no prompt hassle
+     beyond that first, cancellable ask. */
+  var TOKEN_KEY='ops-dashboard-write-token';
+  function token(){
+    var t=null;try{t=localStorage.getItem(TOKEN_KEY);}catch(e){}
+    if(t===null){
+      try{t=window.prompt('Dashboard write token (leave blank if the server has none):');}catch(e){t=null;}
+      if(t===null)t='';   /* treat cancel as "no token" so a click isn't re-prompted forever */
+      try{localStorage.setItem(TOKEN_KEY,t);}catch(e){}
+    }
+    return t;
+  }
+  function clearToken(){try{localStorage.removeItem(TOKEN_KEY);}catch(e){}}
+  function send(items){
+    var headers={'Content-Type':'application/json'};
+    var tok=token();if(tok)headers['X-Dashboard-Token']=tok;
+    return fetch('ack',{method:'POST',cache:'no-store',
+      headers:headers,body:JSON.stringify({ids:items})});
+  }
+  function rows(){return document.querySelectorAll('[data-ack-sig]');}
+  function unseenOf(row){
+    var id=row.getAttribute('data-ack-id'), sig=row.getAttribute('data-ack-sig');
+    return loaded?acked[id]!==sig:row.getAttribute('data-unseen')==='1';
+  }
+  function apply(){
+    var n=0;
+    Array.prototype.forEach.call(rows(),function(row){
+      var u=unseenOf(row);row.classList.toggle('unseen',u);if(u)n++;});
+    Array.prototype.forEach.call(document.querySelectorAll('.ackbar'),function(bar){
+      var el=bar.querySelector('.ackn-n');if(el)el.textContent=String(n);
+      if(n)bar.removeAttribute('hidden');else bar.setAttribute('hidden','');});
+  }
+  /* acks.json stores {id:{sig,at}}; flatten to {id:sig} — the `at` is only
+     there so the server can expire marks for PRs that left the board. */
+  function take(d){
+    var src=(d&&d.acks)||{};acked={};
+    for(var k in src)if(src[k])acked[k]=src[k].sig;
+    loaded=true;apply();
+  }
+  function pull(){
+    fetch('acks.json?t='+Math.floor(Date.now()/1000),{cache:'no-store'})
+      .then(function(r){if(!r.ok)throw 0;return r.json();}).then(take).catch(function(){});
+  }
+  function push(items){
+    if(!items.length||inflight)return;
+    inflight=true;
+    items.forEach(function(it){acked[it.id]=it.sig;});loaded=true;apply();
+    send(items)
+      .then(function(r){
+        if(r.status===401){clearToken();return send(items);}  /* rotation/logout: re-prompt once */
+        return r;
+      })
+      .then(function(r){if(!r.ok)throw 0;return r.json();})
+      .then(take).catch(pull).then(function(){inflight=false;});
+  }
+  function one(row){
+    var id=row.getAttribute('data-ack-id'), sig=row.getAttribute('data-ack-sig');
+    if(id&&sig)push([{id:id,sig:sig}]);
+  }
+  function all(){
+    var items=[];
+    Array.prototype.forEach.call(rows(),function(row){
+      if(!unseenOf(row))return;
+      var id=row.getAttribute('data-ack-id'), sig=row.getAttribute('data-ack-sig');
+      if(id&&sig)items.push({id:id,sig:sig});});
+    push(items);
+  }
+  /* Capture phase, not bubble: the mark sits inside the row's own <a href>,
+     and this must win the race against the link's default navigation, which
+     the browser can otherwise commit to before a bubble-phase listener runs. */
+  document.addEventListener('click',function(e){
+    var mark=e.target.closest&&e.target.closest('.ack');
+    if(mark){e.preventDefault();e.stopPropagation();  /* row is a link to the PR */
+      var row=mark.closest('[data-ack-sig]');if(row)one(row);return;}
+    if(e.target.closest&&e.target.closest('.ackall')){e.preventDefault();all();}
+  },true);
+  document.addEventListener('keydown',function(e){
+    if(e.key!=='Enter'&&e.key!==' ')return;
+    var mark=e.target.closest&&e.target.closest('.ack');if(!mark)return;
+    e.preventDefault();e.stopPropagation();
+    var row=mark.closest('[data-ack-sig]');if(row)one(row);
+  });
+  /* Re-derive marks whenever the shell swaps in a fresh PR section. apply()
+     itself writes .ackn-n's textContent — a childList mutation *inside* the
+     observed subtree — so it must run with the observer disconnected, or each
+     apply() would re-trigger the observer and spin the main thread forever. */
+  var host=document.getElementById('sec-pr'), obs=null;
+  function reapply(){if(obs)obs.disconnect();apply();if(obs&&host)obs.observe(host,{childList:true,subtree:true});}
+  if(host){obs=new MutationObserver(reapply);obs.observe(host,{childList:true,subtree:true});}
+  apply();pull();setInterval(pull,30000);
 })();
 """
 
@@ -1268,6 +2068,43 @@ def render_note(note: str | None, inline: bool = False) -> str:
     return f'<div class="{cls}">{dspan}{E(body)}</div>'
 
 
+def render_ack(r: dict) -> tuple[str, str]:
+    """(extra row attributes, the ✳ mark) for one PR row.
+
+    The mark IS the click target — click it to acknowledge that row's current
+    activity signature. It stays in the DOM when acknowledged (hidden, not
+    removed) so nothing reflows as rows are cleared.
+    """
+    if not r.get("sig"):
+        return "", ""
+    when = r.get("activity_at") or ""
+    title = f"new activity{f' · {when}' if when else ''} — click to mark seen"
+    attrs = (f' data-ack-id="{E(str(r["id"]))}" data-ack-sig="{E(r["sig"])}"'
+             + (' data-unseen="1"' if r.get("unseen") else ""))
+    mark = (f'<span class="ack" role="button" tabindex="0" title="{E(title)}"'
+            f' aria-label="Mark this PR seen">✳</span>')
+    return attrs, mark
+
+
+def render_held(r: dict) -> tuple[str, str]:
+    """(the row's freshness tooltip, the `held` tag for an unobserved row).
+
+    The tooltip is on every row: `last_successful_observation_at` is only
+    useful if it is there when nothing is wrong too, which is the point P-03
+    makes about exposing it on ordinary rows.
+    """
+    stamp = r.get("last_successful_observation_at") or ""
+    when = str(stamp)[:16].replace("T", " ")
+    if not r.get("unobserved"):
+        return (f' title="last observed {E(when)} UTC"' if when else ""), ""
+    srcs = ", ".join(r.get("unobserved_sources") or []) or "no source"
+    title = (f"held — the spotter could not re-read this item "
+             f"({r.get('unobserved_outcome')}: {srcs}). "
+             + (f"Shown as of {when} UTC."
+                if when else "It has no recorded observation time."))
+    return f' title="{E(title)}"', '<span class="tag held">held</span>'
+
+
 def render_pr_board(board: dict) -> str:
     b = board["buckets"]
     meta = board["meta"]
@@ -1286,6 +2123,9 @@ def render_pr_board(board: dict) -> str:
     shown = board["act_first"][:ACTFIRST_CAP]
     for r in shown:
         cls = "astray" if r["astray"] else "mine"
+        if r.get("unseen"):
+            cls += " unseen"
+        ack_attrs, ack_mark = render_ack(r)
         key = r["key"] or (r["linear_id"] or r["id"])
         idle = r["idle_days"]
         idle_cls = "hot" if (idle or 0) >= 7 else "warm" if (idle or 0) >= 4 else ""
@@ -1294,19 +2134,20 @@ def render_pr_board(board: dict) -> str:
             f'<span class="tag {E(f)}">{E(f)}</span>'
             for f in r["flags"] if f != "astray")
         astray_tag = '<span class="tag astray">astray</span>' if r["astray"] else ""
+        held_attr, held_tag = render_held(r)
         comments = (f'<span>💬 {r["comments"]}</span>'
                     if r.get("comments") else "")
         proj = (f'<span>{E(r["project"])}</span>' if r.get("project") else "")
         href = f' href="{E(r["url"])}"' if r["url"] else ""
         target = ' target="_blank" rel="noopener"' if r["url"] else ""
         rows.append(f'''
-      <a class="prrow {cls}"{href}{target}>
+      <a class="prrow {cls}"{href}{target}{ack_attrs}{held_attr}>
         <div class="r1">
-          <span class="prkey">{E(str(key))}</span>
+          {ack_mark}<span class="prkey">{E(str(key))}</span>
           <span class="prttl">{E(r["title"])}</span>
         </div>
         <div class="r2">
-          {astray_tag}{flag_tags}
+          {held_tag}{astray_tag}{flag_tags}
           <span class="idle-d {idle_cls}">{E(idle_txt)}</span>
           {comments}{proj}
         </div>
@@ -1326,11 +2167,16 @@ def render_pr_board(board: dict) -> str:
             key = r["key"] or (r["linear_id"] or r["id"])
             href = f' href="{E(r["url"])}"' if r["url"] else ""
             target = ' target="_blank" rel="noopener"' if r["url"] else ""
+            ack_attrs, ack_mark = render_ack(r)
+            cls = "pno unseen" if r.get("unseen") else "pno"
+            work_tag = ('<span class="tag working">working</span>'
+                        if r.get("in_progress") else "")
+            held_attr, held_tag = render_held(r)
             lines.append(f'''
-      <a class="pno"{href}{target}>
+      <a class="{cls}"{href}{target}{ack_attrs}{held_attr}>
         <div class="r1">
-          <span class="prkey">{E(str(key))}</span>
-          <span class="prttl">{E(r["title"])}</span>
+          {ack_mark}<span class="prkey">{E(str(key))}</span>
+          <span class="prttl">{E(r["title"])}</span>{work_tag}{held_tag}
         </div>
         {render_note(r.get("note"), inline=True)}
       </a>''')
@@ -1341,10 +2187,32 @@ def render_pr_board(board: dict) -> str:
     upd = meta.get("updated") or ""
     sub = (f'{meta.get("active")} active · {meta.get("ignored")} ignored'
            if meta.get("active") is not None else "")
+    if board.get("snoozed"):
+        sub += f'{" · " if sub else ""}{board["snoozed"]} snoozed'
+    # Rendered unseen count; the live shell recomputes it from acks.json.
+    unseen = sum(1 for r in shown + other if r.get("unseen"))
+    ackbar = (f'<div class="ackbar"{"" if unseen else " hidden"}>'
+              f'<span class="ackn">✳ <b class="ackn-n">{unseen}</b> with new activity</span>'
+              f'<button class="ackall" type="button">mark all seen</button></div>')
+    # P-03. Counts are computed over the whole board, so this fires even when
+    # every held item sits in a bucket that never renders a row — the tiles
+    # above are what would otherwise be quietly wrong.
+    heldbar = ""
+    n_held = board.get("unobserved") or 0
+    if n_held:
+        srcs = ", ".join(
+            f'{s.get("source")} ({s.get("outcome")})'
+            for s in (board.get("unreadable_sources") or []))
+        heldbar = (f'<div class="heldbar">⏸ <b>{n_held}</b> tracked item(s) '
+                   f'held — the spotter could not re-read them this refresh'
+                   + (f' (could not read {E(srcs)})' if srcs else "")
+                   + '. Their rows are the last real observation, not live '
+                     'state. Nothing was archived on a failed fetch.</div>')
     return f'''
     <div class="tiles">{tile_html}</div>
     <div style="font-size:10.5px;color:var(--faint);margin:2px 2px 8px">
       {E(sub)}{" · scanning " + E(scan) if scan else ""}</div>
+    {heldbar}{ackbar}
     {"".join(rows)}{other_html}'''
 
 
@@ -1501,10 +2369,16 @@ def render_night(night: dict) -> str:
     rep = night["report"]
     rep_line = ""
     if rep["done"] is not None:
+        # `failed` shows only when there were failures — a standing "0 failed"
+        # is noise, and a night that failed nothing should not look like one
+        # that was never checked.
+        failed = (f' · <span style="color:var(--crit)">{rep["failed"]} failed</span>'
+                  if rep.get("failed") else "")
         rep_line = (f'<div style="font-size:11px;color:var(--faint);margin:0 2px 10px">'
                     f'last night ({E(rep["date"] or "")}) · '
-                    f'<span style="color:var(--good)">{rep["done"]} done</span> · '
-                    f'<span style="color:var(--crit)">{rep["needs_you"]} needs you</span></div>')
+                    f'<span style="color:var(--good)">{rep["done"]} done</span>{failed} · '
+                    f'<span style="color:var(--crit)">{rep["needs_you"] or 0} '
+                    f'needs you</span></div>')
     rows = []
     for it in night["queue"]:
         st = it["status"]
@@ -1572,10 +2446,119 @@ def render_brief_markdown(raw: str) -> str:
         lambda m: f"<b>{m.group(1) or m.group(2)}</b>", body)
 
 
+DELIVERY_NOTE = {
+    "delivered": "relayed to Slack",
+    "pending": "NOT relayed yet",
+    "delivering": "relay in flight",
+    "unpublished": "NOT published — nothing was handed to the hub",
+    "abandoned": "never relayed",
+}
+
+
+def brief_delivery_note(delivery: dict | None) -> str:
+    """One phrase saying whether the operator actually received this brief.
+
+    On EVERY brief that has a record, not only the undelivered ones — P-03's
+    rule about freshness fields applies here for the same reason: a line that
+    appears only when something is wrong is a line the reader stops seeing.
+    A brief with no record at all says nothing, because a pre-P-10 report file
+    is not evidence either way.
+    """
+    if not delivery:
+        return ""
+    note = DELIVERY_NOTE.get(delivery.get("status"))
+    if not note:
+        return ""
+    if delivery.get("status") == "abandoned" and delivery.get("reason"):
+        note += f" ({delivery['reason']})"
+    tries = delivery.get("attempts") or 0
+    if tries > 1 or (tries and delivery.get("status") != "delivered"):
+        note += f" · {tries} attempt{'s' if tries != 1 else ''}"
+    return note
+
+
+# P-11. One chip per source, rendered FROM the manifest — the status and the
+# freshness budget are the brief's own, not this file's second opinion. The
+# only thing computed here is the age, and SOURCE_JS re-computes that in the
+# browser from the same `data-asof` / `data-maxage` pair, so a panel left open
+# all day goes amber on its own instead of lying until the next regeneration.
+SOURCE_STATE_TITLE = {
+    brief_manifest.COMPLETED: "completed — an empty result here is real",
+    brief_manifest.FAILED: "FAILED — an empty result here means nobody looked",
+    brief_manifest.UNAVAILABLE: "unavailable — this fetch never ran",
+}
+
+
+def render_source_chip(env: dict) -> str:
+    status = str(env.get("status") or "")
+    stale = env.get("staleness") or {}
+    as_of = stale.get("as_of") or ""
+    max_age = stale.get("max_age_seconds") or 0
+    fresh = stale.get("state") or brief_manifest.UNKNOWN
+    label = brief_manifest.SOURCE_LABEL.get(env.get("source"),
+                                            str(env.get("source")))
+    count = env.get("count")
+    # The degrade is a separate class from the status on purpose: it is a
+    # `completed` source whose emptiness still is not evidence, and collapsing
+    # it into `failed` would overstate what went wrong.
+    degraded = " deg" if env.get("degraded") else ""
+    tip = SOURCE_STATE_TITLE.get(status, status)
+    if env.get("degraded"):
+        tip += " · partly unread"
+    if env.get("why"):
+        tip += f" · {env['why']}"
+    age = (human_age(stale.get("age_seconds"))
+           if stale.get("age_seconds") is not None else "—")
+    n = "" if count is None else f'<span class="srcn">{E(str(count))}</span>'
+    return (f'<span class="srcchip s-{E(status)} f-{E(fresh)}{degraded}" '
+            f'title="{E(tip)}" data-asof="{E(as_of)}" '
+            f'data-maxage="{E(str(max_age))}">'
+            f'<span class="srcdot"></span>'
+            f'<span class="srcname">{E(label)}</span>{n}'
+            f'<span class="srcage">{E(age)}</span></span>')
+
+
+def render_brief_sources(brief: dict) -> str:
+    """The provenance strip above the brief body: what each gatherer saw."""
+    manifest = brief.get("manifest") or {}
+    if manifest.get("legacy") or not manifest.get("sources"):
+        return ('<div class="srcstrip legacy" title="'
+                + E(str(manifest.get("why") or brief_manifest.LEGACY_WHY))
+                + '">no source manifest — nothing recorded what this brief '
+                  'could see</div>')
+    order = [s for s in brief_manifest.SOURCES if s in manifest["sources"]]
+    order += [s for s in sorted(manifest["sources"]) if s not in order]
+    chips = "".join(render_source_chip(manifest["sources"][s]) for s in order)
+    bad = brief_manifest.incomplete_sources(manifest)
+    lines = [f'<div class="srcstrip">{chips}</div>']
+    if bad:
+        names = ", ".join(
+            f"{brief_manifest.SOURCE_LABEL.get(e['source'], e['source'])} "
+            f"({e['outcome']})" for e in bad)
+        lines.append(
+            f'<div class="srcwarn">{len(bad)} source(s) could not answer for '
+            f'themselves — an empty section below is not evidence of a quiet '
+            f'morning: {E(names)}</div>')
+    cut = manifest.get("ledger_cutoff") or {}
+    if brief.get("board_moved"):
+        lines.append(
+            '<div class="srcwarn">the PR board above has changed since this '
+            'brief read it — the panel is live, the digest is this morning\'s '
+            'snapshot</div>')
+    seq = cut.get("seq")
+    if seq is not None:
+        lines.append(f'<div class="srccut">ledger cutoff · event {E(str(seq))}'
+                     f'</div>')
+    return "".join(lines)
+
+
 def render_brief(brief: dict, loops: list[dict]) -> str:
     if brief.get("available"):
+        note = brief_delivery_note(brief.get("delivery"))
+        tail = f' · {E(note)}' if note else ""
         return (f'<div style="font-size:10.5px;color:var(--faint);margin-bottom:8px">'
-                f'{E(brief["name"])}</div>'
+                f'{E(brief["name"])}{tail}</div>'
+                f'{render_brief_sources(brief)}'
                 f'<div class="brief-body scroll">'
                 f'{render_brief_markdown(brief["body"])}</div>')
     briefer = next((l for l in loops if l["name"] == "morning-brief"), None)
@@ -1604,10 +2587,13 @@ def render_ledger(rows: list[dict]) -> str:
         except (ValueError, AttributeError, OSError):
             tm = re.search(r"T(\d{2}:\d{2})", str(ts))
             t = tm.group(1) if tm else str(ts)[:5]
-        actor = r.get("actor", "")
-        acls = "hub" if actor == "hub" else ("eph" if actor.startswith("ephemeral") else "")
+        # Rows arrive normalized from build_ledger, but render_ledger is also
+        # called with raw rows in tests and by hand, so fold again — normalize
+        # is idempotent.
+        who = actors.normalize(r.get("actor"), r.get("session_id"))
+        acls = {actors.CLASS_OPERATOR: "hub", actors.CLASS_EPHEMERAL: "eph"}.get(who.actor_class, "")
         kind = r.get("kind", "activity")
-        short = actor.replace("ephemeral-", "eph:")
+        short = who.short
         out.append(f'''
       <div class="led {E(kind)}">
         <span class="t">{E(t)}</span>
@@ -1628,18 +2614,49 @@ def render_ephemeral(items: list[dict]) -> str:
         lamp = {"running": "run beat", "waiting": "wait", "idle": "idle"}.get(st, "run")
         st_cls = st.replace("-", "").replace("_", "")
         age = human_age(it["age"]) if it["age"] is not None else "—"
+        ref = (f'<div class="es-ref">{E(str(it["ref"]))}</div>'
+               if it.get("ref") else "")
+        kind = (f'<span class="es-kind">{E(str(it["kind"]))}</span>'
+                if it.get("kind") else "")
         cards.append(f'''
       <div class="ephcard">
         <span class="lamp {lamp}" title="{E(st)}"></span>
         <div class="es-body">
           <div class="es-slug" title="{E(it.get("path") or "")}">{E(it["slug"])}</div>
+          {ref}
           <div class="es-meta">
             <span class="status {st_cls}">{E(st)}</span>
+            {kind}
             <span class="es-age">{E(age)} alive</span>
           </div>
         </div>
       </div>''')
     return f'<div class="ephstrip">{"".join(cards)}</div>'
+
+
+def cap_pace(pct: float, resets_at: str, *, hours: float,
+             reserve_pct: float = 0, now: datetime | None = None) -> tuple[int, str] | None:
+    """Expected linear consumption and severity for a bounded usage window."""
+    try:
+        reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if reset.tzinfo is None:
+        reset = reset.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    start = reset - timedelta(hours=hours)
+    elapsed = max(0.0, min(hours, (current - start).total_seconds() / 3600))
+    if reserve_pct and hours == 168:
+        weekday_hours = 120.0
+        if elapsed <= weekday_hours:
+            expected = elapsed / weekday_hours * (100 - reserve_pct)
+        else:
+            expected = ((100 - reserve_pct) +
+                        (elapsed - weekday_hours) / 48.0 * reserve_pct)
+    else:
+        expected = elapsed / hours * 100
+    severity = "good" if pct < expected - 3 else ("crit" if pct > expected + 3 else "warn")
+    return round(expected), severity
 
 
 def render_cap(cap: dict | None) -> str:
@@ -1656,7 +2673,18 @@ def render_cap(cap: dict | None) -> str:
                         ("spend_pct", "spend")):
         v = cap.get(key)
         if isinstance(v, (int, float)):
-            parts.append(f"{label} {v:g}%")
+            pace = None
+            if key == "weekly_pct":
+                pace = cap_pace(v, cap.get("weekly_resets_at"), hours=168,
+                                reserve_pct=10)
+            elif key == "session_pct":
+                pace = cap_pace(v, cap.get("session_resets_at"), hours=5)
+            if pace:
+                expected, severity = pace
+                parts.append(f'<span class="pace {severity}">{label} {v:g}% '
+                             f'(pace {expected}%)</span>')
+            else:
+                parts.append(f"{label} {v:g}%")
     if cap.get("spend_blocked"):
         parts.append("SPEND BLOCKED")
     body = " · ".join(parts) if parts else "no signal"
@@ -1665,7 +2693,7 @@ def render_cap(cap: dict | None) -> str:
                  "error": "unreadable"}.get(source, source)
     return (f'<span class="sep">·</span><span class="pct" '
             f'title="account usage cap — source: {E(src_label)}">'
-            f'cap {E(body)} ({E(src_label)})</span>')
+            f'cap {body} ({E(src_label)})</span>')
 
 
 def render_loop_costs(rows: list[dict] | None) -> str:
@@ -1768,18 +2796,15 @@ def render_body(s: dict) -> str:
         <div class="phead"><span class="k">Loops</span><span class="grow"></span>
           <span class="tick">persona · model · interval · heartbeat</span></div>
         <div class="pbody tight">{render_loops(s["loops"])}</div>
+        <div class="panel-subhead"><span class="k">Ephemeral queue</span><span class="grow"></span>
+          <span class="tick">in flight now · {len(s["ephemeral"])} dispatched</span></div>
+        <div class="pbody tight ephemeral-body">{render_ephemeral(s["ephemeral"])}</div>
       </section>
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Night-shift queue</span><span class="grow"></span>
           <span class="tick">the night shift</span></div>
         <div class="pbody tight scroll">{render_night(s["night"])}</div>
-      </section>
-
-      <section class="panel col-12">
-        <div class="phead"><span class="k">Ephemeral queue</span><span class="grow"></span>
-          <span class="tick">in flight now · {len(s["ephemeral"])} dispatched</span></div>
-        <div class="pbody tight">{render_ephemeral(s["ephemeral"])}</div>
       </section>
 
       <section class="panel col-12">
@@ -1826,7 +2851,7 @@ def render_body(s: dict) -> str:
 # sections client-side in place. Structure mirrors render_body but every dynamic
 # region is an empty id'd container that SHELL_JS fills from the JSON.
 
-def render_shell_body(s: dict) -> str:
+def render_shell_body(s: dict, *, brief_tick: str = "the briefer") -> str:
     return f'''
   <div class="wrap">
     <header class="masthead">
@@ -1852,18 +2877,15 @@ def render_shell_body(s: dict) -> str:
         <div class="phead"><span class="k">Loops</span><span class="grow"></span>
           <span class="tick">persona · model · interval · heartbeat</span></div>
         <div class="pbody tight" id="sec-loops"></div>
+        <div class="panel-subhead"><span class="k">Ephemeral queue</span><span class="grow"></span>
+          <span class="tick">in flight now · <span id="eph-count">0</span> dispatched</span></div>
+        <div class="pbody tight ephemeral-body" id="sec-ephemeral"></div>
       </section>
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Night-shift queue</span><span class="grow"></span>
           <span class="tick">the night shift</span></div>
         <div class="pbody tight scroll" id="sec-night"></div>
-      </section>
-
-      <section class="panel col-12">
-        <div class="phead"><span class="k">Ephemeral queue</span><span class="grow"></span>
-          <span class="tick">in flight now · <span id="eph-count">0</span> dispatched</span></div>
-        <div class="pbody tight" id="sec-ephemeral"></div>
       </section>
 
       <section class="panel col-12">
@@ -1886,7 +2908,7 @@ def render_shell_body(s: dict) -> str:
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Daily digest</span><span class="grow"></span>
-          <span class="tick">the briefer</span></div>
+          <span class="tick">{E(brief_tick)}</span></div>
         <div class="pbody" id="sec-brief"></div>
       </section>
 
@@ -1905,15 +2927,42 @@ def render_shell_body(s: dict) -> str:
   </div>'''
 
 
-def render_shell(s: dict) -> str:
+SHELL_SECTIONS = {
+    "loops": "sec-loops",
+    "ephemeral": "sec-ephemeral",
+    "night": "sec-night",
+    "focus": "sec-focus",
+    "pr_board": "sec-pr",
+    "mechanic": "sec-mech",
+    "brief": "sec-brief",
+    "ledger": "sec-ledger",
+}
+
+
+def render_shell(s: dict, *, extra_css: str = "", extra_js: str = "",
+                 unmanaged_sections: tuple[str, ...] = (),
+                 brief_tick: str = "the briefer") -> str:
+    """Render the live shell with explicit hooks for the primary UI layer.
+
+    ``unmanaged_sections`` removes regions from the base live updater so a
+    specialized renderer can own them. Extra CSS and JavaScript remain inlined,
+    preserving the dashboard's self-contained shell contract.
+    """
     title = f'🐱 {s["estate"]} / {s["operator"]} — estate dashboard'
-    body = render_shell_body(s)
+    body = render_shell_body(s, brief_tick=brief_tick)
+    sections = {k: v for k, v in SHELL_SECTIONS.items()
+                if k not in unmanaged_sections}
+    section_config = ("<script>window.OPS_DASH_SECTIONS="
+                      + json.dumps(sections, separators=(",", ":"))
+                      + ";</script>\n")
     return (f'<!doctype html>\n<html lang="en" data-theme="dark">\n<head>\n'
             f'<meta charset="utf-8">\n'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">\n'
             f'<link rel="icon" href="{FAVICON}">\n'
-            f'<title>{E(title)}</title>\n<style>{CSS}</style>\n</head>\n<body>\n{body}\n'
-            f'<script>{SHELL_JS}</script>\n</body>\n</html>\n')
+            f'<title>{E(title)}</title>\n<style>{CSS}\n{extra_css}</style>\n</head>\n'
+            f'<body>\n{body}\n{section_config}'
+            f'<script>{SOURCE_JS}\n{SHELL_JS}\n{ACK_JS}\n{extra_js}</script>\n'
+            f'</body>\n</html>\n')
 
 
 def render_fragment(s: dict) -> str:
@@ -1921,7 +2970,7 @@ def render_fragment(s: dict) -> str:
     title = f'{s["estate"]} / {s["operator"]} — estate dashboard'
     body = render_body(s)
     style = f"<style>{CSS}</style>"
-    script = f"<script>{JS}</script>"
+    script = f"<script>{JS}\n{SOURCE_JS}</script>"
     return f'<title>{E(title)}</title>\n{style}\n{body}\n{script}\n'
 
 
@@ -1964,21 +3013,18 @@ def main() -> int:
         print(f"wrote {json_out}  ({json_out.stat().st_size:,} bytes, --json)")
         return 0
 
-    # Default: also (re)write the static live shell and the Artifact fragment.
-    shell_out = STATE / "dashboard.html"
+    # Default: also (re)write the data-inlined Artifact fragment. The primary
+    # live shell is generated by bin/dashboard-index.
     frag_out = STATE / "dashboard.body.html"
-    shell = render_shell(snap)
     fragment = render_fragment(snap)
-    shell_out.write_text(shell, encoding="utf-8")
     frag_out.write_text(fragment, encoding="utf-8")
     print(f"wrote {json_out}  ({json_out.stat().st_size:,} bytes, data model)")
-    print(f"wrote {shell_out}  ({len(shell):,} bytes, Tier-1 live shell)")
     print(f"wrote {frag_out}  ({len(fragment):,} bytes, Artifact fragment)")
     v = snap["vitals"]
     print(f"  loops {v['loops_live']} live / {v['loops_ondemand']} on-demand · "
           f"needs-you {v['needs_you']} · astray {v['going_astray']} · "
           f"queued {v['queue_queued']} · proposals {v['proposals']}")
-    print("  serve locally:  bin/ops dashboard up")
+    print("  serve locally:  flox activate --start-services  ·  url: bin/ops dashboard")
     return 0
 
 

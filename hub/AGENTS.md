@@ -42,6 +42,15 @@ operator's requests directly through this agent-deck session (`attach` or
   message.
 - **The hub delegates; it never builds.** Route work to a loop's queue or a
   dispatched session; keep only routing plus a ledger line in this session.
+- **Never launch a worker into a shared clone.** A checkout's current branch and
+  working tree are shared mutable state: a second dispatch into the same repo
+  directory rewrites the ground under a still-running sibling, which then keeps
+  going against the wrong tree and reports success anyway. Every dispatch that
+  puts a worker in an external repo gets its own `git worktree add --detach`
+  first, and `agent-deck launch <dir>` points at that worktree —
+  unconditionally, not only when something else looks like it is running. Same
+  for the hub's own commits in a repo a dispatch might be using. Details and the
+  cleanup step: the hub skill's **Worktree isolation** section.
 - If a CLI tool is missing, re-run the command as:
   `flox activate -d .. -- <cmd>`
 - Never set or export `ANTHROPIC_API_KEY`. Recurring work runs in interactive

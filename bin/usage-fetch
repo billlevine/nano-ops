@@ -36,6 +36,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,10 +109,19 @@ def signal_from_api(data: dict) -> dict:
 def signal_from_local_estimate() -> dict:
     """Fallback: bin/dashboard's local host-only token estimate vs a
     configured soft budget. Imported rather than reimplemented so the
-    estimate logic lives in exactly one place."""
-    spec = importlib.util.spec_from_file_location("_dashboard", ROOT / "bin" / "dashboard")
+    estimate logic lives in exactly one place. build_usage now shares an
+    incremental transcript checkpoint (state/usage/transcript_cache.json) with
+    the dashboard refresher, so this fallback tails only the bytes appended
+    since the last pass instead of rescanning the whole tree — the redundant
+    full scan the efficiency scan flagged (finding #13) no longer happens."""
+    # bin/dashboard is extensionless, so spec_from_file_location() returns None
+    # (no loader inferred) and the old code AttributeError'd here — meaning this
+    # whole fallback crashed exactly when the OAuth token was unavailable, the
+    # case it exists to cover. Load it by explicit source loader instead.
+    loader = SourceFileLoader("_dashboard", str(ROOT / "bin" / "dashboard"))
+    spec = importlib.util.spec_from_loader("_dashboard", loader)
     dashboard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(dashboard)
+    loader.exec_module(dashboard)
 
     try:
         registry = tomllib.loads((ROOT / "loops.toml").read_text(encoding="utf-8"))

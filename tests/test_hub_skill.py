@@ -71,7 +71,7 @@ class TestSkillGuard(unittest.TestCase):
                 self.assertIn(GUARD, self.sections[heading].lower())
 
     def test_unset_channel_is_not_treated_as_an_outage(self):
-        body = self.sections["7. Control channel unreachable"]
+        body = self.sections["7. Control channel send — the parameter, and failures"]
         self.assertIn(GUARD, body.lower())
         self.assertRegex(flat(body), r"(?i)not a failure")
 

@@ -1,48 +1,286 @@
 #!/usr/bin/env python3
-"""dashboard-server — tiny localhost static server for the estate dashboard.
+"""dashboard-server — tiny server for the estate dashboard.
 
-Tier-1, LOCAL ONLY. Binds 127.0.0.1 and serves exactly two files from state/:
-dashboard.html (the live shell) and dashboard.json (the data model the shell
-polls). GET/HEAD only, strict allowlist — no directory listing, no traversal,
-no other paths — so nothing else under state/ (ledger, secrets, per-loop state)
-is ever exposed over HTTP. Pure reader: it only reads its own generated files.
+Tier-1. Serves the primary live shell, its polled dashboard data, and per-PR
+"seen" marks (dashboard-acks.json, as /acks.json), through a strict allowlist
+— no directory listing, no traversal, and no access to ledger, secrets, or
+per-loop state. GET/HEAD are read-only.
 
-Host/port come from loops.toml [dashboard] (default 127.0.0.1:8422).
+Two narrow, validated write endpoints. POST /ack records that the operator
+has seen a PR row's current activity signature — touches exactly one file,
+state/dashboard-acks.json, and can only ever store {id: {sig, at}} string
+pairs, bounded in count and length. POST /proposal-stage records one token-
+authenticated proposal review decision through the exact lifecycle operation
+the CLI uses. It cannot run arbitrary commands and does not invoke a shell.
 
-Tier-2 (serve from a second machine / remotely) is later JUST a config change
-here plus a reverse proxy + auth in front: flip [dashboard].host and put the
-authenticating proxy ahead of this process. The shell fetches dashboard.json
-with a *relative* URL, so nothing in the page changes. No auth/remote/tunnel
-lives here on purpose — this stays loopback-only for now.
+Host/port come from loops.toml [dashboard] (default 127.0.0.1:8422). THE BIND
+ADDRESS IS THAT CONFIG'S CALL, NOT THIS FILE'S — read the [dashboard] comment
+there for what the configured host actually exposes and why. This process has
+no identity layer of its own, so any host beyond loopback must be one whose
+reachability is already gated (a tailnet interface) or must have an
+authenticating reverse proxy in front. POST /ack inherits that posture; the
+more consequential POST /proposal-stage additionally requires the configured
+write token and is disabled without one. Both require application/json (so a
+cross-origin form POST cannot reach them without a preflight this server never
+answers) and emit no CORS headers. The
+shell fetches dashboard.json with a *relative* URL, so nothing in the page
+changes when the host does.
 """
 from __future__ import annotations
 
+import hmac
 import http.server
+import importlib.util
+import json
 import os
 import socketserver
+import sqlite3
 import sys
+import tempfile
+import threading
 import tomllib
+from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(REPO, "state")
-
-# Path -> (filename under state/, content-type). Nothing else is served.
-ALLOW = {
-    "/": ("dashboard.html", "text/html; charset=utf-8"),
-    "/dashboard.html": ("dashboard.html", "text/html; charset=utf-8"),
-    "/dashboard.json": ("dashboard.json", "application/json; charset=utf-8"),
-}
+ACKS = os.path.join(STATE, "dashboard-acks.json")
+ESTATE_DB = os.path.join(STATE, "estate.db")
 
 
-def config() -> tuple[str, int]:
+def write_token() -> str | None:
+    """The shared secret guarding write endpoints, from
+    state/secrets/dashboard-write-token (a plain-text file mirroring
+    state/secrets/slack-user-token). Resolved off STATE at REQUEST time so a
+    test that repoints STATE is honored.
+
+    An absent (or empty) file means write-protection is simply OFF — today's
+    behavior is unchanged. That back-compat is deliberate: no token file must
+    never hard-fail a write.
+    """
+    try:
+        with open(os.path.join(STATE, "secrets", "dashboard-write-token"),
+                  encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def write_authorized(headers) -> bool:
+    """True unless a token file exists and the request's X-Dashboard-Token
+    header does not match it (constant-time). Enforced BEFORE any mutation."""
+    expected = write_token()
+    if expected is None:
+        return True                      # write-protection off (back-compat)
+    supplied = headers.get("X-Dashboard-Token") or ""
+    return hmac.compare_digest(supplied, expected)
+
+
+def proposal_write_authorized(headers) -> bool:
+    """Proposal decisions are consequential and always fail closed.
+
+    ``/ack`` retains its historical no-token compatibility.  Estate lifecycle
+    writes do not: a configured, matching token is required before the request
+    body is read.
+    """
+    expected = write_token()
+    supplied = headers.get("X-Dashboard-Token") or ""
+    return expected is not None and hmac.compare_digest(supplied, expected)
+
+# Path -> (absolute filename, content-type). Nothing else is served.
+# A function, not a fixed dict: STATE/ACKS/REPO must resolve at REQUEST time,
+# not at module-import time, so a test (or anything else) that repoints
+# STATE/ACKS after import is honored rather than silently ignored.
+def _allow() -> dict[str, tuple[str, str]]:
+    return {
+        "/": (os.path.join(STATE, "index.html"), "text/html; charset=utf-8"),
+        "/index.html": (os.path.join(STATE, "index.html"), "text/html; charset=utf-8"),
+        "/dashboard.json": (os.path.join(STATE, "dashboard.json"), "application/json; charset=utf-8"),
+        "/acks.json": (ACKS, "application/json; charset=utf-8"),
+        "/estate.html": (os.path.join(STATE, "estate.html"), "text/html; charset=utf-8"),
+        # t-414 — the v2 surface, additive and read-only. Bare path and .html
+        # both resolve, the way / and /index.html already do, so "swap between
+        # the two" is one URL edit either direction.
+        "/dashboard-v2": (os.path.join(STATE, "dashboard-v2.html"), "text/html; charset=utf-8"),
+        "/dashboard-v2.html": (os.path.join(STATE, "dashboard-v2.html"), "text/html; charset=utf-8"),
+    }
+
+MAX_BODY = 64 * 1024      # an ack post is a few hundred bytes; this is slack
+MAX_IDS = 200             # more rows than the board can ever show
+MAX_FIELD = 200           # entry ids and 12-char signatures are far shorter
+ACK_TTL_DAYS = 120        # forget marks for PRs long gone from the board
+
+# The server is threaded, and an ack is a read-modify-write of one small file.
+# Serialize them so two clicks landing together cannot lose one.
+ACK_LOCK = threading.Lock()
+PROPOSAL_LOCK = threading.Lock()
+_ESTATE_MODULE = None
+
+
+def dashboard_config() -> dict:
     try:
         with open(os.path.join(REPO, "loops.toml"), "rb") as f:
             d = tomllib.load(f).get("dashboard", {})
-    except OSError:
-        d = {}
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def config() -> tuple[str, int]:
+    d = dashboard_config()
     host = d.get("host", "127.0.0.1")
     port = int(d.get("port", 8422))
     return host, port
+
+
+def decision_actor() -> str:
+    """Who a proposal decision made through this page is recorded AS.
+
+    A decision arrives from a browser with no identity of its own, so the actor
+    is an installation's own name for the person holding the write token —
+    [dashboard].decision_actor in loops.toml. Per the actor taxonomy this is a
+    TECHNICAL name, never a persona; the neutral default says only that a human
+    owner made it. Resolved per request so a config edit needs no restart.
+    """
+    name = str(dashboard_config().get("decision_actor") or "").strip()
+    return name or "owner"
+
+
+def load_acks() -> dict:
+    """{id: {"sig","at"}} from disk. Anything unreadable/malformed reads empty
+    rather than raising — a corrupt marks file must never take the board down."""
+    try:
+        with open(ACKS, "rb") as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    acks = doc.get("acks") if isinstance(doc, dict) else None
+    if not isinstance(acks, dict):
+        return {}
+    return {k: v for k, v in acks.items()
+            if isinstance(k, str) and isinstance(v, dict)
+            and isinstance(v.get("sig"), str)}
+
+
+def save_acks(acks: dict) -> None:
+    """Atomic replace, so a reader never sees a half-written marks file."""
+    doc = {"version": 1, "acks": acks}
+    os.makedirs(STATE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".dashboard-acks.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2, sort_keys=True)
+        os.replace(tmp, ACKS)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def prune(acks: dict, now: datetime) -> dict:
+    """Drop marks older than ACK_TTL_DAYS. Entries leave the board when they
+    merge or get archived and never come back, so their marks would otherwise
+    accumulate forever; there is no entry list here to diff against."""
+    cutoff = now - timedelta(days=ACK_TTL_DAYS)
+    out = {}
+    for k, v in acks.items():
+        try:
+            at = datetime.fromisoformat(str(v.get("at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            out[k] = v          # unparseable stamp: keep, don't silently drop
+            continue
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        if at >= cutoff:
+            out[k] = v
+    return out
+
+
+def apply_ack(payload: object, now: datetime) -> dict:
+    """Merge {"ids":[{"id","sig"},...]} into the marks file; return the new map.
+
+    Rejects anything that is not a short string pair, so the file can only ever
+    hold what the board itself put there.
+    """
+    ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list):
+        raise ValueError("expected {\"ids\": [...]}")
+    if len(ids) > MAX_IDS:
+        raise ValueError("too many ids")
+    stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with ACK_LOCK:
+        return _merge(ids, stamp, now)
+
+
+def _merge(ids: list, stamp: str, now: datetime) -> dict:
+    acks = load_acks()
+    for item in ids:
+        if not isinstance(item, dict):
+            raise ValueError("each id must be an object")
+        eid, sig = item.get("id"), item.get("sig")
+        if not isinstance(eid, str) or not isinstance(sig, str):
+            raise ValueError("id and sig must be strings")
+        if not eid or not sig or len(eid) > MAX_FIELD or len(sig) > MAX_FIELD:
+            raise ValueError("id or sig out of range")
+        acks[eid] = {"sig": sig, "at": stamp}
+    acks = prune(acks, now)
+    save_acks(acks)
+    return acks
+
+
+def _load_estate():
+    """Load the extensionless CLI module used by both write surfaces.
+
+    The returned ``apply_proposal_stage`` function is also what the CLI calls;
+    the server does not reimplement transitions and does not invoke a shell.
+    """
+    global _ESTATE_MODULE
+    if _ESTATE_MODULE is not None:
+        _ESTATE_MODULE.STATE_DIR = os.path.dirname(ESTATE_DB)
+        _ESTATE_MODULE.DB_PATH = ESTATE_DB
+        return _ESTATE_MODULE
+    source = os.path.join(REPO, "bin", "estate")
+    name = "_dashboard_estate_write"
+    loader = SourceFileLoader(name, source)
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    module.STATE_DIR = os.path.dirname(ESTATE_DB)
+    module.DB_PATH = ESTATE_DB
+    _ESTATE_MODULE = module
+    return module
+
+
+def apply_proposal_decision(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("expected a JSON object")
+    allowed = {"id", "expected_stage", "stage", "note"}
+    if set(payload) - allowed:
+        raise ValueError("unexpected proposal decision field")
+    key = payload.get("id")
+    expected = payload.get("expected_stage")
+    target = payload.get("stage")
+    note = payload.get("note")
+    if not all(isinstance(v, str) for v in (key, expected, target, note)):
+        raise ValueError("id, expected_stage, stage and note must be strings")
+    if not key or len(key) > 32 or not note.strip() or len(note) > 2000:
+        raise ValueError("id or decision note out of range")
+    # The CLI module's NOW is process-local because a CLI invocation is short.
+    # Serialize this tiny write surface and refresh that clock per request so a
+    # long-lived server preserves the same semantics without a second clock.
+    with PROPOSAL_LOCK:
+        estate = _load_estate()
+        estate.NOW = datetime.now(timezone.utc)
+        try:
+            return estate.apply_proposal_stage(
+                key, target, note, decision_actor(), expected_stage=expected)
+        except estate.ProposalStageConflict as exc:
+            raise RuntimeError(str(exc)) from exc
+        except estate.ProposalStageError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -59,22 +297,113 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _json(self, code: int, obj: object) -> None:
+        self._send(code, json.dumps(obj).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
-        entry = ALLOW.get(path)
+        entry = _allow().get(path)
         if entry is None:
             self._send(404, b"not found\n")
             return
-        name, ctype = entry
+        filename, ctype = entry
         try:
-            with open(os.path.join(STATE, name), "rb") as f:
+            with open(filename, "rb") as f:
                 body = f.read()
         except OSError:
+            if path == "/acks.json":
+                # Nothing acknowledged yet is a normal state, not an outage.
+                self._send(200, b'{"version":1,"acks":{}}\n', ctype)
+                return
             self._send(503, b"dashboard not generated yet - run bin/dashboard\n")
             return
         self._send(200, body, ctype)
 
     do_HEAD = do_GET
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/ack":
+            self._handle_ack()
+        elif path == "/proposal-stage":
+            self._handle_proposal_stage()
+        else:
+            self._send(404, b"not found\n")
+
+    def _read_json(self) -> object:
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+        if ctype != "application/json":
+            raise TypeError("expected application/json")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            raise OverflowError("bad or oversized body")
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("malformed json") from exc
+
+    def _handle_proposal_stage(self) -> None:
+        if write_token() is None:
+            self._json(503, {"error": "proposal decisions are not configured; "
+                             "set state/secrets/dashboard-write-token"})
+            return
+        if not proposal_write_authorized(self.headers):
+            self._send(401, b"unauthorized\n")
+            return
+        try:
+            payload = self._read_json()
+        except TypeError as exc:
+            self._json(415, {"error": str(exc)}); return
+        except OverflowError as exc:
+            self._json(413, {"error": str(exc)}); return
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)}); return
+        try:
+            result = apply_proposal_decision(payload)
+        except RuntimeError as exc:
+            self._json(409, {"error": str(exc)}); return
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)}); return
+        except (OSError, sqlite3.Error) as exc:
+            self._json(500, {"error": f"cannot persist proposal decision: {exc}"}); return
+        self._json(200, result)
+
+    def _handle_ack(self) -> None:
+        # Write-protection gate: reject a missing/wrong token before anything is
+        # read from the body or any state file is touched. When no token file is
+        # configured, write_authorized() returns True and behavior is unchanged.
+        if not write_authorized(self.headers):
+            self._send(401, b"unauthorized\n")
+            return
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+        if ctype != "application/json":
+            self._send(415, b"expected application/json\n")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            self._send(413, b"bad or oversized body\n")
+            return
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (OSError, json.JSONDecodeError):
+            self._send(400, b"malformed json\n")
+            return
+        try:
+            acks = apply_ack(payload, datetime.now(timezone.utc))
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._json(500, {"error": f"cannot persist acks: {exc}"})
+            return
+        self._json(200, {"version": 1, "acks": acks})
 
     def log_message(self, *_a) -> None:  # keep the service log quiet
         pass
@@ -90,7 +419,7 @@ def main() -> int:
     try:
         with Server((host, port), Handler) as srv:
             print(f"dashboard-server: serving state/ (allowlist) at "
-                  f"http://{host}:{port}/dashboard.html", flush=True)
+                  f"http://{host}:{port}/", flush=True)
             srv.serve_forever()
     except OSError as exc:
         sys.exit(f"dashboard-server: cannot bind {host}:{port}: {exc}")

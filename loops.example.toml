@@ -76,11 +76,23 @@ deck_profile = "ops"
 
 [dashboard]
 # bin/dashboard-server binds here; bin/dashboard links to it in its output.
-# Port 8522 (not the operations default 8422) so this prototype can run
-# ALONGSIDE a live operations dashboard-server on the same host without a
-# bind conflict. Loopback only by design — Tier-1 local dashboard.
+# Port 8522 (not the 8422 default) so this can run ALONGSIDE another estate's
+# dashboard-server on the same host without a bind conflict. Loopback only by
+# design — Tier-1 local dashboard.
 host = "127.0.0.1"
 port = 8522
+
+# Header labels for the rendered pages. Both are optional and both fall back to
+# the [hub] identity above ([hub].estate and [hub].persona), so an install that
+# named itself once up there does not have to name itself again.
+# estate_name = "ops"
+# operator_name = "ops"
+
+# Who a proposal decision made through the dashboard is recorded AS. A decision
+# arrives from a browser with no identity of its own, so this is the
+# installation's own name for whoever holds the write token — a TECHNICAL actor
+# name, never a persona. Unset, decisions are recorded as "owner".
+# decision_actor = "owner"
 
 # [loops.<name>] — one block per loop this hub manages. This is the shape
 # `bin/ops health`, the hub skill's health pass, and bin/dashboard all read.
