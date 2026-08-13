@@ -77,12 +77,14 @@ on-activate = '''
     cp "$FLOX_ENV_PROJECT/personas/config.example.toml" \
        "$FLOX_ENV_PROJECT/personas/config.toml"
   fi
-  # Render the static dashboard shell once (token-free, ~3s). The
-  # dashboard-refresh service then keeps state/dashboard.json fresh and the
-  # shell re-polls it in place. Guarded on the shell's existence (runs once)
-  # and best-effort so it never blocks or fails activation.
-  if [ ! -f "$FLOX_ENV_PROJECT/state/dashboard.html" ]; then
+  # Render the data model and the served shells once (token-free, ~3s). The
+  # shells are DATA-FREE — they fetch state/dashboard.json at runtime — so the
+  # dashboard-refresh service keeps that JSON fresh and the pages re-poll it in
+  # place. Guarded on the primary shell's existence (runs once) and best-effort
+  # so it never blocks or fails activation.
+  if [ ! -f "$FLOX_ENV_PROJECT/state/index.html" ]; then
     python3 "$FLOX_ENV_PROJECT/bin/dashboard" >/dev/null 2>&1 || true
+    python3 "$FLOX_ENV_PROJECT/bin/dashboard-index" >/dev/null 2>&1 || true
   fi
 '''
 
@@ -125,7 +127,8 @@ dashboard-refresh.command = '''
   done
 '''
 
-# dashboard-server — localhost-only static server for state/dashboard.{html,json}.
+# dashboard-server — localhost-only server for the generated shells
+# (state/index.html, estate.html, dashboard-v2.html) plus state/dashboard.json.
 # Reads host/port from loops.toml [dashboard]; the seeded loops.toml uses
 # 127.0.0.1:8522 so this coexists with a live operations dashboard-server
 # (default :8422) on the same host. Wrapped so a bind error or crash restarts.

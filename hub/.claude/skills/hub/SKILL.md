@@ -255,12 +255,60 @@ At the end of EVERY tick, write the current unix time to
 liveness signal `bin/ops up` uses to detect a dead loop after a restart —
 scheduled `/loop` wakeups do not survive a process restart.
 
-## 7. Control channel unreachable
+## 7. Control channel send — the parameter, and failures
 
-This section is about a channel that is CONFIGURED and failing. An unset
+This section is about a channel that is CONFIGURED. An unset
 `slack_channel_id` is not a failure — that is channel-less mode (§0), and it
 never produces an error ledger line or a retry.
 
-If the channel's MCP calls fail: append a ledger entry (kind `"error"`), still
-run the health pass, and let the next tick retry (cap effective backoff at 10m).
-When the channel recovers, mention the gap in CHANNEL.
+**Check the send tool's own parameter names against its schema, not against
+the underlying service's API docs.** A field the web API calls `text` may be
+named something else by the tool wrapping it; guessing produces an empty
+message the service rejects (`no_text`), nothing reaches the operator, and the
+failure looks exactly like an outage from here. Verify against the schema if a
+send ever fails this way — and do not infer it from this file either.
+
+**Scan the text first.** Every send is preceded by the **Never a bare key**
+scan in §3: bare item references become links. It is one re-read of your own
+draft, done before the call rather than after the operator asks why they have
+to search for an id you already had.
+
+### A failed send is one of two different things
+
+Before retrying anything, classify it. Getting this wrong is expensive:
+
+**(a) The call is malformed — retrying is futile.** `no_text`,
+`invalid_arguments`, `channel_not_found`, `missing_scope`, `not_in_channel`.
+These are deterministic. The identical call will fail the identical way
+forever, and every retry burns a tick while the operator hears nothing. **Do
+not back off and retry.** Fix the call — check the parameter names first — and
+send again this tick. If you cannot work out the correct call, treat it as (c)
+below immediately; do not sit in a retry loop.
+
+**(b) The service is genuinely unreachable** — transport errors, 5xx,
+timeouts, `ratelimited`. This is the retry case: append a ledger entry (kind
+`"error"`), still run the health pass, and let the next tick retry (cap
+effective backoff at 10m). When it recovers, mention the gap in CHANNEL.
+
+**(c) Either kind has persisted past 3 consecutive failures.** Stop calling it
+an outage — you do not have evidence for that, and after 3 identical errors
+(a) is far more likely than (b). The operator is not hearing you, so the
+priority is a different route, not a better retry:
+
+    agent-deck session send "<a live session the operator is in>" "⚙️ <what they need to know>"
+
+Say in the relay that sends are failing, give the **exact error string**, and
+say what is queued up undelivered. An error string is diagnosable by someone
+else; "the channel is down" is not, and if it is actually (a) it is also false.
+
+Ledger the escalation. Never let a send failure silently swallow content that
+was supposed to reach the operator — an unsent acknowledgment is worse than a
+late one, because from their side nothing distinguishes it from work never
+done.
+
+### Do not send an empty message
+
+If a tick produces nothing worth saying, say nothing. A quiet tick is a normal
+outcome and needs no channel call at all. Sending an empty or content-free
+message is not a heartbeat — it fails with `no_text`, which then reads as an
+outage and starts the loop above over something that was never worth sending.

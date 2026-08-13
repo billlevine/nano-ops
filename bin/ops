@@ -52,11 +52,13 @@ print(d.get("host", "127.0.0.1"), int(d.get("port", 8422)))
 PY
 }
 
-registry_autostart() {  # emit "<title>\t<name>\t<secs>\t<interval>" per autostart loop
-  # One row for each [loops.*] with autostart=true, tab-separated: the session
-  # TITLE ("<persona> (<name>)", matching the hub skill §5), the loop name, the
-  # interval in seconds (-1 if unparseable, e.g. "on-demand"), and the raw
-  # interval string.
+registry_autostart() {  # one row per autostart loop, tab-separated
+  # "<title>\t<name>\t<secs>\t<interval>\t<dir>\t<skill>\t<model>" for each
+  # [loops.*] with autostart=true: the session TITLE ("<persona> (<name>)",
+  # matching the hub skill §5), the loop name, the interval in seconds (-1 if
+  # unparseable, e.g. "on-demand"), the raw interval string, and the three
+  # fields the restart commands health prints need — dir, skill, registry
+  # model.
   python3 - "$REPO/loops.toml" <<'PY'
 import sys, tomllib
 UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -75,8 +77,26 @@ for name, c in loops.items():
     persona = (c.get("persona") or "").strip()
     title = f"{persona} ({name})" if persona else name
     iv = c.get("interval", "")
-    print("\t".join([title, name, str(secs(iv)), iv]))
+    print("\t".join([title, name, str(secs(iv)), iv,
+                     c.get("dir", "") or f"loops/{name}",
+                     c.get("skill", "") or name,
+                     c.get("model", "") or ""]))
 PY
+}
+
+interval_secs() {  # "<interval string>" -> seconds, or -1 if unparseable
+  # The same conversion registry_autostart does in python, available to bash
+  # for the per-loop pace override (which is a /loop interval argument, not a
+  # registry field).
+  local iv="${1:-}" n u
+  n="${iv%?}"; u="${iv: -1}"
+  case "$u" in
+    s) [ -n "$n" ] && [[ "$n" =~ ^[0-9]+$ ]] && { echo $((n));         return; } ;;
+    m) [ -n "$n" ] && [[ "$n" =~ ^[0-9]+$ ]] && { echo $((n * 60));    return; } ;;
+    h) [ -n "$n" ] && [[ "$n" =~ ^[0-9]+$ ]] && { echo $((n * 3600));  return; } ;;
+    d) [ -n "$n" ] && [[ "$n" =~ ^[0-9]+$ ]] && { echo $((n * 86400)); return; } ;;
+  esac
+  echo -1
 }
 
 # ── doctor ───────────────────────────────────────────────────────────────────
@@ -178,9 +198,32 @@ cmd_status() {
 # needs-start/needs-kick lines it emits (still applying its own crash-loop
 # breaker before restarting). Session TITLE is "<persona> (<name>)"; heartbeat
 # is state/<name>/last_tick (epoch seconds).
+#
+# Every anomaly line is followed by an indented "→" line carrying the EXACT
+# command that fixes it, with the loop's registry interval already inside the
+# `/loop <interval> /<skill>` argument. The interval is otherwise something the
+# operator re-derives from loops.toml by hand at restart time, and a hand-typed
+# `/loop /<skill>` that drops it silently puts the loop on dynamic self-pacing
+# — which looks healthy for hours. A restart re-armed from this line cannot
+# drop the interval, because nobody types one.
+#
+# PACE OVERRIDE. The registry interval is the DEFAULT, not a prohibition: an
+# operator may deliberately put one loop on another cadence, including dynamic
+# self-pacing. What they cannot do is put one there silently.
+# `state/<name>/pace-override` is where that choice is recorded, and it reuses
+# this function's own 2*x+120 staleness formula rather than adding a second
+# one: it holds ONE token, either a /loop interval argument ("60m") or the word
+# `dynamic`. Deliberately NOT named `pace` — state/hub/pace holds a scheduler
+# delay in seconds and this holds the argument typed into `/loop`; same idea,
+# different units, and one filename meaning both is how they get confused.
+# An override prints an `off-registry` line on EVERY pass, so the deviation is
+# never the invisible state. A `dynamic` loop is reported with NO liveness
+# verdict at all: a self-pacing loop and a dead one produce the same stale
+# heartbeat, and this says so out loud instead of guessing.
 cmd_health() {
-  local now anomalies=0 loops=0
-  local title name secs interval thresh st last age t
+  local now anomalies=0 overrides=0 loops=0
+  local title name secs interval dir skill model thresh st last age t
+  local pace_file pace pace_secs kick_interval basis
   now=$(date +%s)
   # ONE structured read for the whole sweep — `ls --json` carries the same
   # Status a per-session `show` prints, with untruncated titles, so we index by
@@ -211,19 +254,48 @@ for s in (data if isinstance(data, list) else []):
     print(t.replace("\t", " ").replace("\n", " ") + "\t" + st.replace("\t", " "))
 PY
 )
-  while IFS=$'\t' read -r title name secs interval; do
+  while IFS=$'\t' read -r title name secs interval dir skill model; do
     [ -n "$name" ] || continue
     loops=$((loops + 1))
     if [ "$secs" -le 0 ]; then
       echo "needs-attn   $title — unparseable interval '${interval}' in loops.toml"
       anomalies=$((anomalies + 1)); continue
     fi
-    thresh=$((secs * 2 + 120))
+    # The interval this loop is re-armed with, and the basis its heartbeat is
+    # judged against. Both come from the registry unless state/<name>/pace-
+    # override replaces them — and an override is reported, never assumed.
+    kick_interval="$interval"; basis="$interval"; thresh=$((secs * 2 + 120))
+    pace_file="$REPO/state/$name/pace-override"
+    pace=""
+    if [ -f "$pace_file" ]; then
+      pace="$(tr -d '[:space:]' < "$pace_file" 2>/dev/null || true)"
+    fi
+    if [ -n "$pace" ]; then
+      overrides=$((overrides + 1))
+      last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
+      age=$((now - last))
+      if [ "$pace" = "dynamic" ]; then
+        # Self-pacing by instruction. There is no expected interval, so there
+        # is no threshold — and a heartbeat age is a fact, not a verdict.
+        echo "off-registry $title — self-paced by override (state/$name/pace-override = dynamic); registry says ${interval}. Deliberate, so no kick and NO liveness verdict: last tick ${age}s ago, and a self-pacing loop is indistinguishable from a dead one."
+        echo "             → restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  agent-deck session send \"$title\" \"/loop $interval /$skill\""
+        continue
+      fi
+      pace_secs=$(interval_secs "$pace")
+      if [ "$pace_secs" -le 0 ]; then
+        echo "needs-attn   $title — unreadable pace override '${pace}' in state/$name/pace-override (want a /loop interval like '60m', or 'dynamic')"
+        anomalies=$((anomalies + 1)); continue
+      fi
+      kick_interval="$pace"; basis="$pace"; thresh=$((pace_secs * 2 + 120))
+      echo "off-registry $title — paced at ${pace} by override (state/$name/pace-override); registry says ${interval}. Deliberate, so no kick: freshness is judged against ${thresh}s = 2*${pace}+120, and last tick was ${age}s ago."
+      echo "             → restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  agent-deck session send \"$title\" \"/loop $interval /$skill\""
+    fi
     # Absent from the ls --json read = no such session (never launched, or
     # removed) — that's a `launch`, not a `start`, so keep it distinct from a
     # registered-but-stopped session below.
     if [ -z "${DECK_STATUS[$title]+x}" ]; then
       echo "needs-start  $title — unregistered (no agent-deck session) → launch"
+      echo "             → agent-deck launch $REPO/$dir -c claude -t \"$title\" -g \"$DECK_GROUP\"${model:+ -model $model} -m \"/loop $kick_interval /$skill\""
       anomalies=$((anomalies + 1)); continue
     fi
     st="${DECK_STATUS[$title]}"
@@ -234,7 +306,8 @@ PY
         last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
         age=$((now - last))
         if [ "$age" -gt "$thresh" ]; then
-          echo "needs-kick   $title — alive but stale (last tick ${age}s ago > ${thresh}s = 2*${interval}+120)"
+          echo "needs-kick   $title — alive but stale (last tick ${age}s ago > ${thresh}s = 2*${basis}+120). A dead wakeup chain and a loop running off its cadence look identical from here."
+          echo "             → agent-deck session send \"$title\" \"/loop $kick_interval /$skill\""
           anomalies=$((anomalies + 1))
         fi
         ;;
@@ -242,12 +315,17 @@ PY
         # Registered but stopped/errored (or no Status line): the /loop wakeup
         # died with the process — revive with `session start` + kick.
         echo "needs-start  $title — session ${st:-unknown} (stopped/errored) → start + kick"
+        echo "             → agent-deck session start \"$title\"  &&  sleep 10  &&  agent-deck session send \"$title\" \"/loop $kick_interval /$skill\""
         anomalies=$((anomalies + 1))
         ;;
     esac
   done < <(registry_autostart)
   if [ "$anomalies" -eq 0 ]; then
-    echo "ok  all ${loops} autostart loops healthy (alive + fresh heartbeat)"
+    if [ "$overrides" -eq 0 ]; then
+      echo "ok  all ${loops} autostart loops healthy (alive + fresh heartbeat)"
+    else
+      echo "ok  ${loops} autostart loops healthy; ${overrides} off-registry by override (above) — deliberate, not an anomaly"
+    fi
   fi
 }
 
@@ -301,7 +379,7 @@ cmd_services() {
 cmd_dashboard() {
   local sub="${1:-url}" host port url
   read -r host port < <(dash_hostport)
-  url="http://${host}:${port}/dashboard.html"
+  url="http://${host}:${port}/"
   case "$sub" in
     url|"") echo "$url" ;;
     status)
@@ -406,14 +484,35 @@ usage() {
   sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
+# Refuse arguments this dispatcher would otherwise drop on the floor.
+#
+# Every branch below forwards at most one sub-verb, so anything past it was
+# silently ignored. That is a bad failure mode for a CLI whose subcommands
+# restart live sessions: `ops compact run --help`, typed as a safety probe to
+# print usage, is otherwise indistinguishable from `ops compact run` and
+# performs a real forced restart of the caller's own session.
+#
+# An unrecognized argument now stops the command before it does anything.
+# Bounds are per-subcommand: `max_args 0` for the ones taking none, `1` for
+# the ones taking a single sub-verb.
+max_args() {
+  local limit=$1 cmd=$2; shift 2
+  if [ "$#" -gt "$limit" ]; then
+    shift "$limit"
+    echo "ops: unexpected argument for '$cmd': $1" >&2
+    echo "ops $cmd takes $limit argument(s). Nothing was run." >&2
+    exit 2
+  fi
+}
+
 case "${1:-}" in
-  up)        cmd_up ;;
-  status)    cmd_status ;;
-  health)    cmd_health ;;
-  doctor)    cmd_doctor ;;
+  up)        max_args 0 up        "${@:2}"; cmd_up ;;
+  status)    max_args 0 status    "${@:2}"; cmd_status ;;
+  health)    max_args 0 health    "${@:2}"; cmd_health ;;
+  doctor)    max_args 0 doctor    "${@:2}"; cmd_doctor ;;
   services)  shift; cmd_services "$@" ;;
-  dashboard) cmd_dashboard "${2:-}" ;;
-  compact)   cmd_compact "${2:-}" ;;
+  dashboard) max_args 1 dashboard "${@:2}"; cmd_dashboard "${2:-}" ;;
+  compact)   max_args 1 compact   "${@:2}"; cmd_compact "${2:-}" ;;
   -h|--help|help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
