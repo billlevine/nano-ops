@@ -18,6 +18,12 @@
 # copy and the core's can never diverge into a conflict.
 /docs/ideas.md
 
+# The same, for the other file the estate GENERATES into docs/. `bin/estate
+# memory render --write` writes this from the shared memory rows, so its
+# contents are one estate's distilled history and never core. Ignored rather
+# than absent so a render in a fresh clone cannot stage a diary by accident.
+/docs/lessons.md
+
 # Persona selection is installation policy — which roles your estate has, and
 # which sessions wear them. personas/config.example.toml is the committed
 # documented form. compiled/ and the persona.md sidecars are generated from it
