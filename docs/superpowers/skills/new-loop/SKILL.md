@@ -96,9 +96,13 @@ and calls the script for I/O. Put its tests next to it and run them.
 `loops.toml` is gitignored — it is the per-installation registry, and it is
 the only place a loop is declared. `loops.example.toml` is the committed
 template documenting its shape; copy it once (`cp loops.example.toml
-loops.toml`) and add a block per loop. No real loop ships in this repo: a loop
-is where installation policy concentrates, and the allowlist rule keeps policy
-out of the core.
+loops.toml`) and add a block per loop. Almost no real loop ships in this repo:
+a loop is where installation policy concentrates, and the allowlist rule keeps
+policy out of the core. `loops/mechanic/` is the exception that proves it — it
+diagnoses an installation against what that installation itself has written, so
+it names no operator, repo or channel — and `loops.example.toml` registers it,
+which is the one entry a fresh clone can read as a worked example rather than a
+template.
 
 ```toml
 [loops.<name>]
