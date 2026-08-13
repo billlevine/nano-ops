@@ -223,3 +223,6 @@ gets silently forgotten. That is the whole reason the store shape exists.
 - [ ] worktree isolation + approval gate — if it touches another repo
 - [ ] durable state follows `history.jsonl` or the `{store, ledger}` shape
 - [ ] tests run and read; `loops.toml` parses; `bin/ops health` still clean
+- [ ] non-obvious surprises recorded with `bin/estate memory add`, then
+      `bin/estate memory render --write` — never by editing `docs/lessons.md`,
+      which is rendered from the shared store and would be overwritten
