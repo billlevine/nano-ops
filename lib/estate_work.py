@@ -35,6 +35,21 @@ already exists somewhere else in the estate, by calling it:
   attention      lib/estate_attention.is_attention — an open follow-up, or a
                  task parked at `needs-owner`. Docs: docs/attention-contract.md.
   followup       the `refs` envelope `bin/followups` writes and reads.
+  decision_      the question, the recommendation and the one-line context a
+  surface        collapsed row must show (t-476). One rule, two renderers: the
+                 CLI's grouped review view imports `decision_surface()` and the
+                 dashboard reads the key it puts on every task, so neither can
+                 decide on its own which `refs` key is "the question".
+  tier           lib/estate_attention.tier — which of the three kinds of
+                 waiting one attention row is (t-721). Derived from the same
+                 `status`/`kind`/`stage` the set itself is derived from.
+  idle_days      lib/estate_attention.idle_days, compared only against its own
+                 tier's median. Age is neglect, not importance.
+  decision_      whether a row DECLARED a classification and, for a decision,
+  state          whether it carries the whole sketch. A reading of what is on
+                 file, never a repair of it — the four words are in
+                 docs/decision-classification-contract.md's vocabulary and
+                 `unstated` is an answer.
 
 A TERMINAL TASK HAS NO DUE STATE
 --------------------------------
@@ -68,6 +83,7 @@ import datetime as dt
 import json
 
 import estate_attention
+import estate_decisions
 import estate_deps
 
 # A task in one of these is finished. Same tuple as bin/estate's TERMINAL and
@@ -92,7 +108,29 @@ MESSAGE_FIELDS = ("message_id", "channel", "message_ts", "thread_ts", "inbox")
 PROPOSAL_STAGES = ("pending-review", "approved-backlog", "rejected",
                    "resolved", "stopped")
 PROPOSAL_FIELDS = ("fingerprint", "condition", "desired_outcome",
-                   "completion_check")
+                   "completion_check", "classification", "question",
+                   "alternatives", "recommendation", "defer_consequence")
+
+# t-476. WHICH STORED FIELD IS "THE QUESTION", AND WHICH IS "THE RECOMMENDATION"
+#
+# A collapsed row has to carry the decision itself, and no writer in this estate
+# has ever stored a field called `question`. What it stores is `condition` — the
+# observation the proposal was filed about — and `desired_outcome`, which the
+# review grid has always labelled "Recommendation". So the answer is a
+# PRECEDENCE, not a rename: an explicit key wins if some future writer records
+# one, the field that exists today answers otherwise, and the row says which one
+# it used so a reader is never shown an observation while being told it is a
+# question. Absent means absent: nothing here falls back to the title, because a
+# title paraphrased into a question is a question this estate never asked.
+#
+# Ordered most-explicit-first. Adding a key here is how a new schema takes over
+# a surface, and it takes over both renderers at once.
+QUESTION_FIELDS = ("question", "condition")
+RECOMMENDATION_FIELDS = ("recommendation", "desired_outcome")
+# The one line of a follow-up that says why it is waiting. `context` is the
+# envelope's own field; `intent` is the task column a `needs-owner` row that is
+# not a follow-up carries instead, and it is the same kind of sentence.
+CONTEXT_FIELDS = ("context", "intent")
 
 # The follow-up compatibility envelope, exactly as `bin/followups` writes it
 # into `refs`. Decoded once here so no reader has to know the envelope's shape
@@ -101,6 +139,16 @@ PROPOSAL_FIELDS = ("fingerprint", "condition", "desired_outcome",
 # printed it.
 FOLLOWUP_FIELDS = ("legacy_id", "source", "ref", "context", "resolution",
                    "attention_key")
+
+# The field each surface is ALREADY understood to mean, so a renderer knows
+# when to name its source and when to keep quiet. `desired_outcome` has been
+# labelled "Recommendation" in the review grid since proposals existed, so
+# saying "from desired_outcome" on every row would be noise. `condition` under
+# "Question" is not noise: an observation is not a question, and a reader
+# deciding on it should know the difference.
+SURFACE_CANONICAL = {"question": "question",
+                     "recommendation": "desired_outcome",
+                     "context": "context"}
 
 # The id of the synthetic "work that belongs to no project" bucket. Not a
 # project id — `estate project add` mints `p-N`, so this can never collide.
@@ -169,7 +217,216 @@ def proposal_view(task: dict) -> dict | None:
                                       "completion_check"))
     out["recurrences"] = 0
     out["last_recurrence_at"] = None
+    # t-476. Which key answers "the question" and which answers "the
+    # recommendation", resolved once here so the collapsed row does not decide.
+    # The NAME always ships; the TEXT only when the answering key is not
+    # already in this envelope, because `condition` and `desired_outcome` are
+    # right there and shipping either twice is the duplication §4.6 refused for
+    # a general decoded-refs blob. A renderer reads `question` if present and
+    # `out[question_field]` otherwise.
+    surface = decision_surface(task)
+    for name in ("question", "recommendation"):
+        field = surface[f"{name}_field"]
+        out[f"{name}_field"] = field
+        if field is not None and field not in PROPOSAL_FIELDS:
+            out[name] = surface[name]
     return out
+
+
+# ── t-476: the decision a collapsed row has to carry ─────────────────────────
+
+def _first_present(source, fields) -> tuple[str | None, str | None]:
+    """(text, which field it came from), or (None, None) if none is recorded.
+
+    Whitespace-only is not recorded. A field present and blank is the same
+    absence as a field that was never written, and treating them differently
+    would put an empty box on the page under a confident label.
+    """
+    for field in fields:
+        value = source.get(field)
+        text = str(value).strip() if value is not None else ""
+        if text:
+            return text, field
+    return None, None
+
+
+def first_line(text: str | None) -> str | None:
+    """The first non-empty line of a block, or None.
+
+    A LINE, which is all this ever claimed to be — and on this store most
+    context blobs contain no newline at all, so on its own it returns the whole
+    500-character paragraph. `one_line()` below is what a summary actually
+    needs; this stays because "the first line" is still the first step of it.
+    """
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        if line.strip():
+            return line.strip()
+    return None
+
+
+# t-721. HOW LONG A SUMMARY LINE MAY BE, AND WHY THERE ARE TWO NUMBERS
+#
+# Measured against a real set, most titles run well past a line and the long
+# tail runs to hundreds of characters — and the "one-line" context strip that
+# was supposed to clarify a long title is LONGER than the title on most rows,
+# because `first_line()` cuts at a newline and most blobs have none. The
+# clarifier ends up several times longer than the thing it clarifies.
+#
+# So the headline is the shorter of the two: it is the row's identity and it
+# shares a line with the badges. The context line is allowed more room because
+# it is the sentence that says WHY, and it sits on its own line under it.
+# Neither number is a display detail the browser could pick on its own — the
+# CLI's grouped review renders the same rows, and two clamps drift.
+HEADLINE_MAX = 80
+CONTEXT_LINE_MAX = 120
+# What a clamped string ends in. One character, so a clamp never costs a reader
+# three characters of the text they were trying to read.
+ELLIPSIS = "…"
+
+
+def clamp(text: str | None, limit: int) -> tuple:
+    """(text clamped to `limit` characters, whether it had to be), or (None,
+    False) for nothing at all.
+
+    Cuts on a word boundary when one falls in the last third of the budget, so
+    a clamp reads as a sentence that stops rather than one chopped mid-token,
+    and falls back to a hard cut when it does not — a single 200-character
+    token is still better shown than dropped.
+
+    It reports the clamp rather than hiding it. A renderer that cannot say "the
+    stored text is longer than this" has silently made the store's own content
+    unquotable, which is the bug F7 found wearing different clothes.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None, False
+    # Internal newlines and runs of whitespace collapse: this is one line by
+    # construction, and a tab inside it would render as a gap nobody wrote.
+    raw = " ".join(raw.split())
+    if len(raw) <= limit:
+        return raw, False
+    budget = max(1, limit - len(ELLIPSIS))
+    cut = raw[:budget]
+    space = cut.rfind(" ")
+    if space >= (budget * 2) // 3:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:—-") + ELLIPSIS, True
+
+
+def one_line(text: str | None, limit: int = CONTEXT_LINE_MAX) -> tuple:
+    """The first line of a block, clamped. (text, was_clamped).
+
+    The two steps are separate because they answer different questions: the
+    first line is the store's own idea of where the summary ends, and the clamp
+    is this estate's idea of how much of it fits. A blob with no newline has no
+    answer to the first, which is exactly when the second has to hold.
+    """
+    return clamp(first_line(text), limit)
+
+
+# t-721. WHAT A ROW SAYS ABOUT ITS OWN DECISION, IN FOUR WORDS
+#
+# The contract (docs/decision-classification-contract.md) says what a filing
+# must declare. This says what a filing already on file DID declare — a
+# reading, never a repair. Most rows on a real set carry no classification at
+# all, and nothing here invents one for them: `unstated` is the answer, and it
+# is the answer a renderer must print out loud rather than leaving a blank
+# where a decision should be.
+#
+#   sketched    a `decision` carrying the complete sketch — the question, at
+#               least two alternatives, a recommendation key, and what happens
+#               if the owner defers.
+#   incomplete  a `decision` missing at least one of those. Filed through a
+#               door that did not enforce them (`estate proposal add` accepts
+#               without requiring, deliberately), or amended since.
+#   stated      an `action` or a `clarification`. Complete by definition — the
+#               contract refuses the sketch keys on both, so a missing question
+#               here is the schema working, not a hole.
+#   unstated    no classification recorded. Nothing is inferred.
+SKETCHED, INCOMPLETE, STATED, UNSTATED = (
+    "sketched", "incomplete", "stated", "unstated")
+
+
+def decision_state(refs: dict) -> tuple:
+    """(one of the four words, the sketch keys that are missing).
+
+    The missing list is empty for every state but `incomplete`, and it names
+    the estate's own key names so a badge can say WHICH half is absent instead
+    of only that something is.
+    """
+    classification = str(refs.get(estate_decisions.CLASSIFICATION_KEY)
+                         or "").strip().lower()
+    if not classification:
+        return UNSTATED, []
+    if classification != estate_decisions.DECISION:
+        return STATED, []
+    missing = []
+    for key in estate_decisions.DECISION_ONLY_KEYS:
+        value = refs.get(key)
+        if key == estate_decisions.ALTERNATIVES_KEY:
+            options = [v for v in (value or [])
+                       if isinstance(v, dict) and v.get(
+                           estate_decisions.OPTION_KEY)]
+            if len(options) < estate_decisions.MIN_ALTERNATIVES:
+                missing.append(key)
+            continue
+        if not str(value or "").strip():
+            missing.append(key)
+    return (INCOMPLETE, missing) if missing else (SKETCHED, [])
+
+
+def decision_surface(task: dict) -> dict:
+    """What a COLLAPSED row must show: the question, the recommendation, the
+    one-line context — each with the field it actually came from (t-476).
+
+    Every value is either a real stored string or None, and `*_field` names
+    which key answered. A renderer showing None must say so out loud: an absent
+    question rendered as an empty cell reads like "no question", and the whole
+    point of putting the decision in the collapsed row is that a reader can
+    trust what is in it. Nothing here paraphrases and nothing falls back to a
+    title: `question` is the stored question or None.
+
+    IT DOES CLAMP NOW, AND THAT IS A CHANGED POSITION (t-721). This function
+    used to say clamping was a rendering choice belonging to whichever surface
+    was rendering. Two surfaces render these rows, neither clamped, and the
+    result was a "one-line" context strip with a median of 500 characters
+    sitting under a title with a median of 131. The clamped values are ADDED
+    keys — `context_line`, `headline`, and a boolean beside each saying it was
+    cut — and the full `context`, `question` and `recommendation` are untouched
+    beside them. A surface that wants the whole string still has it; what it no
+    longer has is its own private idea of how long a summary line is.
+
+    Defined once so the CLI's grouped review view and the dashboard's row
+    cannot disagree; the dashboard gets it as a snapshot key rather than
+    re-deriving it in JavaScript, which is this module's standing rule.
+    """
+    refs = decode_refs(task.get("refs"))
+    question, question_field = _first_present(refs, QUESTION_FIELDS)
+    recommendation, rec_field = _first_present(refs, RECOMMENDATION_FIELDS)
+    # `intent` is a column, not a refs key, so the context lookup reads a merged
+    # mapping — refs first, because an envelope written for this task beats the
+    # generic column.
+    context, context_field = _first_present(
+        dict({"intent": task.get("intent")}, **refs), CONTEXT_FIELDS)
+    context_line, context_clamped = one_line(context)
+    headline, headline_clamped = clamp(task.get("title"), HEADLINE_MAX)
+    state, missing = decision_state(refs)
+    return {
+        "question": question, "question_field": question_field,
+        "recommendation": recommendation, "recommendation_field": rec_field,
+        "context": context, "context_field": context_field,
+        # Clamped, and it says so. See HOW LONG A SUMMARY LINE MAY BE: the
+        # unclamped version of this key was the panel's F7 — a "one-line"
+        # clarifier running a median of 500 characters.
+        "context_line": context_line,
+        "context_line_clamped": context_clamped,
+        # The row's own title, cut to something a collapsed row can hold. The
+        # full title still ships on the row itself; this never replaces it, and
+        # nothing downstream may treat the headline as the task's name.
+        "headline": headline, "headline_clamped": headline_clamped,
+        "decision_state": state, "decision_missing": missing,
+        "classification": refs.get(estate_decisions.CLASSIFICATION_KEY),
+    }
 
 
 def message_view(task: dict) -> dict | None:
@@ -323,6 +580,68 @@ def projects(conn, tasks: list[dict]) -> list[dict]:
     return out
 
 
+# ── the attention set, by lifecycle tier (t-721) ─────────────────────────────
+
+def tiers(ordered: list) -> list:
+    """The attention set split into its three lifecycle tiers, each carrying
+    the counts and the within-tier idle comparison a section header needs.
+
+    `ordered` is the attention set in the contract's own order, and each tier
+    keeps that order — the split is a grouping, not a re-sort. Ids again, on
+    exactly the terms `attention` uses: the rows are already in `tasks`, and a
+    second copy is a row that can disagree with itself.
+
+    THE COUNTS ARE TWO NUMBERS AND ALWAYS BOTH (P4, resolved uncapped). `total`
+    is every row in the tier and `notice` is how many of them are inside the
+    advance-notice band. Neither is a limit: nothing here truncates a tier, and
+    a renderer that shows fewer rows than `total` is responsible for saying so.
+    A hard cap of five to seven was the alternative and it was refused, because
+    a queue that hides its tail reports itself healthy.
+
+    IDLE IS COMPARED WITHIN THE TIER AND NOWHERE ELSE. `idle_median` is over
+    this tier's own rows, so "longer than half its tier" means something
+    different in a tier that turns over in a day and one that has not moved in
+    three weeks. Age is a fact about neglect, not about importance, and this is
+    what keeps it from being read as a rank: no tier is ordered by it, and the
+    set is never sorted by it at all.
+    """
+    grouped: dict[str, list] = {name: [] for name in estate_attention.TIERS}
+    for task in ordered:
+        # A row whose tier this module does not recognise still belongs to
+        # somebody. It gets its own bucket rather than being dropped, on the
+        # same rule `dependencies()` follows for an edge kind it has not heard
+        # of — a row missing from the page is worse than one under an odd head.
+        grouped.setdefault(task.get("tier") or "unclassified", []).append(task)
+    out = []
+    for name, rows in sorted(
+            grouped.items(),
+            key=lambda kv: estate_attention.TIER_ORDER.get(
+                kv[0], len(estate_attention.TIERS))):
+        if not rows:
+            continue
+        idles = [t.get("idle_days") for t in rows]
+        middle = estate_attention.median(idles)
+        for task in rows:
+            idle = task.get("idle_days")
+            # None when either number is missing: an unreadable `updated_at`
+            # and a tier of one undated row are both "no comparison available",
+            # and False would claim one was made.
+            task["idle_above_tier_median"] = (
+                None if idle is None or middle is None else idle > middle)
+        out.append({
+            "id": name,
+            "title": estate_attention.TIER_TITLES.get(
+                name, "Uncategorised — the store did not say"),
+            "total": len(rows),
+            "notice": sum(1 for t in rows if t.get("notice")),
+            "idle_median": middle,
+            "idle_max": max((v for v in idles if v is not None), default=None),
+            "unreadable_idle": sum(1 for v in idles if v is None),
+            "ids": [t["id"] for t in rows],
+        })
+    return out
+
+
 # ── the composed read ────────────────────────────────────────────────────────
 
 def build(conn, now: dt.datetime | None = None,
@@ -368,6 +687,36 @@ def build(conn, now: dt.datetime | None = None,
         task["followup"] = followup_view(task)
         task["proposal"] = proposal_view(task)
         task["message"] = message_view(task)
+        # t-476. The collapsed attention row shows why this is waiting, and one
+        # LINE of it is all a summary can hold — so one line is all that ships.
+        # Only for rows in the attention set: no other collapsed row asks for
+        # it, and a field on every task is how a snapshot grows a copy of the
+        # store. `context_field` names the source so an absent context can be
+        # rendered as absent rather than as an empty cell.
+        if task["is_attention"]:
+            surface = decision_surface(task)
+            task["context_line"] = surface["context_line"]
+            task["context_field"] = surface["context_field"]
+            task["context_line_clamped"] = surface["context_line_clamped"]
+            # t-721. The row's BODY, not just its title. Few rows declare a
+            # classification and fewer carry a full sketch, so most of these
+            # are None — and None printed as "no decision stated" is the
+            # finding. Nothing is invented for a row that declared nothing.
+            task["headline"] = surface["headline"]
+            task["headline_clamped"] = surface["headline_clamped"]
+            task["question"] = surface["question"]
+            task["question_field"] = surface["question_field"]
+            task["recommendation"] = surface["recommendation"]
+            task["recommendation_field"] = surface["recommendation_field"]
+            task["decision_state"] = surface["decision_state"]
+            task["decision_missing"] = surface["decision_missing"]
+            task["classification"] = surface["classification"]
+            task["tier"] = estate_attention.tier(kind, status,
+                                                 task.get("stage"))
+            task["idle_days"] = estate_attention.idle_days(
+                task.get("updated_at"), now)
+            task["notice"] = (task["due_state"]
+                              in estate_attention.NOTICE_STATES)
         by_id[task["id"]] = task
 
     # Titles resolved server-side (§ build scope step 7) so no consumer has to
@@ -405,6 +754,7 @@ def build(conn, now: dt.datetime | None = None,
         attention_counts[state] = attention_counts.get(state, 0) + 1
     attention_counts["total"] = len(ordered)
     attention = [t["id"] for t in ordered]
+    attention_tiers = tiers(ordered)
 
     # Every follow-up, open and resolved: the page keeps resolved ones behind a
     # History filter rather than mixing them into current attention (§5.3 A),
@@ -465,6 +815,7 @@ def build(conn, now: dt.datetime | None = None,
         "dep_counts": dep_counts,
         "attention": attention,
         "attention_counts": attention_counts,
+        "attention_tiers": attention_tiers,
         "followups": followups,
         "followup_counts": followup_counts,
         "proposals": proposals,

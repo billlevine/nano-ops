@@ -183,6 +183,49 @@ class TestLifecycle(EstateCase):
         self.assertEqual(refs, {"summary": "landed", "verification": "tests green",
             "dependencies": "none", "retry_notes": "rerun", "residual_risk": "low", "branch": "topic"})
 
+    def test_landing_keys_are_first_class_and_never_required(self):
+        """t-712 panel P1's write side: structure, refusing nothing.
+
+        The three properties in one test because they are one decision — the
+        keys are recorded when given, absent when not, and no shape of them is
+        ever a reason for `done` to fail. A completion that landed nothing
+        gitty must close exactly as it did before this existed.
+        """
+        self.add(); self.ok("mark-ready", "1"); self.ok("claim", "1", "--actor", "w")
+        self.ok("done", "1", "--actor", "w", "--summary", "s",
+                "--landed-branch", "topic/one", "--landed-sha", "abc1234",
+                "--landed-repo", "/somewhere/else")
+        refs = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(refs["landed_branch"], "topic/one")
+        self.assertEqual(refs["landed_sha"], "abc1234")
+        self.assertEqual(refs["landed_repo"], "/somewhere/else")
+
+        self.add("second"); self.ok("mark-ready", "2"); self.ok("claim", "2", "--actor", "w")
+        self.ok("done", "2", "--actor", "w", "--summary", "nothing gitty")
+        plain = json.loads(self.events("t-2")[-1]["refs"])
+        self.assertNotIn("landed_sha", plain)
+        self.assertNotIn("landed_branch", plain)
+
+        # A sha nothing could resolve is still recorded rather than refused.
+        # The reconciler reports it `sha_unknown`; a gate here would fire on
+        # the unattended 3am path with nobody awake to unblock it.
+        self.add("third"); self.ok("mark-ready", "3"); self.ok("claim", "3", "--actor", "w")
+        self.ok("done", "3", "--actor", "w", "--landed-sha", "not-a-sha at all")
+        self.assertEqual(json.loads(self.events("t-3")[-1]["refs"])["landed_sha"],
+                         "not-a-sha at all")
+
+    def test_a_landing_flag_wins_over_the_same_key_in_refs(self):
+        """The flag is the first-class path; --refs is where a caller that
+        predates it reaches the same field. Both spellings land in one key, and
+        when they disagree the explicit one is the answer."""
+        self.add(); self.ok("mark-ready", "1"); self.ok("claim", "1", "--actor", "w")
+        self.ok("done", "1", "--actor", "w",
+                "--refs", '{"landed_sha":"0000000","pr":"o/r#1"}',
+                "--landed-sha", "9999999")
+        refs = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(refs["landed_sha"], "9999999")
+        self.assertEqual(refs["pr"], "o/r#1")
+
     def test_a_transition_carries_its_evidence_in_the_same_transaction(self):
         """`done`'s bargain, on every other edge (t-296 follow-up).
 
@@ -237,6 +280,77 @@ class TestLifecycle(EstateCase):
         self.add(ready=True); self.ok("claim", "1", "--actor", "a"); self.ok("done", "1", "--actor", "a")
         self.ok("reopen", "1")
         row = self.task(); self.assertEqual(row["status"], "ready"); self.assertIsNone(row["claimed_by"]); self.assertIsNone(row["closed_at"])
+
+
+class TestPrActionCompletionEvidence(EstateCase):
+    """t-147 — a `pr-action` task cannot be closed on a worker's word.
+
+    The dispatched worker pushes the fix and replies on each review thread,
+    and those replies are the only record the owner reads instead of diffing the
+    PR. Its report that it did so is not evidence: the collector has to
+    re-check `gh api …/pulls/N/comments` itself and pass what it saw. So
+    `--verification`, optional on every other kind, is required here — and
+    refused rather than warned, because a warning in an unattended sweep is a
+    warning nobody reads.
+    """
+
+    def pr_task(self, key="1", claim=True):
+        self.ok("task", "add", "acme/widgets#2022 — address review comments",
+                "--kind", "pr-action", "--ready")
+        if claim:
+            self.ok("claim", key, "--actor", "hub", "--ttl", "4h")
+        return f"t-{key}"
+
+    def test_close_without_verification_is_refused(self):
+        self.pr_task()
+        r = self.cli("done", "1", "--actor", "hub", "--summary", "pushed abc123")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--verification", r.stderr)
+        self.assertIn("in_reply_to_id", r.stderr)      # names the re-check
+
+    def test_a_refused_close_changes_nothing(self):
+        self.pr_task()
+        before = self.task()
+        self.cli("done", "1", "--actor", "hub", "--summary", "pushed abc123")
+        row = self.task()
+        self.assertEqual(row["status"], "claimed")     # still recoverable
+        self.assertEqual(row["claimed_by"], "hub")
+        self.assertEqual(row["updated_at"], before["updated_at"])
+        self.assertNotIn("evidence", [e["kind"] for e in self.events()])
+
+    def test_a_blank_verification_is_no_verification(self):
+        self.pr_task()
+        r = self.cli("done", "1", "--actor", "hub", "--summary", "pushed abc123",
+                     "--verification", "   \n ")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.task()["status"], "claimed")
+
+    def test_close_with_verification_is_accepted_and_recorded(self):
+        self.pr_task()
+        self.ok("done", "1", "--actor", "hub", "--summary", "pushed abc123",
+                "--verification", "reply 91 on thread 77, reply 92 on thread 81")
+        self.assertEqual(self.task()["status"], "done")
+        refs = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(refs["verification"],
+                         "reply 91 on thread 77, reply 92 on thread 81")
+
+    def test_the_wrong_actor_is_still_the_first_thing_reported(self):
+        """The gate is about evidence, not about who is holding the lease."""
+        self.pr_task()
+        r = self.cli("done", "1", "--actor", "someone-else", "--summary", "x")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not claimed by someone-else", r.stderr)
+
+    def test_other_kinds_are_unaffected(self):
+        """Only `pr-action`. Widening the gate would make it noise."""
+        for i, kind in enumerate(("generic", "night-shift", "panel",
+                                  "forge-build", "ci-fix", "hub-intent"), start=1):
+            with self.subTest(kind=kind):
+                key = str(i)
+                self.ok("task", "add", f"a {kind} task", "--kind", kind, "--ready")
+                self.ok("claim", key, "--actor", "hub")
+                self.ok("done", key, "--actor", "hub", "--summary", "landed")
+                self.assertEqual(self.task(f"t-{key}")["status"], "done")
 
 
 class TestOrphans(EstateCase):
@@ -694,6 +808,219 @@ class TestStale(EstateCase):
         self.assertEqual(len(self.events()), 1)   # only the creation event
 
 
+class TestAwaiting(EstateCase):
+    """t-476 — everything awaiting the owner, grouped by the question each group
+    answers, with the decision IN the row.
+
+    The gate on this feature is not that the new view is pretty. It is that
+    `proposal list` and `stale` did not move: both are read by scripts and by
+    the night shift every night, and the whole reason this is a separate verb
+    is so a verbosity flag can never leak into them.
+    """
+
+    def backdate(self, key, days):
+        ts = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+        with self.conn() as c:
+            c.execute("UPDATE tasks SET updated_at=? WHERE id=?", (ts, key))
+
+    def propose(self, title, **fields):
+        args = ["proposal", "add", title, "--actor", "mechanic"]
+        for flag, value in fields.items():
+            args += [f"--{flag.replace('_', '-')}", value]
+        return self.ok(*args).stdout.strip()
+
+    def groups(self, *args):
+        return json.loads(self.ok("awaiting", "--json", *args).stdout)
+
+    def ids(self, group, *args):
+        return [i["id"] for i in self.groups(*args)[group]["items"]]
+
+    # ── the acceptance check ────────────────────────────────────────────────
+
+    def test_proposal_list_and_stale_are_untouched_by_the_new_view(self):
+        """c1. Byte-for-byte, before and after the new command exists and
+        after it has been run. Nothing about `awaiting` is allowed to be
+        visible from either of the two commands other readers depend on."""
+        self.propose("a condition", condition="the disk fills",
+                     desired_outcome="it stops filling",
+                     completion_check="free space stays above 10%")
+        self.ok("task", "add", "an old one", "--kind", "followup")
+        self.backdate("t-2", 9)
+        before = (self.ok("proposal", "list").stdout, self.ok("stale").stdout)
+        self.ok("awaiting")
+        self.ok("awaiting", "--json")
+        self.ok("awaiting", "--full", "--width", "200")
+        after = (self.ok("proposal", "list").stdout, self.ok("stale").stdout)
+        self.assertEqual(before, after)
+        self.assertNotIn("Question", after[0])
+        self.assertNotIn("Question", after[1])
+
+    def test_the_new_view_writes_nothing(self):
+        self.propose("a condition", condition="the disk fills")
+        before = self.task()
+        self.ok("awaiting"); self.ok("awaiting", "--json")
+        self.assertEqual(self.task(), before)
+        self.assertEqual(len(self.events()), 1)   # proposal creation only
+
+    # ── the grouping ────────────────────────────────────────────────────────
+
+    def test_each_group_prints_the_question_it_answers(self):
+        out = self.ok("awaiting").stdout
+        for question in ("What decision is waiting on you?",
+                         "What is waiting on a person?",
+                         "What is nobody looking at?"):
+            self.assertIn(question, out)
+
+    def test_a_row_answers_exactly_one_question(self):
+        """An untouched follow-up is stale AND waiting on a person, and an
+        undecided proposal is stale too. Each belongs to the first question it
+        answers; printing it twice would make the counts a lie about how much
+        is actually waiting."""
+        self.propose("undecided", condition="something happened",
+                     desired_outcome="it stops happening")
+        self.ok("task", "add", "waiting on a person", "--kind", "followup")
+        self.backdate("t-1", 30); self.backdate("t-2", 30)
+        # Both are stale by `stale`'s own reading...
+        self.assertEqual(
+            [r["id"] for r in json.loads(self.ok("stale", "--json").stdout)],
+            ["t-1", "t-2"])
+        groups = self.groups()
+        self.assertEqual([i["id"] for i in groups["decisions"]["items"]], ["t-1"])
+        self.assertEqual([i["id"] for i in groups["attention"]["items"]], ["t-2"])
+        self.assertEqual(groups["stale"]["items"], [])   # ...and neither twice
+
+    def test_a_decided_proposal_is_a_record_not_a_request(self):
+        self.propose("already handled", condition="something happened",
+                     desired_outcome="it stops happening")
+        self.ok("proposal", "stage", "t-1", "approved-backlog", "yes")
+        self.assertEqual(self.ids("decisions"), [])
+
+    def test_the_attention_and_stale_sets_come_from_their_own_commands(self):
+        self.ok("task", "add", "waiting on a person", "--kind", "followup")
+        self.ok("task", "add", "nobody is looking", "--kind", "generic")
+        self.backdate("t-1", 9); self.backdate("t-2", 9)
+        self.assertEqual(self.ids("attention"), ["t-1"])
+        self.assertEqual(self.ids("stale"), ["t-2"])
+        self.assertEqual(
+            self.ids("attention"),
+            [r["id"] for r in json.loads(self.ok("attention", "--json").stdout)])
+
+    def test_thresholds_are_the_callers_policy_exactly_as_the_siblings(self):
+        self.ok("task", "add", "two days idle", "--kind", "generic")
+        self.backdate("t-1", 2)
+        self.assertEqual(self.ids("stale"), [])
+        self.assertEqual(self.ids("stale", "--days", "1"), ["t-1"])
+        for bad in (("--days", "-1"), ("--notice", "-1"), ("--lines", "-1"),
+                    ("--group", "nonsense")):
+            self.assertEqual(self.cli("awaiting", *bad).returncode, 2, bad)
+
+    # ── the fourth group ────────────────────────────────────────────────────
+
+    def test_a_proposal_that_asks_nothing_gets_its_own_honest_group(self):
+        """It is awaiting the owner, but it is not asking anything. Filing it
+        under "What decision is waiting on you?" would put a row in a group
+        whose question it cannot answer."""
+        self.propose("filed with no review record")
+        self.propose("filed properly", condition="the disk fills",
+                     desired_outcome="it stops filling")
+        self.assertEqual(self.ids("unstated"), ["t-1"])
+        self.assertEqual(self.ids("decisions"), ["t-2"])
+        out = self.ok("awaiting").stdout
+        self.assertIn("Awaiting you, but the record does not say what for", out)
+
+    def test_the_fourth_group_is_silent_when_it_is_empty(self):
+        self.propose("filed properly", condition="the disk fills",
+                     desired_outcome="it stops filling")
+        out = self.ok("awaiting").stdout
+        self.assertNotIn("the record does not say what for", out)
+        self.assertNotIn("unstated", out)
+
+    # ── the item block ──────────────────────────────────────────────────────
+
+    def test_the_decision_is_in_the_block_with_no_second_invocation(self):
+        self.propose("Disk fills during export",
+                     condition="the export fills the disk every night",
+                     desired_outcome="exports stay below the disk budget",
+                     completion_check="free space stays above 10%")
+        out = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertIn("Question", out)
+        self.assertIn("the export fills the disk every night", out)
+        self.assertIn("Recommendation", out)
+        self.assertIn("exports stay below the disk budget", out)
+        self.assertIn("Deferred", out)
+        self.assertIn("#1 of 1", out)
+
+    def test_a_field_says_which_stored_key_answered(self):
+        self.propose("Disk fills", condition="the export fills the disk")
+        self.assertIn("[condition]",
+                      self.ok("awaiting", "--group", "decisions").stdout)
+
+    def test_the_name_this_estate_already_uses_is_not_announced(self):
+        """`desired_outcome` has been labelled "Recommendation" since proposals
+        existed. Saying "from desired_outcome" on every row is noise; saying
+        "from condition" under "Question" is not, because an observation is
+        not a question."""
+        self.propose("Disk fills", condition="the export fills the disk",
+                     desired_outcome="exports stay below the budget")
+        out = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertNotIn("[desired_outcome]", out)
+        self.assertIn("[condition]", out)
+
+    def test_one_stored_sentence_is_not_printed_twice_under_two_labels(self):
+        """`proposal add` copies the desired outcome into `intent`, so an
+        unfiltered Context line would print each recommendation to the owner
+        twice."""
+        self.propose("Disk fills", condition="the export fills the disk",
+                     desired_outcome="exports stay below the budget")
+        out = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertEqual(out.count("exports stay below the budget"), 1)
+        self.assertNotIn("Context", out)
+
+    def test_a_missing_field_prints_as_missing_where_it_is_owed(self):
+        self.propose("Disk fills", condition="the export fills the disk")
+        out = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertIn("no recommendation recorded", out)
+
+    def test_a_field_nobody_owes_is_not_printed_as_missing(self):
+        """Every follow-up saying "no question recorded" is noise: a
+        follow-up was never asked one, and its group's question is answered by
+        the fact that it is in the group."""
+        self.ok("task", "add", "waiting", "--kind", "followup", "--refs",
+                json.dumps({"context": "the evidence is in the worktree"}))
+        out = self.ok("awaiting", "--group", "attention").stdout
+        self.assertNotIn("no question recorded", out)
+        self.assertIn("the evidence is in the worktree", out)
+
+    def test_an_attention_row_with_no_context_says_so(self):
+        self.ok("task", "add", "waiting", "--kind", "followup")
+        self.assertIn("no context recorded",
+                      self.ok("awaiting", "--group", "attention").stdout)
+
+    def test_long_fields_are_clamped_and_full_prints_all_of_them(self):
+        self.propose("Disk fills", condition=" ".join(["evidence"] * 400),
+                     desired_outcome="stop it")
+        clamped = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertIn("…", clamped)
+        self.assertLess(clamped.count("evidence"), 400)
+        self.assertEqual(
+            self.ok("awaiting", "--group", "decisions", "--full")
+                .stdout.count("evidence"), 400)
+        self.assertNotIn(
+            "…", self.ok("awaiting", "--group", "decisions", "--lines", "0").stdout)
+
+    def test_json_carries_the_question_the_group_answers(self):
+        self.propose("Disk fills", condition="the disk fills",
+                     desired_outcome="it stops")
+        groups = self.groups()
+        self.assertEqual(groups["decisions"]["question"],
+                         "What decision is waiting on you?")
+        item = groups["decisions"]["items"][0]
+        self.assertEqual(item["question"], "the disk fills")
+        self.assertEqual(item["question_field"], "condition")
+        self.assertEqual(item["recommendation"], "it stops")
+        self.assertIn("#1 of 1", item["defer"])
+
+
 class TestUnpooledKinds(EstateCase):
     """t-296: the hub mirrors every self-DM message as an `inbox-message`
     task, so the shared store now holds rows as small as "thanks". The two
@@ -1000,6 +1327,47 @@ class TestMemorySchema(EstateCase):
             self.assertIn("memory_id", {r[1] for r in c.execute("PRAGMA table_info(events)")})
             self.assertEqual(c.execute("SELECT summary FROM events WHERE actor='old'").fetchone()[0], "kept")
 
+    def memory_columns(self):
+        with self.conn() as c:
+            return {r[1] for r in c.execute("PRAGMA table_info(memories)")}
+
+    def rename_column_back(self):
+        """Rebuild the pre-2026-08-16 shape: the column under its old name."""
+        with self.conn() as c:
+            c.execute("ALTER TABLE memories RENAME COLUMN last_recalled_at TO last_seen_at")
+        self.assertIn("last_seen_at", self.memory_columns())
+
+    def test_a_fresh_store_gets_the_recalled_name_without_a_migration(self):
+        self.remember()
+        columns = self.memory_columns()
+        self.assertIn("last_recalled_at", columns)
+        self.assertNotIn("last_seen_at", columns)
+
+    def test_migration_renames_the_column_and_keeps_every_value(self):
+        # The live store is exactly this shape: rows already stamped, under the
+        # old name. Rebuild it here rather than trusting the CREATE TABLE path.
+        self.remember("stamped"); self.remember("never recalled")
+        self.ok("memory", "seen", "m-1")
+        stamp = self.memory("m-1")["last_recalled_at"]
+        self.assertIsNotNone(stamp)
+        self.rename_column_back()
+        self.ok("memory", "list")            # any command migrates on entry
+        self.assertNotIn("last_seen_at", self.memory_columns())
+        # The values are the same values: nothing re-stamped, nothing dropped.
+        self.assertEqual(self.memory("m-1")["last_recalled_at"], stamp)
+        self.assertEqual(self.memory("m-1")["body"], "stamped")
+        self.assertIsNone(self.memory("m-2")["last_recalled_at"])
+
+    def test_the_rename_migration_is_idempotent(self):
+        self.remember(); self.ok("memory", "seen", "m-1")
+        self.rename_column_back()
+        for _ in range(3):
+            self.ok("memory", "list")
+        self.assertNotIn("last_seen_at", self.memory_columns())
+        before = self.memory("m-1")
+        self.ok("memory", "list")
+        self.assertEqual(self.memory("m-1"), before)
+
 
 class TestMemoryProvenance(EstateCase):
     def test_shared_active_memory_requires_source_refs(self):
@@ -1106,7 +1474,7 @@ class TestMemoryQueryAndMetadata(EstateCase):
     def test_seen_stamps_metadata_without_flooding_the_audit_stream(self):
         self.remember("one"); self.remember("two")
         self.ok("memory", "seen", "m-1", "m-2")
-        self.assertIsNotNone(self.memory("m-1")["last_seen_at"])
+        self.assertIsNotNone(self.memory("m-1")["last_recalled_at"])
         self.assertEqual([e["kind"] for e in self.memory_events("m-1")], ["activity"])
         self.assertEqual(self.cli("memory", "seen", "m-9").returncode, 2)
 
@@ -1245,24 +1613,24 @@ class TestMemoryRecall(EstateCase):
         self.assertIn("no active memories at scope mechanic/shared",
                       self.recall("mechanic"))
 
-    def test_recall_stamps_last_seen_and_writes_no_event(self):
+    def test_recall_stamps_last_recalled_at_and_writes_no_event(self):
         self.shared("estate-wide")
         self.remember("ours only", scope="mechanic", active=True)
         before = [e["seq"] for e in self.memory_events("m-1")]
         self.recall("mechanic")
-        self.assertIsNotNone(self.memory("m-1")["last_seen_at"])
-        self.assertIsNotNone(self.memory("m-2")["last_seen_at"])
+        self.assertIsNotNone(self.memory("m-1")["last_recalled_at"])
+        self.assertIsNotNone(self.memory("m-2")["last_recalled_at"])
         self.assertEqual([e["seq"] for e in self.memory_events("m-1")], before)
 
     def test_no_touch_inspects_without_claiming_a_pass_used_the_fact(self):
         self.shared("estate-wide")
         self.recall("mechanic", "--no-touch")
-        self.assertIsNone(self.memory("m-1")["last_seen_at"])
+        self.assertIsNone(self.memory("m-1")["last_recalled_at"])
 
     def test_a_fact_the_caller_cannot_see_is_not_stamped_seen(self):
         self.remember("the hub's own", scope="hub", active=True)
         self.recall("mechanic")
-        self.assertIsNone(self.memory("m-1")["last_seen_at"])
+        self.assertIsNone(self.memory("m-1")["last_recalled_at"])
 
 
 class TestLessonsRenderer(EstateCase):
@@ -1617,7 +1985,10 @@ class TestAskExpiry(AskCase):
         if not self.followups_is_estate_backed():
             self.skipTest("bin/followups here is the standalone JSON store, not "
                           "the shim over this store — nothing to reconcile yet")
-        self.followups("add", "an existing item", "--source", "pr-reviewer")
+        # `--classification` is required at this writer (t-475); this item is
+        # scenery for the numbering check, so the honest word is `action`.
+        self.followups("add", "an existing item", "--source", "pr-reviewer",
+                       "--classification", "action")
         self.ask("will go unanswered"); self.overdue()
         self.ok("expired-asks", "--sweep")
         out = self.followups("list").stdout
@@ -2180,6 +2551,515 @@ class TestComputedBlockers(EstateCase):
                 rows)
 
 
+class AutoPromoteCase(EstateCase):
+    """Shared fixture for t-163 — auto-promote a dependent on unblock.
+
+    `blocked_by` stays a derived view. What is new is the ACT: when the last
+    blocker of a FLAGGED dependent finishes, the store moves it open -> ready
+    itself. Opt-in, default off, and the default is what most of these tests
+    are actually about.
+    """
+
+    def blocker(self, title="the blocker"):
+        return self.ok("task", "add", title, "--kind", "generic",
+                       "--ready").stdout.strip()
+
+    def dependent(self, blocker, *, flag=None, kind="night-shift",
+                  project=None, stage=None, title="the dependent"):
+        args = ["task", "add", title, "--kind", kind]
+        if flag is not None:
+            args += ["--refs", json.dumps({"auto_promote": flag})]
+        if project: args += ["--project", project]
+        if stage: args += ["--stage", stage]
+        key = self.ok(*args).stdout.strip()
+        self.ok("dep", "add", blocker, key, "--kind", "blocks")
+        return key
+
+    def finish(self, key):
+        self.ok("claim", key, "--actor", "hub")
+        return self.ok("done", key, "--actor", "hub", "--summary", "done",
+                       "--verification", "tests pass")
+
+    def status(self, key):
+        return self.task(key)["status"]
+
+    def promotions(self, key):
+        return [e for e in self.events(key) if e["kind"] == "auto-promote"]
+
+    def followups(self, *args):
+        """`bin/followups`, against this test's own store."""
+        env = dict(os.environ, ESTATE_STATE_DIR=self.state,
+                   ESTATE_LESSONS_PATH=os.path.join(self.state, "lessons.md"))
+        shim = os.path.join(os.path.dirname(SCRIPT), "followups")
+        result = subprocess.run([sys.executable, shim, *args],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    @staticmethod
+    def followups_takes_classification():
+        """True when bin/followups enforces the filing-time schema.
+
+        The same shape of check as AskCase.followups_is_estate_backed above,
+        and for the same reason: this is a contract between two scripts and
+        only one of them is in this extraction. A repo whose bin/followups
+        predates the schema cannot be filed through with `--classification`,
+        and asserting against it would report a missing re-sync as a bug in
+        this store's promote hook. On the FILE rather than a version string,
+        so these tests start running again by themselves the moment that
+        script lands.
+        """
+        try:
+            with open(os.path.join(os.path.dirname(SCRIPT), "followups")) as f:
+                return "--classification" in f.read()
+        except OSError:
+            return False
+
+
+class TestAutoPromoteOnUnblock(AutoPromoteCase):
+    def test_a_flagged_dependent_is_promoted(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.assertEqual(self.status(d), "open")
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+
+    def test_an_unflagged_dependent_is_untouched(self):
+        """The load-bearing half. Default off means default off."""
+        b = self.blocker()
+        d = self.dependent(b)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+        self.assertEqual(self.promotions(d), [])
+        # And nothing about the pre-t-163 behaviour moved: it is not claimable,
+        # it is not in `ready`, and the derived view says it is unblocked.
+        self.assertNotIn(d, self.ok("ready").stdout)
+
+    def test_an_explicit_false_is_untouched(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=False)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+
+    def test_the_promoted_task_becomes_claimable(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.finish(b)
+        self.assertIn(d, self.ok("ready", "--kind", "night-shift").stdout)
+        self.ok("claim", d, "--actor", "pr-reviewer")
+        self.assertEqual(self.status(d), "claimed")
+
+    def test_the_promotion_writes_a_distinct_event(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.finish(b)
+        rows = self.promotions(d)
+        self.assertEqual(len(rows), 1)
+        self.assertIn(f"after {b}", rows[0]["summary"])
+        self.assertEqual(json.loads(rows[0]["refs"]),
+                         {"blocker": b, "blocker_status": "done",
+                          "flag_source": "task", "kind": "night-shift"})
+
+    def test_the_ordinary_transition_event_is_written_too(self):
+        """A reader that counts lifecycle transitions must see this one."""
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.finish(b)
+        moves = [e for e in self.events(d)
+                 if e["kind"] == "transition" and e["summary"] == "open -> ready"]
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]["subsystem"], "tasks")
+        self.assertEqual(moves[0]["phase"], "transition")
+        self.assertIn(f"last blocker {b}", moves[0]["detail"])
+
+    def test_the_store_is_the_actor_not_the_closing_worker(self):
+        """Rule 6 of the actor taxonomy: the promotion is nobody's judgment."""
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.finish(b)
+        for row in self.events(d):
+            if row["kind"] in ("auto-promote", "transition"):
+                self.assertEqual(row["actor"], "estate")
+
+    def test_it_is_announced_on_stdout(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        out = self.finish(b).stdout
+        self.assertIn(f"{d}: open -> ready (auto-promoted", out)
+        self.assertIn(f"last blocker {b} reached done", out)
+
+    def test_the_announcement_names_the_status_the_blocker_really_reached(self):
+        """`dropped`, not "finished" — the line a person reads, not the refs.
+
+        The hook fires on `dropped` as well as `done`, correctly. The event
+        refs have said `blocker_status` all along; the printed line said
+        "finished", which is the wrong thing to tell whoever just abandoned
+        the blocker and is exactly the moment they might want to stop the
+        thing that started.
+        """
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        out = self.ok("drop", b, "not doing it").stdout
+        self.assertIn(f"{d}: open -> ready (auto-promoted", out)
+        self.assertIn(f"last blocker {b} reached dropped", out)
+        self.assertNotIn("finished", out)
+
+    def test_nothing_is_announced_when_nothing_moved(self):
+        b = self.blocker()
+        self.dependent(b)
+        self.assertNotIn("auto-promoted", self.finish(b).stdout)
+
+    def test_a_dropped_blocker_promotes_too(self):
+        """`dropped` is terminal, so an abandoned blocker blocks nothing."""
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.ok("drop", b, "not doing it")
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(json.loads(self.promotions(d)[0]["refs"])["blocker_status"],
+                         "dropped")
+
+    def test_only_the_last_blocker_promotes(self):
+        first, second = self.blocker("first"), self.blocker("second")
+        d = self.dependent(first, flag=True)
+        self.ok("dep", "add", second, d, "--kind", "blocks")
+        self.finish(first)
+        self.assertEqual(self.status(d), "open")
+        self.assertEqual(self.promotions(d), [])
+        self.finish(second)
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(len(self.promotions(d)), 1)
+
+    def test_a_non_terminal_transition_promotes_nothing(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        for verb, args in (("claim", ("--actor", "hub")),
+                           ("needs-owner", ("an open question", "--actor", "hub")),
+                           ("reopen", ("--actor", "hub")),
+                           ("claim", ("--actor", "hub")),
+                           ("release", ("--actor", "hub"))):
+            self.ok(verb, b, *args)
+            self.assertEqual(self.status(d), "open", f"after {verb}")
+        self.assertEqual(self.promotions(d), [])
+
+    def test_only_blocks_edges_promote(self):
+        b = self.blocker()
+        d = self.ok("task", "add", "related work", "--kind", "night-shift",
+                    "--refs", '{"auto_promote": true}').stdout.strip()
+        for kind in ("parent", "related", "discovered-from"):
+            self.ok("dep", "add", b, d, "--kind", kind)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+
+    def test_the_direction_of_the_edge_matters(self):
+        """Finishing the DEPENDENT must not promote its blocker."""
+        b = self.ok("task", "add", "the blocker", "--kind", "generic",
+                    "--refs", '{"auto_promote": true}').stdout.strip()
+        d = self.dependent(b, flag=True)
+        self.ok("mark-ready", d, "--actor", "hub")
+        self.finish(d)
+        self.assertEqual(self.status(b), "open")
+
+    def test_only_an_open_dependent_is_promoted(self):
+        """`blocked` and `needs-owner` wait on a person, not on this edge."""
+        for parked in ("blocked", "needs-owner"):
+            with self.subTest(parked=parked):
+                b = self.blocker(f"blocker for {parked}")
+                d = self.dependent(b, flag=True, title=f"dependent {parked}")
+                self.ok("mark-ready", d, "--actor", "hub")
+                self.ok("claim", d, "--actor", "hub")
+                verb = "block" if parked == "blocked" else "needs-owner"
+                self.ok(verb, d, "a reason", "--actor", "hub")
+                self.finish(b)
+                self.assertEqual(self.status(d), parked)
+                self.assertEqual(self.promotions(d), [])
+
+    def test_an_already_ready_dependent_is_left_alone(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.ok("mark-ready", d, "--actor", "hub")
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(self.promotions(d), [])
+
+    def test_reopening_the_blocker_does_not_demote(self):
+        """The derived view re-blocks it. Nothing here keeps a second copy."""
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.finish(b)
+        self.ok("reopen", b, "--actor", "hub")
+        self.assertEqual(self.status(d), "ready")
+        self.assertNotIn(d, self.ok("ready").stdout)
+        out = self.ok("task", "show", d).stdout
+        self.assertEqual(json.loads(out[:out.index("\n}") + 2])["blocked_by"], [b])
+
+    def test_promotion_does_not_cascade(self):
+        """`ready` is not terminal, so promoting one task releases no other."""
+        b = self.blocker()
+        first = self.dependent(b, flag=True, title="first in the chain")
+        second = self.dependent(first, flag=True, title="second in the chain")
+        self.finish(b)
+        self.assertEqual(self.status(first), "ready")
+        self.assertEqual(self.status(second), "open")
+
+
+class TestAutoPromoteInheritance(AutoPromoteCase):
+    """Where the flag comes from: the task's own refs, else its project."""
+
+    def project(self, flag=None, title="a flagged project"):
+        args = ["project", "add", title, "--kind", "workstream"]
+        if flag is not None:
+            args += ["--meta", json.dumps({"auto_promote": flag})]
+        return self.ok(*args).stdout.strip()
+
+    def test_a_project_flag_is_inherited(self):
+        p = self.project(flag=True)
+        b = self.blocker()
+        d = self.dependent(b, project=p)
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(json.loads(self.promotions(d)[0]["refs"])["flag_source"],
+                         "project")
+
+    def test_an_unflagged_project_promotes_nothing(self):
+        p = self.project()
+        b = self.blocker()
+        d = self.dependent(b, project=p)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+
+    def test_the_task_flag_wins_over_the_project(self):
+        p = self.project(flag=True)
+        b = self.blocker()
+        d = self.dependent(b, flag=False, project=p)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open",
+                         "an explicit task-level false must opt out of a "
+                         "project-wide default")
+
+    def test_a_task_flag_works_without_a_project(self):
+        p = self.project(flag=False)
+        b = self.blocker()
+        d = self.dependent(b, flag=True, project=p)
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(json.loads(self.promotions(d)[0]["refs"])["flag_source"],
+                         "task")
+
+
+class TestAutoPromoteRefusals(AutoPromoteCase):
+    """The cases where promoting would be wrong, and the store declines."""
+
+    def test_a_non_boolean_flag_is_not_consent(self):
+        b = self.blocker()
+        d = self.dependent(b, flag="yes")
+        result = self.finish(b)
+        self.assertEqual(self.status(d), "open")
+        self.assertIn("must be true or false", result.stderr)
+
+    def test_an_unreadable_refs_blob_does_not_break_the_close(self):
+        b = self.blocker()
+        d = self.dependent(b)
+        with self.conn() as c:
+            c.execute("UPDATE tasks SET refs='not json' WHERE id=?", (d,))
+        self.finish(b)
+        self.assertEqual(self.status(b), "done")
+        self.assertEqual(self.status(d), "open")
+
+    def test_an_unreadable_project_meta_does_not_break_the_close(self):
+        p = self.ok("project", "add", "a project", "--kind", "workstream").stdout.strip()
+        with self.conn() as c:
+            c.execute("UPDATE projects SET meta='not json' WHERE id=?", (p,))
+        b = self.blocker()
+        d = self.dependent(b, project=p)
+        self.finish(b)
+        self.assertEqual(self.status(b), "done")
+        self.assertEqual(self.status(d), "open")
+
+    def test_an_undecided_proposal_is_never_promoted(self):
+        """Moving a pending proposal to `ready` would look like a decision."""
+        b = self.blocker()
+        d = self.dependent(b, flag=True, kind="proposal", stage="pending-review")
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+        self.assertEqual(self.promotions(d), [])
+
+    def test_an_approved_proposal_is_promoted(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True, kind="proposal",
+                           stage="approved-backlog")
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+
+
+class TestAutoPromoteFromAProposalDecision(AutoPromoteCase):
+    """The other door into a terminal status (P-02's drive_task_status).
+
+    A review decision closes its task without going through the verb machine,
+    which is exactly why the hook lives in apply_status and not in
+    transition(). A blocker closed by the owner's decision has finished as surely as
+    one a worker completed.
+    """
+
+    def test_a_resolved_proposal_promotes_its_dependents(self):
+        b = self.ok("proposal", "add", "a condition worth fixing",
+                    "--actor", "mechanic").stdout.strip()
+        d = self.dependent(b, flag=True)
+        self.ok("proposal", "stage", b, "resolved", "--actor", "hub")
+        self.assertEqual(self.status(b), "done")
+        self.assertEqual(self.status(d), "ready")
+        self.assertEqual(json.loads(self.promotions(d)[0]["refs"])["blocker_status"],
+                         "done")
+
+    def test_a_rejected_proposal_promotes_its_dependents(self):
+        b = self.ok("proposal", "add", "a condition to turn down",
+                    "--actor", "mechanic").stdout.strip()
+        d = self.dependent(b, flag=True)
+        self.ok("proposal", "stage", b, "rejected", "--actor", "hub")
+        self.assertEqual(self.status(b), "dropped")
+        self.assertEqual(self.status(d), "ready")
+
+
+class TestAutoPromoteFromAResolvedFollowUp(AutoPromoteCase):
+    """The THIRD door into a terminal status: `bin/followups resolve` (t-206).
+
+    Written for this landing, not ported. Branch B's own c1 assertions for
+    this chain could not come across — they need B's `scratch` helper, assert
+    a row in an `unblocked` attention bucket this base deliberately does not
+    build, and assert an event summary this base writes differently. That left
+    the case with no automated coverage at all, which is the wrong shape: it
+    is the case t-163 was written for. "Waiting on the owner to answer X" is the
+    commonest reason real work here is queued behind something, and a
+    follow-up is how that waiting is recorded.
+
+    So it is re-asserted here in this base's own shape. The chain under test is
+    the whole assembly and it crosses two files: `bin/followups resolve` ->
+    `estate.apply_status` -> the hook -> the event under actor `estate` ->
+    `estate ready --auto-promoted`.
+    """
+
+    def resolvable(self):
+        """A follow-up, and its id as a task."""
+        if not self.followups_takes_classification():
+            self.skipTest("bin/followups here predates the filing-time "
+                          "classification schema — the other half of this "
+                          "contract has not been re-synced yet")
+        self.followups("add", "answer the design question",
+                       "--classification", "clarification")
+        return "t-1"
+
+    def test_a_resolved_follow_up_promotes_its_flagged_dependent(self):
+        b = self.resolvable()
+        d = self.dependent(b, flag=True)
+        self.assertEqual(self.status(d), "open")
+        self.followups("resolve", "followup:1", "answered")
+        self.assertEqual(self.status(b), "done")
+        self.assertEqual(self.status(d), "ready")
+
+    def test_the_store_is_the_actor_not_whoever_resolved_it(self):
+        b = self.resolvable()
+        d = self.dependent(b, flag=True)
+        self.followups("resolve", "followup:1", "answered")
+        promotion = self.promotions(d)[0]
+        self.assertEqual(promotion["actor"], "estate")
+        self.assertEqual(json.loads(promotion["refs"])["blocker"], b)
+
+    def test_the_close_is_tagged_the_way_every_other_close_is(self):
+        """The other half of t-206: P-06 could not see this subsystem's
+        commonest terminal outcome, because this path wrote its own bare
+        `open -> resolved` event."""
+        b = self.resolvable()
+        self.dependent(b, flag=True)
+        self.followups("resolve", "followup:1", "answered")
+        close = [e for e in self.events(b)
+                 if e["kind"] == "transition" and e["summary"] == "open -> done"]
+        self.assertEqual(len(close), 1)
+        self.assertEqual(close[0]["subsystem"], "tasks")
+        self.assertEqual(close[0]["phase"], "outcome")
+
+    def test_the_promoted_task_reaches_the_hubs_query(self):
+        b = self.resolvable()
+        d = self.dependent(b, flag=True)
+        self.assertEqual(self.ok("ready", "--auto-promoted").stdout.strip(), "")
+        self.followups("resolve", "followup:1", "answered")
+        self.assertIn(d, self.ok("ready", "--auto-promoted").stdout)
+
+    def test_an_unflagged_dependent_is_left_alone(self):
+        b = self.resolvable()
+        d = self.dependent(b)
+        self.followups("resolve", "followup:1", "answered")
+        self.assertEqual(self.status(d), "open")
+        self.assertEqual(self.promotions(d), [])
+        self.assertEqual(self.ok("ready", "--auto-promoted").stdout.strip(), "")
+
+    def test_resolving_twice_promotes_once(self):
+        """An already-terminal follow-up is left alone, so the promotion does
+        not fire a second time on a task somebody has since claimed."""
+        b = self.resolvable()
+        d = self.dependent(b, flag=True)
+        self.followups("resolve", "followup:1", "answered")
+        self.followups("resolve", "followup:1", "answered again")
+        self.assertEqual(len(self.promotions(d)), 1)
+
+
+class TestAutoPromoteVerb(AutoPromoteCase):
+    """`task auto-promote` — the retrofit path for tasks that already exist."""
+
+    def refs(self, key):
+        return json.loads(self.task(key)["refs"] or "{}")
+
+    def test_on_sets_the_flag_and_takes_effect(self):
+        b = self.blocker()
+        d = self.dependent(b)
+        self.ok("task", "auto-promote", d, "--on", "--actor", "hub")
+        self.assertIs(self.refs(d)["auto_promote"], True)
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+
+    def test_off_writes_an_explicit_false(self):
+        b = self.blocker()
+        d = self.dependent(b, flag=True)
+        self.ok("task", "auto-promote", d, "--off", "--actor", "hub")
+        self.assertIs(self.refs(d)["auto_promote"], False)
+        self.finish(b)
+        self.assertEqual(self.status(d), "open")
+
+    def test_clear_removes_the_key_rather_than_denying(self):
+        """Cleared inherits the project's default; off overrides it."""
+        p = self.ok("project", "add", "a flagged project", "--kind", "workstream",
+                    "--meta", '{"auto_promote": true}').stdout.strip()
+        b = self.blocker()
+        d = self.dependent(b, flag=False, project=p)
+        self.ok("task", "auto-promote", d, "--clear", "--actor", "hub")
+        self.assertNotIn("auto_promote", self.refs(d))
+        self.finish(b)
+        self.assertEqual(self.status(d), "ready")
+
+    def test_it_preserves_the_other_refs_keys(self):
+        d = self.ok("task", "add", "a task", "--kind", "generic",
+                    "--refs", '{"pr": "acme/gizmo#1"}').stdout.strip()
+        self.ok("task", "auto-promote", d, "--on", "--actor", "hub")
+        self.assertEqual(self.refs(d), {"pr": "acme/gizmo#1", "auto_promote": True})
+
+    def test_it_records_the_change(self):
+        d = self.ok("task", "add", "a task", "--kind", "generic").stdout.strip()
+        self.ok("task", "auto-promote", d, "--on", "--actor", "hub")
+        summaries = [e["summary"] for e in self.events(d)]
+        self.assertIn('auto_promote "unset" -> true', summaries)
+
+    def test_it_refuses_an_ambiguous_request(self):
+        d = self.ok("task", "add", "a task", "--kind", "generic").stdout.strip()
+        for args in (("--on", "--off"), ()):
+            with self.subTest(args=args):
+                result = self.cli("task", "auto-promote", d, *args)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("exactly one of", result.stderr)
+
+    def test_it_refuses_an_unknown_task(self):
+        result = self.cli("task", "auto-promote", "t-99", "--on")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("no task matches", result.stderr)
+
+
 class TestPromotionAttribution(EstateCase):
     """P-19 / S37 — a promotion is the Memory subsystem's own act.
 
@@ -2239,8 +3119,13 @@ class TestPromotionAttribution(EstateCase):
                 "--source-refs", '{"ledger": [7, 9]}')
         row = self.promotion_event(key)
         self.assertEqual(row["memory_id"], key)
-        self.assertIn("scope=shared", row["summary"])
-        self.assertEqual(row["refs"], '{"ledger": [7, 9]}')
+        # t-389: BOTH scopes, in the summary and again as a field. The
+        # provenance the caller cited survives beside the scope pair.
+        self.assertEqual(row["summary"],
+                         "candidate -> active (scope: mechanic -> shared)")
+        self.assertEqual(json.loads(row["refs"]),
+                         {"ledger": [7, 9],
+                          "scope_change": {"from": "mechanic", "to": "shared"}})
         self.assertTrue(row["ts"], "a promotion event needs its timestamp")
 
     def test_after_restart_only_the_promoted_fact_is_in_shared_recall(self):
@@ -2299,6 +3184,277 @@ class TestPromotionAttribution(EstateCase):
             os.path.dirname(os.path.abspath(__file__))), "lib"))
         import actors
         self.assertEqual(actors.normalize("memory").actor_class, "tool")
+
+
+class TestPromotingAnActiveLocalFact(EstateCase):
+    """t-389 — the deadlock, and the widening that resolves it.
+
+    Recall returns only `active`. Promotion used to accept only `candidate`.
+    So the rows that satisfied "a local fact recallable in its own context"
+    were exactly the rows promotion refused, and no promotion had ever
+    occurred on the live store. These tests are about the transition that was
+    unreachable: a fact that is ALREADY active and local becoming estate-wide.
+    """
+
+    def local(self, body="a fact the hub learned", scope="hub"):
+        return self.remember(body, scope=scope, refs='{"ledger": [11]}',
+                             active=True)
+
+    def transitions(self, key):
+        return [e for e in self.memory_events(key) if e["kind"] == "transition"]
+
+    def test_an_active_local_fact_is_recallable_before_it_is_promoted(self):
+        """The half of the deadlock that was never in doubt."""
+        key = self.local()
+        self.assertIn(key, self.ok("memory", "recall", "--scope", "hub").stdout)
+        self.assertNotIn(key, self.ok("memory", "recall",
+                                      "--scope", "mechanic").stdout)
+
+    def test_one_operation_makes_it_estate_wide(self):
+        key = self.local()
+        result = self.ok("memory", "promote", key, "--scope", "shared")
+        self.assertIn("local -> shared", result.stdout)
+        self.assertEqual(self.memory(key)["scope"], "shared")
+        self.assertEqual(self.memory(key)["status"], "active")
+
+    def test_and_then_every_other_scope_recalls_it(self):
+        """The whole point: promotion changed who can see the fact."""
+        key = self.local()
+        self.ok("memory", "promote", key, "--scope", "shared")
+        for scope in ("mechanic", "night-shift", "morning-brief"):
+            self.assertIn(key, self.ok("memory", "recall",
+                                       "--scope", scope).stdout, scope)
+
+    def test_the_event_names_the_memory_subsystem_and_both_scopes(self):
+        key = self.local()
+        self.ok("memory", "promote", key, "--scope", "shared")
+        rows = self.transitions(key)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["actor"], "memory")
+        self.assertEqual(row["subsystem"], "memory")
+        self.assertEqual(row["phase"], "transition")
+        self.assertEqual(row["summary"], "local -> shared (scope: hub -> shared)")
+        self.assertEqual(json.loads(row["refs"])["scope_change"],
+                         {"from": "hub", "to": "shared"})
+
+    def test_the_provenance_it_was_filed_with_survives_the_promotion(self):
+        key = self.local()
+        self.ok("memory", "promote", key, "--scope", "shared")
+        refs = json.loads(self.transitions(key)[0]["refs"])
+        self.assertEqual(refs["ledger"], [11])
+
+    def test_a_local_fact_with_no_provenance_cannot_go_shared(self):
+        """§5.3 still governs: promotion is not a way around --source-refs."""
+        key = self.remember("no citation", scope="hub", active=False)
+        result = self.cli("memory", "promote", key, "--scope", "shared")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--source-refs", result.stderr)
+        self.assertEqual(self.memory(key)["scope"], "hub")
+
+    def test_an_active_fact_is_not_promoted_without_asking_for_a_scope(self):
+        key = self.local()
+        result = self.cli("memory", "promote", key)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--scope shared", result.stderr)
+        self.assertEqual(self.memory(key)["scope"], "hub")
+        self.assertEqual(self.transitions(key), [])
+
+    def test_promotion_never_moves_a_fact_between_loops(self):
+        """A lateral scope change reads like a promotion and is not one."""
+        key = self.local()
+        result = self.cli("memory", "promote", key, "--scope", "mechanic")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("supersede", result.stderr)
+        self.assertEqual(self.memory(key)["scope"], "hub")
+
+    def test_promotion_never_narrows_an_estate_wide_fact(self):
+        key = self.shared("already everyone's")
+        result = self.cli("memory", "promote", key, "--scope", "hub")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not a promotion", result.stderr)
+        self.assertEqual(self.memory(key)["scope"], "shared")
+
+    def test_an_already_shared_fact_has_nowhere_further_to_go(self):
+        key = self.shared()
+        for args in (("memory", "promote", key),
+                     ("memory", "promote", key, "--scope", "shared")):
+            result = self.cli(*args)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("already", result.stderr)
+
+    def test_a_retired_fact_is_sent_to_reinstate_not_promoted(self):
+        key = self.local()
+        self.ok("memory", "archive", key)
+        result = self.cli("memory", "promote", key, "--scope", "shared")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("reinstate", result.stderr)
+
+    def test_a_candidate_still_promotes_and_still_names_both_scopes(self):
+        """The original transition, unbroken, and now saying where it came from."""
+        key = self.remember("unjudged", scope="hub", refs='{"ledger": [12]}')
+        self.ok("memory", "promote", key)
+        self.assertEqual(self.memory(key)["status"], "active")
+        self.assertEqual(self.transitions(key)[0]["summary"],
+                         "candidate -> active (scope: hub -> hub)")
+
+
+class TestCrossStoreReconciliation(EstateCase):
+    """t-389 — the same fact held at two scopes, across two stores.
+
+    The estate store enforces scope. The session auto-memory store has exactly
+    one scope — `shared`, because every file in it reaches every session in the
+    repo — and no field that could say otherwise. So a fact the estate keeps at
+    `hub` and the session store also holds is held at two scopes at once, and
+    that is what this read names.
+
+    Every test points --memory-dir at a tempdir. Nothing here reads or writes
+    the real ~/.claude/projects/.../memory store.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.notes = os.path.join(self.state, "session-memory")
+        os.makedirs(self.notes)
+
+    def note(self, name, body, declares=None):
+        head = ["---", f"name: {name}", "metadata:", "  type: feedback"]
+        if declares:
+            head.append(f"  estate: {declares}")
+        head.append("---")
+        path = os.path.join(self.notes, f"{name}.md")
+        with open(path, "w") as handle:
+            handle.write("\n".join(head) + "\n\n" + body + "\n")
+        return f"{name}.md"
+
+    def reconcile(self, *extra):
+        result = self.ok("memory", "reconcile", "--memory-dir", self.notes,
+                         "--json", *extra)
+        return json.loads(result.stdout)
+
+    def test_a_local_fact_copied_into_the_session_store_is_divergent(self):
+        key = self.remember("the hub learned this", scope="hub",
+                            refs='{"ledger": [1]}', active=True)
+        name = self.note("hub-thing", "the hub learned this", declares=key)
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["divergent"], 1)
+        [finding] = report["findings"]
+        self.assertEqual(finding["memory"], key)
+        self.assertEqual(finding["note"], name)
+        self.assertEqual(finding["memory_scope"], "hub")
+        self.assertEqual(finding["session_scope"], "shared")
+
+    def test_an_estate_wide_fact_copied_there_is_aligned_not_divergent(self):
+        key = self.shared("everybody's fact")
+        self.note("shared-thing", "everybody's fact", declares=key)
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["divergent"], 0)
+        self.assertEqual(report["counts"]["aligned"], 1)
+
+    def test_one_file_may_declare_several_memories(self):
+        """The real store has a running log that absorbed three facts."""
+        a = self.remember("first", scope="hub", refs='{"l": [1]}', active=True)
+        b = self.remember("second", scope="hub", refs='{"l": [2]}', active=True)
+        self.note("log", "first and second", declares=f"{a}, {b}")
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["divergent"], 2)
+        self.assertEqual({f["memory"] for f in report["findings"]}, {a, b})
+
+    def test_a_declared_id_the_store_does_not_have_is_dangling(self):
+        self.note("stale", "a fact whose row went away", declares="m-999")
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["dangling"], 1)
+        self.assertEqual(report["findings"][0]["verdict"], "dangling")
+
+    def test_a_candidate_copied_into_the_session_store_still_diverges(self):
+        """The sharpest case: unrecallable in the estate, loaded by everyone."""
+        key = self.remember("nobody judged this", scope="hub")
+        self.note("unjudged", "nobody judged this", declares=key)
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["divergent"], 1)
+        self.assertEqual(report["findings"][0]["memory_status"], "candidate")
+
+    def test_an_undeclared_file_is_counted_unlinked_and_never_scored_clean(self):
+        """docs/absence-contract.md, applied to a second store."""
+        self.remember("the hub learned this", scope="hub",
+                      refs='{"ledger": [1]}', active=True)
+        self.note("hub-thing", "the hub learned this")
+        report = self.reconcile()
+        self.assertEqual(report["counts"]["divergent"], 0)
+        self.assertEqual(report["counts"]["unlinked"], 1)
+        self.assertEqual(report["unlinked"], ["hub-thing.md"])
+
+    def test_the_text_output_says_out_loud_what_it_did_not_check(self):
+        self.note("hub-thing", "some fact nobody linked")
+        out = self.ok("memory", "reconcile", "--memory-dir", self.notes).stdout
+        self.assertIn("1 of 1 fact files declare no estate counterpart", out)
+        self.assertIn("not evidence they hold no duplicate", out)
+
+    def test_a_close_undeclared_pair_is_suspected_and_never_a_finding(self):
+        body = ("bin/hub-intake record --cursor writes the watermark path "
+                "and silently no-ops when the flag is omitted entirely")
+        self.remember(body, scope="hub", refs='{"ledger": [1]}', active=True)
+        self.note("cursor-note", body)
+        report = self.reconcile()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(len(report["suspected"]), 1)
+        self.assertEqual(report["suspected"][0]["would_be"], "divergent")
+        self.assertGreater(report["suspected"][0]["score"], 0.4)
+
+    def test_declaring_a_pair_moves_it_out_of_the_worklist(self):
+        """The worklist converges as links get declared, rather than re-guessing."""
+        body = "a distinctly worded fact about worktree destination paths"
+        key = self.remember(body, scope="hub", refs='{"ledger": [1]}',
+                            active=True)
+        self.note("wt", body)
+        self.assertEqual(len(self.reconcile()["suspected"]), 1)
+        self.note("wt", body, declares=key)
+        after = self.reconcile()
+        self.assertEqual(after["suspected"], [])
+        self.assertEqual(after["counts"]["divergent"], 1)
+
+    def test_unrelated_text_is_not_suspected(self):
+        self.remember("the spotter's heartbeat file went stale", scope="hub",
+                      refs='{"ledger": [1]}', active=True)
+        self.note("elsewhere", "how to publish a nix flake output to a registry")
+        self.assertEqual(self.reconcile()["suspected"], [])
+
+    def test_the_index_file_is_not_a_fact(self):
+        with open(os.path.join(self.notes, "MEMORY.md"), "w") as handle:
+            handle.write("- [a](a.md) — a summary line\n")
+        self.assertEqual(self.reconcile()["counts"]["notes"], 0)
+
+    def test_a_store_that_cannot_be_read_is_not_a_store_that_is_empty(self):
+        result = self.cli("memory", "reconcile", "--memory-dir",
+                          os.path.join(self.state, "nowhere"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not the same as it holding nothing", result.stderr)
+
+    def test_the_read_writes_to_neither_store(self):
+        key = self.remember("the hub learned this", scope="hub",
+                            refs='{"ledger": [1]}', active=True)
+        name = self.note("hub-thing", "the hub learned this", declares=key)
+        path = os.path.join(self.notes, name)
+        before_row = self.memory(key)
+        before_events = len(self.memory_events(key))
+        with open(path) as handle:
+            before_note = handle.read()
+        self.reconcile()
+        self.assertEqual(self.memory(key), before_row)
+        self.assertEqual(len(self.memory_events(key)), before_events)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), before_note)
+
+    def test_promoting_a_divergence_resolves_it(self):
+        """The two halves of t-389, working as one: detect, then widen."""
+        key = self.remember("the hub learned this", scope="hub",
+                            refs='{"ledger": [1]}', active=True)
+        self.note("hub-thing", "the hub learned this", declares=key)
+        self.assertEqual(self.reconcile()["counts"]["divergent"], 1)
+        self.ok("memory", "promote", key, "--scope", "shared")
+        after = self.reconcile()["counts"]
+        self.assertEqual(after["divergent"], 0)
+        self.assertEqual(after["aligned"], 1)
 
 
 class ProposalCase(EstateCase):
@@ -2906,6 +4062,137 @@ class TestProposalReviewRecord(ProposalCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("not in the proposal review lifecycle", r.stderr)
         self.assertEqual(self.cli("proposal", "show", "t-999").returncode, 2)
+
+
+class TestPinnedRecurrence(ProposalCase):
+    """t-310 — recurrence identity can be ASSERTED, not only derived.
+
+    A fingerprint over condition prose recognizes wording. A condition worth
+    watching carries a number that moves, so the second night's write-up of
+    one unresolved condition hashed differently and filed as a discovery
+    (t-250, then t-272 — the same extraction:5 drift). `--recurrence-of` names
+    the proposal instead of hoping the words match.
+    """
+
+    NIGHT_ONE = ("nano-ops's mechanic extraction (extraction:5) has drifted: "
+                 "four ported files changed since the 2026-07-29 sync and were "
+                 "never re-synced (a1b2c3d)")
+    NIGHT_TWO = ("nano-ops's mechanic extraction (extraction:5) has drifted: "
+                 "six ported files changed since the 2026-08-06 sync and were "
+                 "never re-synced (9f8e7d6)")
+
+    def test_the_widened_observation_lands_on_the_same_task(self):
+        # c1. Two extraction:5 drift observations, different counts and
+        # hashes, the second pinned. One task, and a recurrence recorded.
+        first = self.propose("extraction:5 drift", "--condition", self.NIGHT_ONE)
+        again = self.ok("proposal", "add", "extraction:5 drift (wider)",
+                        "--condition", self.NIGHT_TWO, "--actor", "mechanic",
+                        "--recurrence-of", first)
+        self.assertEqual(again.stdout.strip(), first)
+        self.assertIn("recurrence", again.stderr)
+        with self.conn() as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
+        self.assertIn("condition observed again",
+                      [e["summary"] for e in self.events(first)])
+        self.assertIn("recurrences       1", self.ok("proposal", "show", first).stdout)
+
+    def test_without_the_pin_the_same_pair_files_twice(self):
+        # The defect, held in place. If this ever stops being true the pin is
+        # no longer what makes the two observations one proposal, and this
+        # class is testing something else.
+        self.propose("extraction:5 drift", "--condition", self.NIGHT_ONE)
+        self.propose("extraction:5 drift (wider)", "--condition", self.NIGHT_TWO)
+        with self.conn() as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM tasks").fetchone()[0], 2)
+
+    def test_the_row_says_the_identity_was_asserted(self):
+        first = self.propose("a drifting condition", "--condition", self.NIGHT_ONE)
+        self.ok("proposal", "add", "wider", "--condition", self.NIGHT_TWO,
+                "--actor", "mechanic", "--recurrence-of", first)
+        refs = json.loads(self.events(first)[-1]["refs"])
+        self.assertEqual(refs["recurrence"], "pinned")
+        # What tonight's wording hashed to, kept because it is the evidence
+        # that the pin did any work at all.
+        self.assertEqual(refs["observed_fingerprint"],
+                         self.ok("proposal", "fingerprint", self.NIGHT_TWO).stdout.strip())
+
+    def test_a_derived_recurrence_still_says_derived(self):
+        first = self.propose("the dispatch store loses rows")
+        self.ok("proposal", "add", "the dispatch store loses rows",
+                "--actor", "mechanic")
+        refs = json.loads(self.events(first)[-1]["refs"])
+        self.assertEqual(refs["recurrence"], "derived")
+        self.assertNotIn("observed_fingerprint", refs)
+
+    def test_a_pin_fills_a_blank_the_same_way_a_hash_match_does(self):
+        first = self.propose("extraction drift", "--condition", self.NIGHT_ONE)
+        self.ok("proposal", "add", "wider", "--condition", self.NIGHT_TWO,
+                "--actor", "mechanic", "--recurrence-of", first,
+                "--completion-check", "one sync with nothing left over")
+        self.assertIn("one sync with nothing left over",
+                      self.ok("proposal", "show", first).stdout)
+
+    def test_pinning_a_missing_task_is_refused(self):
+        r = self.cli("proposal", "add", "x", "--recurrence-of", "t-99")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no task matches 't-99'", r.stderr)
+
+    def test_pinning_a_task_outside_the_lifecycle_is_refused(self):
+        key = self.add("ordinary work").stdout.strip()
+        r = self.cli("proposal", "add", "x", "--recurrence-of", key)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not in the proposal review lifecycle", r.stderr)
+        self.assertIn("--adopt-task", r.stderr)
+
+    def test_a_refused_pin_writes_nothing(self):
+        key = self.add("ordinary work").stdout.strip()
+        before = len(self.events(key))
+        self.cli("proposal", "add", "x", "--recurrence-of", key)
+        with self.conn() as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
+        self.assertEqual(len(self.events(key)), before)
+
+    def test_a_pin_cannot_steal_a_condition_another_proposal_owns(self):
+        mine = self.propose("condition A")
+        self.propose("condition B")
+        r = self.cli("proposal", "add", "condition B", "--actor", "mechanic",
+                     "--recurrence-of", mine)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("one condition is one proposal", r.stderr)
+
+    def test_repinning_the_identical_wording_is_still_one_recurrence(self):
+        # The pin is redundant here — the hash would have found it — and a
+        # redundant assertion is not a wrong one.
+        first = self.propose("condition A")
+        again = self.ok("proposal", "add", "condition A", "--actor", "mechanic",
+                        "--recurrence-of", first)
+        self.assertEqual(again.stdout.strip(), first)
+        self.assertIn("recurrences       1", self.ok("proposal", "show", first).stdout)
+
+    def test_pin_and_adopt_cannot_both_be_true(self):
+        first = self.propose("condition A")
+        self.add("ordinary work")
+        r = self.cli("proposal", "add", "condition C", "--recurrence-of", first,
+                     "--adopt-task", "t-2")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("cannot both be true", r.stderr)
+
+    def test_a_pinned_fingerprint_that_disagrees_with_the_pin_is_refused(self):
+        first = self.propose("condition A")
+        r = self.cli("proposal", "add", "condition C", "--recurrence-of", first,
+                     "--fingerprint", "deadbeef1234")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("two different", r.stderr)
+
+    def test_a_resolved_proposal_pinned_again_still_reads_resolved(self):
+        # S10 holds through the pin: a condition that came back after it was
+        # called fixed must not read as a discovery.
+        first = self.propose("extraction drift", "--condition", self.NIGHT_ONE)
+        self.ok("proposal", "stage", first, "resolved", "--actor", "hub")
+        r = self.ok("proposal", "add", "wider", "--condition", self.NIGHT_TWO,
+                    "--actor", "mechanic", "--recurrence-of", first)
+        self.assertEqual(r.stdout.strip(), first)
+        self.assertIn("resolved", r.stderr)
 
 
 if __name__ == "__main__": unittest.main()

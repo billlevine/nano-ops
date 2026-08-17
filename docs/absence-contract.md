@@ -157,6 +157,18 @@ not evidence. It used to read as a quiet morning. An outcome this estate has
 never defined is answered on the status alone — the unknown half can withhold
 the answer, never supply one.
 | `spotter` | vocabulary registered and drift-checked against `track.py`'s `SOURCE_*` constants. The engine's own classification is unchanged — the registry is what a third subsystem now reads instead of re-deriving it. |
+| `coverage` | `bin/outcome-coverage` (t-388) counts how many times each defined outcome was actually reached, so its whole product is a set of zeroes a reader has to be able to trust. Each of its three sources — the estate store, the night shift's JSONL, `loops.toml` — is one `reading()`, and an outcome whose sources cannot support an absence prints `unobservable` instead of `0`. Its third verdict is this module's refusal rather than a second scheme, and `partial` is used for real: a JSONL line that would not parse is exactly where the one occurrence of an unexercised path would hide, so the counts stand and the absence claim does not. |
+| `dashboard` | `lib/dashboard_panels.py` gives each of the nine panels an envelope of the same shape, derives its three statuses and its predicate from the registered vocabulary, and renders a panel that could not be read differently from one that read and found nothing. `docs/dashboard-panel-contract.md`. |
+| `doorbell` | `bin/doorbell read` (t-782) is the hub's read-only fallback when the Slack MCP connector is down, and it is the estate's clearest use of `partial`. Slack answers an `oldest`-bounded `conversations.history` with the NEWEST messages in the window and reports truncation in `has_more` / `response_metadata.next_cursor`; the improvised fallback of 2026-08-16 fetched that flag and discarded it. A truncated read is `observed` and partial — the messages it returned are real work, and the one thing it may not do is prove the inbox is quiet, because a cursor advanced past it skips the remainder permanently. The polling daemon does not import this module: the registry is reached only on the `read` path, and there is no fallback if the import fails. |
+
+The dashboard is the first subsystem that did **not** have to be bitten first.
+P-03 and P-11 each learned this rule from an outage; t-390 found the same bug
+in nine more places and fixed it by passing through this registry, which is the
+thing this module was built to make possible. It imports `brief_manifest`'s
+three statuses and freshness words on purpose — those are the presentation
+half, and the two panels share one chip and one browser-side age ticker, so a
+second copy would be two names for one dot. The warrant half is its own, which
+is what the registry is for.
 
 The briefer's three statuses are a projection, not a rival scheme:
 

@@ -19,6 +19,7 @@ Run: python3 tests/test_estate_work.py
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sqlite3
 import subprocess
@@ -191,6 +192,286 @@ class ProposalViewTest(_Store):
         self.assertIsNone(proposal["completion_check"])
 
 
+class DecisionSurfaceTest(_Store):
+    """t-476 — which stored field is the question, and which is the
+    recommendation. One rule; both renderers read it."""
+
+    def test_todays_fields_answer_and_the_row_says_which_one_did(self):
+        self.estate("proposal", "add", "Disk fills during export",
+                    "--condition", "the export fills the disk",
+                    "--desired-outcome", "exports stay below the budget",
+                    "--completion-check", "check free space")
+        surface = estate_work.decision_surface(
+            dict(self.connect().execute(
+                "SELECT * FROM tasks WHERE id='t-1'").fetchone()))
+        self.assertEqual(surface["question"], "the export fills the disk")
+        self.assertEqual(surface["question_field"], "condition")
+        self.assertEqual(surface["recommendation"],
+                         "exports stay below the budget")
+        self.assertEqual(surface["recommendation_field"], "desired_outcome")
+
+    def test_an_explicit_key_wins_over_the_field_that_answers_today(self):
+        self.estate("task", "add", "later schema", "--kind", "proposal",
+                    "--refs", json.dumps({"condition": "observed something",
+                                          "question": "ship it or drop it?",
+                                          "desired_outcome": "the old field",
+                                          "recommendation": "ship it"}))
+        surface = estate_work.decision_surface(
+            dict(self.connect().execute(
+                "SELECT * FROM tasks WHERE id='t-1'").fetchone()))
+        self.assertEqual(surface["question"], "ship it or drop it?")
+        self.assertEqual(surface["question_field"], "question")
+        self.assertEqual(surface["recommendation"], "ship it")
+        self.assertEqual(surface["recommendation_field"], "recommendation")
+
+    def test_absent_is_none_and_never_the_title(self):
+        self.estate("task", "add", "a title that is not a question",
+                    "--kind", "generic")
+        surface = estate_work.decision_surface(
+            dict(self.connect().execute(
+                "SELECT * FROM tasks WHERE id='t-1'").fetchone()))
+        for key in ("question", "recommendation", "context", "context_line"):
+            self.assertIsNone(surface[key], key)
+        self.assertIsNone(surface["question_field"])
+
+    def test_blank_is_the_same_absence_as_missing(self):
+        self.estate("task", "add", "blank fields", "--kind", "proposal",
+                    "--refs", json.dumps({"condition": "   ",
+                                          "desired_outcome": ""}))
+        surface = estate_work.decision_surface(
+            dict(self.connect().execute(
+                "SELECT * FROM tasks WHERE id='t-1'").fetchone()))
+        self.assertIsNone(surface["question"])
+        self.assertIsNone(surface["recommendation_field"])
+
+    def test_context_prefers_the_envelope_and_falls_back_to_intent(self):
+        self.estate("task", "add", "from intent", "--kind", "generic",
+                    "--intent", "why this task exists")
+        self.estate("task", "add", "from context", "--kind", "followup",
+                    "--intent", "the column", "--refs",
+                    json.dumps({"context": "the envelope\nsecond line"}))
+        rows = {r["id"]: dict(r) for r in
+                self.connect().execute("SELECT * FROM tasks")}
+        intent = estate_work.decision_surface(rows["t-1"])
+        self.assertEqual(intent["context"], "why this task exists")
+        self.assertEqual(intent["context_field"], "intent")
+        envelope = estate_work.decision_surface(rows["t-2"])
+        self.assertEqual(envelope["context_field"], "context")
+        self.assertEqual(envelope["context_line"], "the envelope")
+
+    def test_the_proposal_envelope_ships_the_name_not_a_second_copy(self):
+        self.estate("proposal", "add", "Disk fills",
+                    "--condition", "the export fills the disk",
+                    "--desired-outcome", "exports stay below the budget",
+                    "--completion-check", "check free space")
+        proposal = self.tasks()["t-1"]["proposal"]
+        self.assertEqual(proposal["question_field"], "condition")
+        self.assertEqual(proposal["recommendation_field"], "desired_outcome")
+        # The text is already on the envelope under its own key. Shipping it
+        # again would be the duplication §4.6 refused.
+        #
+        # The KEY is on every proposal envelope since t-475 made `question` and
+        # `recommendation` stored fields in their own right, so the assertion
+        # is about the VALUE: answered by `condition`, this row's `question`
+        # stays empty rather than carrying a second copy of a string already
+        # two keys away. (The `assertNotIn` this replaces could not have passed
+        # after t-475 and had been red on main since.)
+        self.assertIsNone(proposal["question"])
+        self.assertIsNone(proposal["recommendation"])
+
+    def test_a_key_outside_the_envelope_does_ship_its_text(self):
+        self.estate("task", "add", "later schema", "--kind", "proposal",
+                    "--stage", "pending-review",
+                    "--refs", json.dumps({"question": "ship it or drop it?"}))
+        proposal = self.tasks()["t-1"]["proposal"]
+        self.assertEqual(proposal["question"], "ship it or drop it?")
+        self.assertEqual(proposal["question_field"], "question")
+
+    def test_only_attention_rows_carry_a_context_line(self):
+        self.estate("task", "add", "waiting", "--kind", "followup", "--refs",
+                    json.dumps({"context": "first line\nrest of it"}))
+        self.estate("task", "add", "ordinary", "--kind", "generic",
+                    "--intent", "not in the attention set")
+        tasks = self.tasks()
+        self.assertEqual(tasks["t-1"]["context_line"], "first line")
+        self.assertEqual(tasks["t-1"]["context_field"], "context")
+        self.assertNotIn("context_line", tasks["t-2"])
+
+
+class ClampTest(unittest.TestCase):
+    """t-721 — the summary line, and the bug that made it a paragraph.
+
+    Pure, so the boundary is tested by moving the limit rather than by finding
+    a row in the store that happens to sit on it.
+    """
+
+    def test_a_blob_with_no_newline_is_clamped_rather_than_shipped_whole(self):
+        # F7 exactly: `first_line` finds no newline, so before this the whole
+        # 500-character paragraph reached the page as "one line".
+        blob = "word " * 200
+        self.assertEqual(estate_work.first_line(blob), blob.strip())
+        line, clamped = estate_work.one_line(blob)
+        self.assertTrue(clamped)
+        self.assertLessEqual(len(line), estate_work.CONTEXT_LINE_MAX)
+        self.assertTrue(line.endswith(estate_work.ELLIPSIS))
+
+    def test_a_short_line_is_returned_untouched_and_says_it_was_not_cut(self):
+        self.assertEqual(estate_work.one_line("short enough"),
+                         ("short enough", False))
+        self.assertEqual(estate_work.clamp(None, 80), (None, False))
+        self.assertEqual(estate_work.clamp("   ", 80), (None, False))
+
+    def test_the_cut_lands_on_a_word_boundary_when_one_is_near_the_end(self):
+        text = "alpha beta gamma delta epsilon"
+        line, clamped = estate_work.clamp(text, 20)
+        self.assertTrue(clamped)
+        self.assertEqual(line, "alpha beta gamma" + estate_work.ELLIPSIS)
+        # And a single unbroken token is cut hard rather than dropped: showing
+        # part of it beats showing none of it.
+        long_token = "x" * 60
+        self.assertEqual(estate_work.clamp(long_token, 20),
+                         ("x" * 19 + estate_work.ELLIPSIS, True))
+
+    def test_a_headline_takes_the_first_line_and_the_full_title_survives(self):
+        title = "A title that runs well past eighty characters " * 3
+        surface = estate_work.decision_surface({"title": title})
+        self.assertTrue(surface["headline_clamped"])
+        self.assertLessEqual(len(surface["headline"]),
+                             estate_work.HEADLINE_MAX)
+        # Nothing here rewrote the title; the clamp is an ADDED key.
+        self.assertNotIn("title", surface)
+
+
+class DecisionStateTest(unittest.TestCase):
+    """t-721 — what a row says about its own decision, and what it does not.
+
+    The rule is a READING of what was filed. Nothing infers a classification
+    for a row that declared none: most rows on a real set are in exactly that
+    condition and `unstated` is the answer they get.
+    """
+
+    def sketch(self, **over):
+        fields = {"classification": "decision", "question": "which one?",
+                  "alternatives": [{"option": "a", "consequence": "x"},
+                                   {"option": "b", "consequence": "y"}],
+                  "recommendation": "a", "defer_consequence": "it rots"}
+        fields.update(over)
+        return fields
+
+    def test_a_complete_decision_is_sketched(self):
+        self.assertEqual(estate_work.decision_state(self.sketch()),
+                         (estate_work.SKETCHED, []))
+
+    def test_a_decision_missing_a_part_names_the_part(self):
+        state, missing = estate_work.decision_state(
+            self.sketch(recommendation="", defer_consequence=None))
+        self.assertEqual(state, estate_work.INCOMPLETE)
+        self.assertEqual(missing, ["recommendation", "defer_consequence"])
+        # One alternative is not a choice — the same floor the filing gate
+        # enforces, read back rather than re-invented.
+        state, missing = estate_work.decision_state(
+            self.sketch(alternatives=[{"option": "a", "consequence": "x"}]))
+        self.assertEqual((state, missing),
+                         (estate_work.INCOMPLETE, ["alternatives"]))
+
+    def test_the_recorded_no_pick_sentinel_is_a_recommendation(self):
+        # "not recorded" is a filer who read the options and picked none. It is
+        # an answer, and reading it as a hole is the absence contract inverted.
+        self.assertEqual(
+            estate_work.decision_state(self.sketch(recommendation="not recorded")),
+            (estate_work.SKETCHED, []))
+
+    def test_an_action_owes_no_sketch_and_an_unclassified_row_is_unstated(self):
+        self.assertEqual(estate_work.decision_state({"classification": "action"}),
+                         (estate_work.STATED, []))
+        self.assertEqual(estate_work.decision_state({}),
+                         (estate_work.UNSTATED, []))
+        self.assertEqual(estate_work.decision_state({"context": "a sentence"}),
+                         (estate_work.UNSTATED, []))
+
+
+class AttentionTierTest(_Store):
+    """t-721, P4 resolved uncapped — typed tiers, age only within a tier."""
+
+    def waiting(self):
+        # One of each tier: a proposal parked on the owner, a plain escalation, and
+        # an ordinary open follow-up.
+        self.estate("proposal", "add", "a decision for the owner",
+                    "--condition", "something", "--desired-outcome", "a fix",
+                    "--completion-check", "it is fixed")
+        self.estate("task", "add", "an escalation", "--kind", "generic",
+                    "--ready")
+        self.estate("task", "add", "a standing obligation", "--kind",
+                    "followup", "--refs", json.dumps({"context": "why"}))
+        # Only an approved proposal is claimable, and a proposal reaches
+        # `needs-owner` the same way anything else does — through a claim.
+        self.estate("proposal", "stage", "t-1", "approved-backlog", "go ahead",
+                    "--actor", "owner")
+        for key in ("t-1", "t-2"):
+            self.estate("claim", key, "--actor", "hub")
+            self.estate("needs-owner", key, "over to the owner", "--actor", "hub")
+
+    def test_the_three_tiers_come_from_status_kind_and_stage(self):
+        self.waiting()
+        view = self.build()
+        tasks = self.tasks(view)
+        self.assertEqual(tasks["t-1"]["tier"], "decision")
+        self.assertEqual(tasks["t-2"]["tier"], "escalation")
+        self.assertEqual(tasks["t-3"]["tier"], "followup")
+        self.assertEqual([t["id"] for t in view["attention_tiers"]],
+                         ["decision", "escalation", "followup"])
+        # Every row in the set is in exactly one tier, and none is dropped.
+        self.assertEqual(
+            sum(t["total"] for t in view["attention_tiers"]),
+            view["attention_counts"]["total"])
+
+    def test_no_tier_is_capped_and_both_counts_are_carried(self):
+        for n in range(12):
+            self.estate("task", "add", f"follow-up {n}", "--kind", "followup")
+        view = self.build()
+        tier = view["attention_tiers"][0]
+        self.assertEqual(tier["id"], "followup")
+        self.assertEqual(tier["total"], 12)
+        self.assertEqual(len(tier["ids"]), 12,
+                         "a cap on the ids is the thing P4 refused")
+        self.assertEqual(tier["notice"], 0)
+
+    def test_the_notice_count_is_the_contracts_band_not_a_new_one(self):
+        self.estate("task", "add", "overdue", "--kind", "followup",
+                    "--due", iso(-1))
+        self.estate("task", "add", "later", "--kind", "followup",
+                    "--due", iso(30))
+        tier = self.build()["attention_tiers"][0]
+        self.assertEqual((tier["total"], tier["notice"]), (2, 1))
+
+    def test_idle_is_measured_against_the_rows_own_tier(self):
+        # Two tiers with very different clocks. The follow-up tier's old row is
+        # above ITS median; the same number of days in the other tier is not a
+        # comparison this makes at all.
+        self.waiting()
+        for n in range(2):
+            self.estate("task", "add", f"fresh follow-up {n}",
+                        "--kind", "followup")
+        conn = self.connect()
+        view = estate_work.build(conn, now=NOW + dt.timedelta(days=10), tz=UTC)
+        tasks = self.tasks(view)
+        tiers = {t["id"]: t for t in view["attention_tiers"]}
+        self.assertEqual(tiers["decision"]["total"], 1)
+        self.assertIsNotNone(tasks["t-3"]["idle_days"])
+        # A tier of one has a median equal to its only row, so nothing in it is
+        # above its own median — an honest "no comparison to make".
+        self.assertIs(tasks["t-1"]["idle_above_tier_median"], False)
+        self.assertEqual(tiers["decision"]["idle_median"],
+                         tasks["t-1"]["idle_days"])
+
+    def test_only_attention_rows_are_tiered(self):
+        self.estate("task", "add", "ordinary work", "--kind", "generic",
+                    "--ready")
+        tasks = self.tasks()
+        self.assertNotIn("tier", tasks["t-1"])
+        self.assertEqual(self.build()["attention_tiers"], [])
+
+
 class DueStateTest(_Store):
     def test_the_five_states_plus_unreadable_are_derived_not_stored(self):
         self.estate("task", "add", "overdue", "--kind", "generic", "--due", iso(-2))
@@ -298,7 +579,7 @@ class AttentionSetTest(_Store):
         self.estate("mark-ready", "t-2", "--actor", "hub")
         self.estate("claim", "t-2", "--actor", "hub")
         self.estate("done", "t-2", "--actor", "hub", "--summary", "answered",
-                    "--verification", "he replied")
+                    "--verification", "they replied")
         view = self.build()
         self.assertNotIn("t-2", view["attention"])
         self.assertIn("t-2", view["followups"])
@@ -333,7 +614,9 @@ class FollowupEnvelopeTest(_Store):
     def test_the_refs_envelope_is_decoded_for_every_followup(self):
         subprocess.run([sys.executable, FOLLOWUPS, "add", "ask about the SLA",
                         "--source", "slack", "--ref", "chan-123/456",
-                        "--context", "raised in the standup"],
+                        "--context", "raised in the standup",
+                        # required at this writer since t-475
+                        "--classification", "action"],
                        capture_output=True, text=True, env=self.env, check=True)
         view = self.tasks()["t-1"]["followup"]
         self.assertEqual(view["legacy_id"], "followup:1")
@@ -385,7 +668,7 @@ class InboxMessageTest(_Store):
     def test_open_messages_are_listed_oldest_first(self):
         """Oldest first because the one open longest is the one most likely to
         have been missed, which is the entire failure this tracks."""
-        self.message("the first thing he asked", "1754000001.0001")
+        self.message("the first thing they asked", "1754000001.0001")
         self.message("the second thing", "1754000002.0001")
         view = self.build()
         self.assertEqual(view["inbox_messages"], ["t-1", "t-2"])

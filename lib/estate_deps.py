@@ -38,6 +38,19 @@ SELECT d.to_task AS task_id, d.from_task AS blocker
  ORDER BY b.seq
 """ % ",".join("?" for _ in TERMINAL)
 
+# The other direction, and the only place anything reads it: who was waiting on
+# THIS task. `blocked_by` answers "what is holding T up" for a reader; this
+# answers "who did T just release" for a writer that has finished T (t-163).
+# Same edge, same `blocks` kind, no second notion of blocking.
+DEPENDENTS_SQL = """
+SELECT d.to_task AS task_id
+  FROM task_deps d
+  JOIN tasks t ON t.id = d.to_task
+ WHERE d.dep_kind = 'blocks'
+   AND d.from_task = ?
+ ORDER BY t.seq
+"""
+
 
 def has_deps_table(conn) -> bool:
     return bool(conn.execute(
@@ -67,6 +80,18 @@ def blocked_by(conn, task_ids=None) -> dict[str, list[str]]:
             continue
         out.setdefault(task, []).append(blocker)
     return out
+
+
+def dependents(conn, task_id: str) -> list[str]:
+    """The ids of the tasks this one blocks, in creation order.
+
+    Empty on a store with no `task_deps` table, for the same reason
+    `blocked_by` returns {}: no dependency table means no dependencies, which
+    is an answer and not an error.
+    """
+    if not has_deps_table(conn):
+        return []
+    return [row["task_id"] for row in conn.execute(DEPENDENTS_SQL, (task_id,))]
 
 
 def annotate(rows, blockers: dict[str, list[str]]) -> list[dict]:

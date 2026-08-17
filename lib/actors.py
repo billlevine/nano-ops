@@ -82,6 +82,24 @@ TOOLS = frozenset({"ops", "cli", "estate", "doorbell", "memory"})
 # installation's own loops are classified without editing this file.
 KNOWN_LOOPS = frozenset({"example", "mechanic"})
 
+# Standing sessions that are NOT in loops.toml: long-lived and non-ticking, a
+# third shape the registry cannot express, since it can only say `autostart`
+# with an interval or `on-demand`.
+#
+# EMPTY BY DEFAULT, for the same reason ALIASES is: which sessions an
+# installation keeps standing outside its registry is one of its own facts.
+# An installation adds its own — `STANDING_SESSIONS = frozenset({"<name>"})`.
+#
+# Deliberately NOT the same thing as adding the name to KNOWN_LOOPS, which is
+# a FALLBACK the live registry replaces: a caller passing `loops=` read from
+# loops.toml would not find it there, so the same actor would classify as
+# `loop` for a caller with no registry and `other` for one with it — one
+# identity in two buckets depending on the call path. Checked before the
+# registry lookup for exactly that reason. The class is `loop` because a
+# renderer's question is "is this a standing identity with its own state",
+# and the answer is yes.
+STANDING_SESSIONS: frozenset[str] = frozenset()
+
 EPHEMERAL_PREFIX = "ephemeral-"
 
 
@@ -139,6 +157,8 @@ def classify(canonical: str, loops: Iterable[str] | None = None) -> str:
         return CLASS_GARAGE
     if canonical in TOOLS:
         return CLASS_TOOL
+    if canonical in STANDING_SESSIONS:
+        return CLASS_LOOP
     if canonical in (set(loops) if loops is not None else KNOWN_LOOPS):
         return CLASS_LOOP
     return CLASS_OTHER

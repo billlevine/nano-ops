@@ -25,6 +25,8 @@ reconciles history cannot disagree about either.
      instant, under one explicit notice interval.
   2. THE ATTENTION SET. Which rows in the shared store are "somebody must look
      at this and nothing else will move it".
+  3. THE THREE LIFECYCLE TIERS. Which KIND of waiting one row in that set is —
+     a decision, an escalation, or a standing follow-up (t-721).
 
 THE FIVE DUE STATES
 -------------------
@@ -45,7 +47,7 @@ WHY THE DAY BOUNDARY IS LOCAL AND THE INTERVAL IS NOT
 -----------------------------------------------------
 "Due today" is a claim about the owner's calendar, and their calendar is local. A
 deadline at 20:00 EDT is 00:00 UTC the next day; classifying it as tomorrow
-because the store speaks UTC would tell him a thing due tonight is not.
+because the store speaks UTC would say a thing due tonight is not.
 
 The notice interval is a DURATION and durations have no timezone, so it is
 plain elapsed time. The two are different kinds of measurement and are computed
@@ -86,6 +88,22 @@ view. A dispatch that comes back needing the owner is filed as a follow-up (the
 night shift's `needs-you` exit already routes there) and is therefore already
 in this set the moment it is filed.
 
+THE THREE LIFECYCLE TIERS
+-------------------------
+One set, three kinds of waiting, derived from `status`/`kind`/`stage`:
+
+  decision    parked at `needs-owner` AND carrying a review `stage` — a proposal
+              waiting on the owner to pick.
+  escalation  parked at `needs-owner` with no stage — work that stopped and
+              asked a question.
+  followup    an open follow-up — a standing obligation somebody owes.
+
+Idle time is compared WITHIN a tier and never across them: a week-old decision
+and a week-old follow-up are not the same claim, and ranking the whole set by
+age says only that nobody has touched it. Nothing here caps a tier — the panel
+that produced these was resolved uncapped, and both counts (rendered and total)
+ride on every section instead.
+
 Docs: docs/attention-contract.md
 """
 from __future__ import annotations
@@ -113,6 +131,42 @@ STATE_ORDER = {state: n for n, state in enumerate(ALL_STATES)}
 # `later` and `undated` are deliberately absent — that is S24's negative, and
 # it is a constant here rather than a condition each consumer re-derives.
 NOTICE_STATES = (OVERDUE, DUE_TODAY, DUE_SOON)
+
+
+# ── the three lifecycle tiers (t-721, P4 resolved uncapped) ──────────────────
+#
+# The attention set is ONE set (above) and it is not one KIND of waiting. A
+# proposal parked at `needs-owner` is the owner choosing between options
+# somebody already wrote down; an escalated dispatch is the owner answering a
+# question; an open follow-up is a standing obligation somebody has to
+# discharge. Rendering all three in one flat list ordered by urgency asks a
+# reader to re-derive that distinction on every row, and a set large enough to
+# be worth rendering is a set where that cost is paid on every one of them.
+#
+# These tiers are a READING of `status`, `kind` and `stage` — the three columns
+# the store already holds. Nothing new is stored, no row is classified by
+# anything but what it already says about itself, and a row's tier changes the
+# moment its status does. That is the same posture the five due states take.
+#
+# The tiers are deliberately UNCAPPED: they are how a long list is made
+# readable, NOT a budget that hides its tail. A consumer of
+# these renders every row it holds and prints both counts; there is deliberately
+# no constant here saying how many rows a section may show.
+TIER_DECISION = "decision"
+TIER_ESCALATION = "escalation"
+TIER_FOLLOWUP = "followup"
+TIERS = (TIER_DECISION, TIER_ESCALATION, TIER_FOLLOWUP)
+TIER_ORDER = {tier: n for n, tier in enumerate(TIERS)}
+
+# What each tier means, in the words a reader needs rather than the column
+# names it is derived from.
+TIER_TITLES = {
+    TIER_DECISION: "Decisions — a proposal is waiting on the owner's pick",
+    TIER_ESCALATION: "Escalations — work stopped and asked for the owner",
+    TIER_FOLLOWUP: "Follow-ups — a standing obligation nobody has discharged",
+}
+
+
 
 # The default advance-notice interval, in days. Same number as bin/estate's
 # DUE_DEFAULT_WITHIN_DAYS and the briefer's `due_within_days`, and deliberately
@@ -219,6 +273,52 @@ def is_attention(kind: str, status: str) -> bool:
     if (status or "") in TERMINAL:
         return False
     return (status or "") in ATTENTION_STATUSES or (kind or "") in ATTENTION_KINDS
+
+
+def tier(kind: str, status: str, stage=None):
+    """Which lifecycle tier one attention row is in, or None if it is not in
+    the attention set at all.
+
+    Precedence is `status` first and it is deliberate. A follow-up escalated to
+    `needs-owner` is both an open follow-up and a parked task; what the owner has to
+    DO with it is the escalation, so that is the tier it reads in. The stage
+    column then splits `needs-owner` into the two things it is really carrying —
+    `needs-owner` is two streams under one status name, and on a real set the
+    proposal stream is the one that arrives steadily and almost never leaves.
+    """
+    if not is_attention(kind, status):
+        return None
+    if (status or "") in ATTENTION_STATUSES:
+        return TIER_DECISION if str(stage or "").strip() else TIER_ESCALATION
+    return TIER_FOLLOWUP
+
+
+def idle_days(updated_at, now: dt.datetime):
+    """Days since this row last moved, or None if the stamp will not parse.
+
+    Idle time, not age since filing: a row reopened this morning is not
+    neglected however old it is. Unreadable is None rather than 0 — the same
+    refusal `days_left` makes about a date nobody can read.
+    """
+    stamp = parse_iso(updated_at) if str(updated_at or "").strip() else None
+    if stamp is None:
+        return None
+    return round(max(0.0, (now - stamp).total_seconds() / 86400), 1)
+
+
+def median(values):
+    """The middle of a list of numbers, or None if there are none.
+
+    Here rather than in a consumer because the whole point of a within-tier
+    comparison is that every consumer computes the comparison the same way.
+    """
+    ordered = sorted(v for v in values if v is not None)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(float(ordered[middle]), 1)
+    return round((ordered[middle - 1] + ordered[middle]) / 2.0, 1)
 
 
 def sort_key(state: str, left, seq) -> tuple:
