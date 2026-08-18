@@ -336,9 +336,9 @@ class CliCase(unittest.TestCase):
                          "the shim over this store")
     def test_the_shims_own_word_for_resolving_a_followup_is_a_departure(self):
         """`bin/followups resolve` sets the status to `done` and records the
-        event as `open -> resolved`. That is how the shim closes nearly every
-        follow-up, so a query reading only the store's two terminal words would
-        show a queue that never drains."""
+        event as `open -> done` (t-206). That is how the shim closes nearly
+        every follow-up, so a query reading only the store's two terminal
+        words would show a queue that never drains."""
         self.estate("task", "add", "ask the owner", "--kind", "followup",
                     "--actor", "hub")
         out = subprocess.run(

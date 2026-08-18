@@ -172,6 +172,14 @@ PRIMARY_JS = r"""
   if(!root)return;
   var STORE='ops-digest-checks-v1', COLLAPSE_STORE='ops-digest-collapsed-v1';
   var DAYS=30, selected=null, reports=[], projectUrls={};
+  /* t-390. This page OWNS the digest panel — `sections.brief` is unmanaged
+     here — so everything the shared renderer puts above the brief was landing
+     on a surface nobody serves. That included the panel's own read warrant and
+     the live-board divergence, which was `true` in dashboard.json while the
+     string that says so appeared on none of the four rendered artifacts.
+     Injected as the PRE-RENDERED block rather than rebuilt in JS, so this page
+     and every other one say it in the same bytes. */
+  var PANELSTATE='';
 
   var digestPanel=root.closest('section.panel');
   if(digestPanel){
@@ -332,7 +340,12 @@ PRIMARY_JS = r"""
   }
 
   function render(){
-    if(!reports.length){root.innerHTML='<div class="digest-empty">No briefs available yet.</div>';return;}
+    /* The panel state goes above the tabs and outside the per-report strip: it
+       describes THIS PANEL's read and the newest brief, not whichever morning
+       is selected. "No briefs available yet" is a claim only a successful read
+       may make, so the block precedes it too. */
+    if(!reports.length){root.innerHTML=PANELSTATE+
+      '<div class="digest-empty">No briefs available yet.</div>';return;}
     var report=reports.find(function(r){return r.date===selected;})||reports[0];selected=report.date;
     var checks=load(), parsed=parse(report.body);
     var tabs='<div class="digest-tabs" role="tablist" aria-label="Morning brief date">'+
@@ -340,7 +353,7 @@ PRIMARY_JS = r"""
         return '<button class="digest-tab'+(r.date===selected?' active':'')+'" type="button" data-date="'+
           esc(r.date)+'" role="tab" aria-selected="'+(r.date===selected)+'">'+esc(label)+'</button>';}).join('')+'</div>';
     var intro=parsed.intro.map(function(b){return '<p>'+inline(b.text)+'</p>';}).join('');
-    root.innerHTML=tabs+sourcesHtml(report)+'<div class="digest-report">'+
+    root.innerHTML=PANELSTATE+tabs+sourcesHtml(report)+'<div class="digest-report">'+
       (intro?'<div class="digest-intro">'+intro+'</div>':'')+
       parsed.sections.map(function(s){return sectionHtml(s,report.date,checks);}).join('')+'</div>';
     if(window.OPS_TICK_SOURCES)window.OPS_TICK_SOURCES();
@@ -351,6 +364,7 @@ PRIMARY_JS = r"""
     var x=load();if(e.target.checked)x[id]=Date.now();else delete x[id];save(x);});
   function refresh(){fetch('dashboard.json?t='+Math.floor(Date.now()/1000),{cache:'no-store'})
     .then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(d){
+      PANELSTATE=(d.panel_state_html&&d.panel_state_html.brief)||'';
       reports=(d.brief&&d.brief.reports)||[];
       projectUrls={};((d.focus&&d.focus.projects)||[]).forEach(function(p){if(p.url)projectUrls[p.name]=p.url;});
       linkProjects();
@@ -406,7 +420,10 @@ function install(){
   var body=document.getElementById('sec-mech'),panel=body&&body.closest('section.panel');if(!body||!panel)return;
   panel.classList.add('proposal-review');
   panel.querySelector('.phead').innerHTML='<span class="k">Proposal review</span><span class="grow"></span><span class="tick" id="proposal-count"></span><span class="tick">decide here · audited by estate</span>';
-  body.className='pbody';body.innerHTML='<div id="proposal-stats"></div><div class="proposal-toolbar">__BUTTONS__<input class="search" id="proposal-search" placeholder="Filter proposals…"></div><div id="proposals"></div>';
+  /* t-390: `sec-mech` is unmanaged here too — this panel is rendered entirely
+     from `estate_activity`, so an estate store that could not be opened used
+     to show an empty proposal list and nothing else. */
+  body.className='pbody';body.innerHTML='<div id="proposal-state"></div><div id="proposal-stats"></div><div class="proposal-toolbar">__BUTTONS__<input class="search" id="proposal-search" placeholder="Filter proposals…"></div><div id="proposals"></div>';
   document.querySelectorAll('[data-proposal-stage]').forEach(function(b){b.onclick=function(){PROPOSAL_STAGE=b.dataset.proposalStage;document.querySelectorAll('[data-proposal-stage]').forEach(function(x){x.classList.toggle('active',x===b)});drawProposals()}});
   document.getElementById('proposal-search').oninput=drawProposals;
   body.onclick=function(ev){var b=ev.target.closest('[data-decision-id]');if(b)decideProposal(b)};
@@ -415,6 +432,8 @@ install();
 document.addEventListener('ops-dashboard-data',function(ev){
   document.querySelectorAll('[data-decision-note]').forEach(function(v){DECISION_NOTES[v.dataset.decisionNote]=v.value});
   OPEN_PROPOSALS={};document.querySelectorAll('[data-proposal][open]').forEach(function(v){OPEN_PROPOSALS[v.dataset.proposal]=true});
+  var state=document.getElementById('proposal-state');
+  if(state)state.innerHTML=((ev.detail&&ev.detail.panel_state_html)||{}).estate_activity||'';
   DATA=(ev.detail&&ev.detail.estate_activity)||{};INDEX={};(DATA.tasks||[]).forEach(function(t){INDEX[t.id]=t});drawProposals();
 });
 })();

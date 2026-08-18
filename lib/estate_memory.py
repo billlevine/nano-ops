@@ -158,6 +158,116 @@ def origin(row_scope: str) -> str:
     return SHARED if (row_scope or "").strip() == SHARED else "local"
 
 
+# PROMOTION (t-389, gap audit Q-06)
+# ---------------------------------
+# `promote` used to mean exactly one transition, `candidate -> active`, and
+# that left a deadlock sitting under the whole contract: recall returns only
+# `active`, promotion accepted only `candidate`, so the rows that satisfy "a
+# local fact recallable in its own context" were precisely the rows promotion
+# refused. A fact could be recallable OR promotable, never both, and no
+# promotion had ever occurred on the live store.
+#
+# So promotion is one verb with two lawful transitions, because both are the
+# same act — making a fact reach further than it did:
+#
+#   candidate -> active    a fact nobody had judged becomes recallable.
+#   local -> shared        a fact recallable in one loop becomes estate-wide.
+#
+# It WIDENS and never moves. `active@hub -> active@mechanic` is not a promotion
+# and is refused: it would take a fact away from the loop that learned it while
+# reading, in the event stream, exactly like a promotion. That is a supersede.
+LOCAL = "local"
+PROMOTION_STATUS = "candidate -> active"
+PROMOTION_SCOPE = f"{LOCAL} -> {SHARED}"
+
+# The refs key carrying the scope pair in machine-readable form. The summary
+# names both scopes in prose and this names them in a field, because Q-06's
+# evidence was two real scope changes whose events named neither and a grep is
+# how the third one gets found.
+SCOPE_CHANGE_KEY = "scope_change"
+
+
+class PromotionError(ValueError):
+    """A promotion that is not a widening."""
+
+
+class Promotion:
+    """What one promotion does, decided before anything is written.
+
+    `summary` always names BOTH scopes, in every case, including the case where
+    they are equal. "scope: hub -> hub" is a longer way of saying nothing
+    changed, and it is worth the characters: a reader grepping the event stream
+    for where a fact came from should never have to infer the absent half from
+    a summary that only printed one.
+    """
+
+    def __init__(self, kind: str, status_from: str, scope_from: str,
+                 scope_to: str):
+        self.kind = kind
+        self.status_from = status_from
+        self.status_to = "active"
+        self.scope_from = scope_from
+        self.scope_to = scope_to
+
+    @property
+    def summary(self) -> str:
+        return f"{self.kind} (scope: {self.scope_from} -> {self.scope_to})"
+
+    @property
+    def refs(self) -> dict:
+        return {SCOPE_CHANGE_KEY: {"from": self.scope_from, "to": self.scope_to}}
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Promotion {self.summary}>"
+
+
+def promotion(memory_id: str, status: str, scope: str,
+              requested_scope: str | None) -> Promotion:
+    """The transition `promote` would perform, or why it cannot.
+
+    Pure: it reads a row's current state and the caller's request and returns
+    the decision. Every refusal names the verb that WOULD do what was asked, so
+    a caller who reached for the wrong one is not left guessing.
+    """
+    target = (requested_scope or "").strip() or None
+
+    if status == "candidate":
+        return Promotion(PROMOTION_STATUS, status, scope, target or scope)
+
+    if status != "active":
+        raise PromotionError(
+            f"{memory_id} is '{status}'; promotion applies to a candidate or "
+            f"to an active local fact. A retired fact comes back through "
+            f"`memory reinstate`.")
+
+    # Active from here down: the only widening left is scope.
+    if target is None:
+        if scope == SHARED:
+            raise PromotionError(f"{memory_id} is already active and estate-wide; "
+                                 "there is nothing further to promote it to")
+        raise PromotionError(
+            f"{memory_id} is already active at scope '{scope}'. To make it "
+            f"estate-wide pass --scope {SHARED}; promotion of an active fact "
+            f"is a scope change and has to be asked for explicitly.")
+
+    if target == scope:
+        raise PromotionError(f"{memory_id} is already active at scope '{scope}'")
+
+    if scope == SHARED:
+        raise PromotionError(
+            f"{memory_id} is estate-wide; narrowing it to '{target}' is not a "
+            f"promotion. Supersede it with a local replacement instead.")
+
+    if target != SHARED:
+        raise PromotionError(
+            f"{memory_id} is at scope '{scope}' and '{target}' is another "
+            f"local scope. Promotion widens and never moves a fact between "
+            f"loops — supersede it with a replacement at '{target}' if that "
+            f"is really what you mean.")
+
+    return Promotion(PROMOTION_SCOPE, status, scope, SHARED)
+
+
 def envelope(scope: str, rows: Iterable) -> dict:
     """The refs object a consumer records on whatever the intake produced.
 

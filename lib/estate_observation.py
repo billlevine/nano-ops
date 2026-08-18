@@ -370,3 +370,129 @@ BRIEFER = register("briefer", {
     "no_tool": NOT_ATTEMPTED,    # the command is not there, or would not exec
     "offline": NOT_DUE,          # `gather --offline` — deliberate, not broken
 })
+
+# Outcome coverage (t-388/Q-05, bin/outcome-coverage). It counts how many times
+# each DEFINED outcome was actually reached, so its whole product is a set of
+# zeroes that a reader has to be able to trust. "This path has never run" is an
+# absence claim about the store, which is precisely what this module governs —
+# and the third verdict the tool prints, `unobservable`, is this vocabulary's
+# refusal rather than a second scheme.
+#
+# `partial` is used here for real and is not decoration: a JSONL with lines
+# that would not parse has been read in part, and the line nobody could read is
+# exactly where the one occurrence of an unexercised path would hide.
+COVERAGE = register("coverage", {
+    "ok": OBSERVED,
+    "unreadable": FAILED,        # the store errored, or a file would not parse
+    "no_state": NOT_ATTEMPTED,   # the producer has never written its file
+    "not_selected": NOT_DUE,     # --mechanism excluded it; nothing was owed
+})
+
+# The dashboard (t-390, docs/dashboard-panel-contract.md). The third subsystem,
+# and the first one that did NOT have to be bitten first: P-11 gave the brief's
+# ten gatherers this rule and every OTHER panel kept folding a missing producer
+# store into a confident zero — rendered against an absent state directory the
+# PR board showed `0/0/0/0/0` with no banner of any kind.
+#
+# It reads files and one local process, so it has no `timeout` and no `offline`:
+# an outcome word this engine can never produce would be a vocabulary entry
+# nothing could ever justify. `not_configured` is its own `not_due` — a panel
+# whose producing loop is not in loops.toml at all was owed no look, which is a
+# boundary and not the hole `no_state` describes.
+DASHBOARD = register("dashboard", {
+    "ok": OBSERVED,
+    "error": FAILED,             # the read raised, or the tool exited non-zero
+    "unreadable": FAILED,        # the file is there and would not parse
+    "no_state": NOT_ATTEMPTED,   # the producer has never written its file
+    "no_tool": NOT_ATTEMPTED,    # the command is not there, or would not exec
+    "not_configured": NOT_DUE,   # no loop in this estate produces this panel
+})
+
+# The doorbell's `read` verb (t-782, bin/doorbell read). The hub's fallback
+# path when the Slack MCP connector is down: one `conversations.history` call
+# over the inbox's own committed cursor, reported with its warrant instead of
+# as a bare list of messages.
+#
+# `partial` is the entry that earns this registration. Slack answers an
+# `oldest`-bounded query with the NEWEST messages in the range and says in
+# `has_more` / `response_metadata.next_cursor` whether it left older ones
+# behind. The hand-built fallback of 2026-08-16 fetched that flag and dropped
+# it, and a cursor advanced past a truncated read skips the remainder
+# permanently — unreachable by the hub and unkickable by the doorbell, since
+# the poller never writes a cursor of its own. So a truncated read is
+# `observed` and partial: the ten messages it did return are real work, and
+# the one thing it may not do is prove the inbox is quiet.
+#
+# `no_credential` is `not_attempted` and not `failed` for the reason the
+# spotter's is: a token that was never on disk is setup, and a token Slack
+# refused is weather, and an operator chases those two differently.
+DOORBELL = register("doorbell", {
+    "ok": OBSERVED,
+    "api_error": FAILED,         # Slack answered `ok: false`
+    "unreachable": FAILED,       # the network, the far end, or a timeout
+    "unreadable": FAILED,        # it answered in something that would not parse
+    "no_credential": NOT_ATTEMPTED,  # no token at TOKEN_FILE; nothing was asked
+})
+
+# The landing reconciler (t-712 panel P1, bin/landed-reconciler,
+# docs/landed-reconciliation-contract.md). It asks one question per closed
+# task — is the commit this task's completion evidence names an ancestor of its
+# repo's default branch — and the only answer this contract governs is the
+# negative one. `not_landed` is an absence claim about a repository's history,
+# and it is exactly the claim a wrong repo, a pruned object or a missing tip
+# would otherwise manufacture for free.
+#
+# `sha_unknown` is `failed` rather than an answer, and that is the one entry
+# worth arguing about. The look ran and the object is not there — which reads
+# like a result until you notice that the overwhelmingly likely cause is that
+# the claim named a repo this run never guessed. "This sha is in no history I
+# can see" and "this sha is in a history I did not open" are the same bytes,
+# so the check that could not be made is recorded as one that could not be
+# made.
+#
+# `no_claim` is the real `not_due` member and carries most of the store: a
+# `done` task whose evidence makes no landing claim was owed no look at all,
+# which is a boundary and not the hole `no_sha` describes (a claim that names
+# a branch and no commit is a caller to go and fix).
+LANDED = register("landed", {
+    "ok": OBSERVED,
+    "git_error": FAILED,         # git ran and failed in a way we cannot read
+    "sha_unknown": FAILED,       # the commit is in no history this run opened
+    "unreadable": FAILED,        # the store errored, or refs would not parse
+    "no_repo": NOT_ATTEMPTED,    # the checkout named is not there, or not git
+    "no_tool": NOT_ATTEMPTED,    # git is not on PATH
+    "no_tip": NOT_ATTEMPTED,     # the default branch has no ref to compare to
+    "no_sha": NOT_ATTEMPTED,     # a landing was claimed and named no commit
+    "no_state": NOT_ATTEMPTED,   # there is no estate store to read
+    "no_claim": NOT_DUE,         # this task's evidence claims no landing
+})
+
+# Closure shadow mode (t-783, bin/closure-shadow, the time-focus panel's
+# alternative A). It counts the hub's contract-mandated closure posts and splits
+# them `done` versus `needs-owner`, per calendar bucket. Its per-bucket zero is
+# the absence claim this module governs: "no closure was posted that day" is a
+# statement about the estate's history, and a store that is absent or would not
+# open produces exactly the same empty bucket as a genuinely quiet day.
+#
+# Three members, and the missing fourth is the point. This engine opens ONE
+# sqlite connection and shells out to nothing, so it has no `timeout`, no
+# `no_tool` and no network outcome — and it has no `not_due` member either,
+# because there is no selector here that can narrow what gets read. Every run
+# reads the one store, so a look is always owed and a boundary can never arise.
+# An outcome word this engine could never produce would be an entry nothing
+# could ever justify, which is the dashboard vocabulary's rule in a second
+# place.
+#
+# The observability floor is deliberately NOT an outcome. `inbox-message`
+# tracking only exists since t-296, and a window reaching back past that is
+# clamped to the floor and said so out loud, exactly as bin/mechanism-audit's
+# M-18/M-23 do — a narrowed window is a real window, not a failed look.
+#
+# `partial` is used here for real: a closure row whose `ts` will not parse
+# cannot be put in any bucket, and the bucket it belongs in is exactly where a
+# day that looks quiet would be hiding it.
+CLOSURE = register("closure", {
+    "ok": OBSERVED,
+    "unreadable": FAILED,        # the store errored, or would not open
+    "no_state": NOT_ATTEMPTED,   # there is no estate store to read
+})

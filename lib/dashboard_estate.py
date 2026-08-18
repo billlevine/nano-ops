@@ -1,9 +1,22 @@
 """Estate-operations dashboard page.
 
-One deliberately narrow write surface: a token-authenticated proposal decision
-invokes the same audited transition operation as ``bin/estate proposal stage``.
-Nothing else on this page mutates estate state; task, project and dependency
-controls remain display-only. The banner states that boundary explicitly.
+Two deliberately narrow write surfaces, each token-authenticated and each
+invoking the same operation its CLI does — a proposal decision through
+``bin/estate proposal stage``'s ``apply_proposal_stage``, and a follow-up
+resolution through ``bin/followups resolve``'s ``apply_followup_resolve``
+(t-721). Nothing else on this page mutates estate state; task, project and
+dependency controls remain display-only. The banner states that boundary
+explicitly.
+
+WHY RESOLUTION IS THE ATTENTION SET'S ONE VERB. The set has three exit arcs,
+and ``bin/outcome-coverage --mechanism attention`` counts how often each has
+actually been walked rather than how often it could be. Dropping an escalation
+is a path that has never fired at all. Reopening one has fired, but the actor
+on every recorded instance is an automated one — so a button for it is a
+control that hands work back to the machine that hands it straight on again.
+Follow-up resolution is the only arc a PERSON has been recorded walking, it is
+the largest of the three lifecycle tiers, and it was the one with no control on
+any surface. Adding a second verb here means counting its arc first.
 
 The sections answer four different questions and are ordered that way:
 
@@ -11,6 +24,11 @@ The sections answer four different questions and are ordered that way:
                 tasks, with the follow-up envelope decoded and the due state
                 derived. Resolved follow-ups sit behind a History toggle; a
                 section that mixes them teaches its reader to skip it.
+                Split into three lifecycle tiers (t-721) — decisions,
+                escalations, follow-ups — each rendered COMPLETE, with the
+                count on screen and the count it holds both on its head. The
+                row carries the stored question and recommendation where they
+                exist and says "no decision stated" where they do not.
   Inbox         which of the owner's own messages the hub has not finished.
                 A cut across the same task rows, not a second store: every one
                 is an `inbox-message` task, and the escalated ones also appear
@@ -41,6 +59,18 @@ the blocking rule in JavaScript is a second rule.
 """
 from __future__ import annotations
 import html
+import json
+import os
+import sys
+
+# This module is imported two ways — as `dashboard_estate` by the generators
+# (which put lib/ on the path) and as `lib.dashboard_estate` by its own test
+# (which puts the repo root there). A bare sibling import is green under one
+# and ModuleNotFoundError under the other, which is the exact trap the header
+# above already describes. Same two lines bin/estate uses, for the same reason.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import estate_work  # noqa: E402  (path established above)
 
 CSS = r"""
 .estate-nav,.filter{color:var(--info);text-decoration:none;border:1px solid var(--edge);background:var(--surface-2);border-radius:7px;padding:7px 10px;font:inherit}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.filter.active{color:var(--accent);border-color:var(--accent)}.filter{cursor:pointer}.search{flex:1;min-width:180px;background:var(--surface-2);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:8px 10px}.estate-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.estate-stat,.subpanel{background:var(--surface-2);border:1px solid var(--hair);border-radius:9px;padding:13px}.estate-stat b,.subpanel .n{display:block;font-size:24px}.estate-stat span,.label{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.task,.row{border-bottom:1px solid var(--hair)}.task>summary,.row{display:grid;grid-template-columns:95px 110px 1fr auto;gap:12px;padding:11px 2px;font-size:12px}.task>summary{cursor:pointer;list-style:none}.task.open .status{color:var(--accent)}.task.done{opacity:.68}.details{padding:0 12px 14px 105px;color:var(--dim);font-size:11px;line-height:1.55}.id,.time{color:var(--faint);font-family:var(--mono)}.empty,.readiness{padding:25px;color:var(--faint);text-align:center}.readiness{text-align:left;line-height:1.6}.chips{display:flex;flex-wrap:wrap;gap:7px}.chipx{background:var(--surface-2);border:1px solid var(--hair);border-radius:99px;padding:5px 8px;font-size:11px}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-badge{color:var(--good);font-size:10px;text-transform:uppercase}@media(max-width:800px){.estate-grid,.split{grid-template-columns:1fr 1fr}.task>summary,.row{grid-template-columns:80px 1fr}.time{display:none}.details{padding-left:12px}}
@@ -55,8 +85,21 @@ CSS = r"""
 .hist{margin-top:9px;border-top:1px solid var(--hair);padding-top:7px}.hist>div{padding:5px 0}.history-entry{border-bottom:1px solid var(--hair)}.history-entry:last-child{border-bottom:0}.history-meta{line-height:1.5}.kv{display:grid;grid-template-columns:120px 1fr;gap:4px 12px;margin:6px 0}.kv .label{align-self:baseline}
 .md-note{font:12.5px/1.65 var(--sans);color:var(--dim);margin:8px 0;overflow-wrap:anywhere}.md-note a{color:var(--info)}.md-note h1,.md-note h2,.md-note h3,.md-note h4{color:var(--ink);line-height:1.3;margin:18px 0 8px}.md-note h1{font-size:20px}.md-note h2{font-size:17px;border-bottom:1px solid var(--hair);padding-bottom:5px}.md-note h3{font-size:14px}.md-note h4{font-size:12.5px}.md-note p{margin:8px 0}.md-note ul,.md-note ol{margin:8px 0;padding-left:24px}.md-note li{margin:4px 0}.md-note code{font-family:var(--mono);font-size:.92em;color:var(--info);background:var(--bg);border:1px solid var(--hair);border-radius:4px;padding:1px 4px}.md-note pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--hair);border-radius:7px;padding:10px;overflow:auto}.md-note pre code{border:0;padding:0;color:var(--dim)}.md-note blockquote{border-left:3px solid var(--edge);margin:10px 0;padding:2px 12px;color:var(--faint)}.md-table-wrap{overflow:auto;margin:11px 0}.md-note table{border-collapse:collapse;width:100%;font-size:11.5px}.md-note th,.md-note td{border:1px solid var(--edge);padding:7px 9px;text-align:left;vertical-align:top}.md-note th{color:var(--ink);background:var(--surface-2)}.md-note tr:nth-child(even) td{background:rgba(255,255,255,.015)}.note-preview{max-height:120px;overflow:hidden;position:relative}.note-preview::after{content:'';position:absolute;left:0;right:0;bottom:0;height:36px;background:linear-gradient(transparent,var(--surface))}.full-note-button{font:inherit;font-size:11px;color:var(--info);background:var(--surface-2);border:1px solid var(--edge);border-radius:7px;padding:6px 9px;cursor:pointer;margin:3px 0 7px}.full-note-button:hover{border-color:var(--info)}.note-dialog{width:min(1180px,calc(100vw - 80px));max-height:calc(100vh - 70px);padding:0;border:1px solid var(--edge);border-radius:12px;background:var(--surface);color:var(--ink);box-shadow:0 24px 80px rgba(0,0,0,.55)}.note-dialog::backdrop{background:rgba(0,0,0,.72)}.note-dialog-head{position:sticky;top:0;z-index:1;display:flex;gap:12px;align-items:center;padding:14px 18px;background:var(--surface-2);border-bottom:1px solid var(--edge)}.note-dialog-title{font-weight:600}.note-dialog-body{padding:12px 24px 28px}.note-close{margin-left:auto;font:inherit;color:var(--dim);background:var(--bg);border:1px solid var(--edge);border-radius:7px;padding:6px 9px;cursor:pointer}
 /* proposal-review:start */
-.proposal{border-bottom:1px solid var(--hair)}.proposal>summary{display:grid;grid-template-columns:82px 132px minmax(260px,1fr) minmax(280px,1.2fr) auto;gap:14px;padding:14px 2px;cursor:pointer;list-style:none;font-size:12px;align-items:start}.proposal-title{color:var(--ink);font-weight:600;line-height:1.45}.proposal-recommendation{color:var(--dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.proposal-body{padding:0 14px 18px 228px;color:var(--dim);font-size:12px}.review-grid{display:grid;grid-template-columns:1.15fr 1.15fr .8fr;gap:12px;margin:12px 0}.review-field{background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;padding:12px;white-space:pre-wrap;line-height:1.55}.review-field.recommendation{border-color:rgba(242,171,53,.35);color:var(--ink)}.review-field.missing{color:var(--faint);font-style:italic}.review-badge{font-family:var(--mono);font-size:10px;border:1px solid currentColor;border-radius:99px;padding:2px 6px;margin-left:5px;color:var(--faint);white-space:nowrap}.review-badge.incomplete{color:var(--warn)}.review-badge.recurring{color:var(--info)}.decision-box{margin-top:14px;padding:13px;border:1px solid var(--edge);border-radius:9px;background:var(--surface-2)}.decision-note{width:100%;box-sizing:border-box;min-height:62px;resize:vertical;background:var(--bg);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:9px 10px;font:12px/1.5 var(--sans);margin:7px 0 9px}.decision-actions{display:flex;gap:8px;flex-wrap:wrap}.decision{font:inherit;font-size:11px;border:1px solid var(--edge);border-radius:7px;padding:7px 10px;background:var(--bg);color:var(--ink);cursor:pointer}.decision:hover{border-color:var(--accent)}.decision.approved-backlog{color:var(--good)}.decision.rejected,.decision.stopped{color:var(--crit)}.decision.resolved{color:var(--info)}.decision[disabled]{opacity:.5;cursor:wait}.decision-status{font-size:11px;color:var(--faint);margin-left:auto;align-self:center}.decision-status.error{color:var(--crit)}.legacy-note{color:var(--warn);font-size:11px}@media(max-width:1000px){.proposal>summary{grid-template-columns:80px 125px 1fr auto}.proposal-recommendation{grid-column:3}.proposal-body{padding-left:12px}}
+.proposal{border-bottom:1px solid var(--hair)}.proposal>summary{display:grid;grid-template-columns:82px 132px minmax(260px,1fr) minmax(280px,1.2fr) auto;gap:14px;padding:14px 2px;cursor:pointer;list-style:none;font-size:12px;align-items:start}.proposal-title{color:var(--ink);font-weight:600;line-height:1.45}.proposal-caption{display:block;color:var(--faint);font-size:10.5px;line-height:1.4;margin-bottom:5px}.proposal-question-text,.proposal-recommendation{color:var(--dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.proposal-question-text{color:var(--ink)}.proposal-question-text.missing,.proposal-recommendation.missing{color:var(--faint);font-style:italic}.proposal-body{padding:0 14px 18px 228px;color:var(--dim);font-size:12px}.review-grid{display:grid;grid-template-columns:1.15fr 1.15fr .8fr;gap:12px;margin:12px 0}.review-field{background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;padding:12px;white-space:pre-wrap;line-height:1.55}.review-field.recommendation{border-color:rgba(242,171,53,.35);color:var(--ink)}.review-field.missing{color:var(--faint);font-style:italic}.review-badge{font-family:var(--mono);font-size:10px;border:1px solid currentColor;border-radius:99px;padding:2px 6px;margin-left:5px;color:var(--faint);white-space:nowrap}.review-badge.incomplete{color:var(--warn)}.review-badge.recurring{color:var(--info)}.decision-box{margin-top:14px;padding:13px;border:1px solid var(--edge);border-radius:9px;background:var(--surface-2)}.decision-note{width:100%;box-sizing:border-box;min-height:62px;resize:vertical;background:var(--bg);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:9px 10px;font:12px/1.5 var(--sans);margin:7px 0 9px}.decision-actions{display:flex;gap:8px;flex-wrap:wrap}.decision{font:inherit;font-size:11px;border:1px solid var(--edge);border-radius:7px;padding:7px 10px;background:var(--bg);color:var(--ink);cursor:pointer}.decision:hover{border-color:var(--accent)}.decision.approved-backlog{color:var(--good)}.decision.rejected,.decision.stopped{color:var(--crit)}.decision.resolved{color:var(--info)}.decision[disabled]{opacity:.5;cursor:wait}.decision-status{font-size:11px;color:var(--faint);margin-left:auto;align-self:center}.decision-status.error{color:var(--crit)}.legacy-note{color:var(--warn);font-size:11px}@media(max-width:1000px){.proposal>summary{grid-template-columns:80px 125px 1fr auto}.proposal-question,.proposal-recommendation{grid-column:3}.proposal-body{padding-left:12px}}
+.sketch-note{margin:10px 0;color:var(--info);font-size:11px}.decision-sketch{margin:12px 0;border:1px solid var(--edge);border-radius:9px;padding:14px;background:var(--bg)}.decision-sketch-head{display:flex;gap:8px;align-items:center;margin-bottom:11px}.classification{font:10px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--accent);border:1px solid currentColor;border-radius:99px;padding:3px 7px}.decision-question{margin-bottom:10px;padding:2px 1px;line-height:1.55;color:var(--ink)}.decision-card-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.decision-options{display:grid;gap:10px;margin-top:10px}.decision-card{border:1px solid var(--hair);border-radius:8px;padding:11px;background:var(--surface-2);line-height:1.55;cursor:pointer;transition:border-color .14s ease,background .14s ease,transform .14s ease}.decision-card:hover,.decision-card:focus-visible{border-color:var(--accent);background:var(--surface);transform:translateY(-1px);outline:none}.decision-card.recommendation{border-top:2px solid var(--accent)}.decision-card.defer{border-top:2px solid var(--warn)}.decision-card.option-card{border-left:3px solid var(--info)}@media(max-width:700px){.decision-card-row{grid-template-columns:1fr}}
 /* proposal-review:end */
+/* t-721 — the attention row. The clamp that keeps these lines short is
+   server-side (lib/estate_work.HEADLINE_MAX / CONTEXT_LINE_MAX): a CSS
+   ellipsis hides the overflow from the eye and not from the page, and the
+   same rows are rendered by `bin/estate awaiting` where there is no CSS at
+   all. So nothing here truncates — it lays out text that already fits. */
+.attention-headline{color:var(--ink);font-weight:600;line-height:1.45}
+.attention-context{color:var(--faint);font-size:11px;line-height:1.45;display:block;margin-top:3px}.attention-context.missing{font-style:italic}
+.attention-decision{display:block;margin-top:4px;color:var(--dim);font-size:11.5px;line-height:1.5}.attention-decision .label{margin-right:5px}
+.idle{font-family:var(--mono);font-size:10.5px;white-space:nowrap;border:1px solid var(--hair);border-radius:99px;padding:1px 6px;margin-left:4px;color:var(--faint)}.idle.above{color:var(--warn,#d08a1e);border-color:currentColor}
+.pill.decision-unstated{color:var(--warn,#d08a1e);border-color:currentColor}.pill.decision-incomplete{color:var(--info);border-color:currentColor}
+.tier{border-top:1px solid var(--edge);padding-top:4px;margin-top:12px}.tier:first-child{border-top:0;margin-top:0}
+.tier-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:9px 2px 5px}.tier-title{color:var(--ink);font-size:12px;font-weight:600}.tier-count{font-family:var(--mono);font-size:10.5px;color:var(--dim)}.tier-count.partial{color:var(--warn,#d08a1e)}.tier-note{font-size:10.5px;color:var(--faint)}
 """
 
 # The V1 dashboard embeds this exact review surface. Keeping the bounded CSS
@@ -65,7 +108,7 @@ PROPOSAL_CSS = CSS.split("/* proposal-review:start */", 1)[1].split(
     "/* proposal-review:end */", 1)[0]
 
 JS_HEAD = r"""(function(){
-var DATA={},FILTER='active',KIND_FILTER='',PROJECT_FILTER='',ATTN_FILTER='all',ATTN_HISTORY=false,DEP_FILTER='all',PROPOSAL_STAGE='pending-review',MEMORY_SCOPE='shared',MEMORY_SCROLL=0,OPEN_TASKS={},OPEN_EVENTS={},OPEN_PROJECTS={},OPEN_PROPOSALS={},DECISION_NOTES={},INDEX={},EVENT_INDEX={};
+var DATA={},FILTER='active',KIND_FILTER='',PROJECT_FILTER='',ATTN_FILTER='all',ATTN_HISTORY=false,DEP_FILTER='all',PROPOSAL_STAGE='pending-review',MEMORY_SCOPE='shared',MEMORY_SCROLL=0,OPEN_TASKS={},OPEN_EVENTS={},OPEN_PROJECTS={},OPEN_PROPOSALS={},DECISION_NOTES={},RESOLVE_NOTES={},INDEX={},EVENT_INDEX={};
 // The task lifecycle's two terminal statuses. Mirrors bin/estate's TERMINAL
 // and lib/estate_work's; "Active" on this page means NOT one of these, which
 // is the whole correction — the old button matched the literal string 'open'
@@ -134,9 +177,43 @@ var LONG_NOTE=4000;
 function noteDetail(v){if(!v.detail)return '';if(v.kind!=='note')return '<br>'+e(v.detail);if(v.detail.length<LONG_NOTE)return markdown(v.detail);var first=v.detail.split(/\n\s*\n/)[0];return '<div class="note-preview">'+markdown(first)+'</div><button type="button" class="full-note-button" data-full-note="'+e(String(v.seq))+'">Read full note · '+e(v.detail.length.toLocaleString())+' characters</button>'}
 function historyLine(v){return '<div class="history-entry"><div class="history-meta"><span class="time">'+e(stamp(v.ts))+'</span> <b>'+e(v.summary)+'</b> · '+who(v)+(v.kind?' · '+e(v.kind):'')+(v.phase?' · '+e(v.phase):'')+'</div>'+noteDetail(v)+'</div>'}
 function history(list,msg){return '<div class="hist"><span class="label">history ('+e(list.length)+')</span>'+(list.length?list.map(historyLine).join(''):'<div>'+e(msg)+'</div>')+'</div>'}
+// t-475's filing, rendered as itself rather than as JSON. A classified item is
+// the one thing on this page a reader is asked to ACT on, and until now the
+// question, the alternatives, the recommendation and the cost of waiting were
+// legible only by reading the raw refs dump below and reassembling them by eye.
+//
+// ONE shape answers for both kinds. `bin/followups add|attention` and
+// `bin/estate proposal add` both file through lib/estate_decisions.validate, so
+// a followup's refs and a proposal's refs carry the same five keys with the
+// same meanings — `alternatives` normalized to {option, consequence} objects by
+// that one validator, never a string. Nothing here re-derives which key is
+// which: these ARE the stored names (docs/decision-classification-contract.md).
+function refsOf(t){var v=t.refs;if(v==null)return {};try{var x=typeof v==='string'?JSON.parse(v):v;return x&&typeof x==='object'&&!Array.isArray(x)?x:{}}catch(_){return {}}}
+// The exact words the contract reserves. A recommendation of "not recorded" is
+// a RECORDED answer — a filer who read the options and picked none — and the
+// same two words printed plainly read like a field nobody filled in. The badge
+// is the difference, which is the absence contract in a rendering.
+var NOT_RECORDED='not recorded';
+function decisionAlternatives(r){return Array.isArray(r.alternatives)?r.alternatives.filter(function(v){return v&&typeof v==='object'&&v.option}):[]}
+// Option and consequence in one card, each labelled: an option and the cost of
+// choosing it are one fact, and a flat list would leave the reader pairing them
+// by position.
+function alternativeCard(v){return '<div class="review-field"><span class="label">option</span><br><b>'+e(v.option)+'</b><br><span class="label">consequence</span><br>'+e(v.consequence||'No consequence recorded')+'</div>'}
+// `shownContext` is whatever the follow-up envelope above already printed. The
+// same sentence twice under two labels is noise; a DIFFERENT one is a fact the
+// envelope does not carry, so it gets its own distinctly-labelled row.
+function decisionBlock(t,shownContext){var r=refsOf(t),c=r.classification;if(!c)return '';
+var rec=r.recommendation==null?'':String(r.recommendation).trim();
+var recRow=rec?'<span class="label">recommendation</span><span>'+e(rec)+(rec.toLowerCase()===NOT_RECORDED?' <span class="review-badge">filer recorded no pick</span>':'')+'</span>':'';
+var ctx=r.context==null?'':String(r.context).trim();
+var ctxRow=(ctx&&ctx!==shownContext)?kv(shownContext?'decision context':'context',ctx):'';
+var kvs=kv('question',r.question)+recRow+kv('if deferred',r.defer_consequence)+ctxRow;
+var alts=decisionAlternatives(r);
+return '<div class="decision-sketch"><div class="decision-sketch-head"><span class="label">classification</span><span class="classification">'+e(c)+'</span></div>'+(kvs?'<div class="kv">'+kvs+'</div>':'')+(alts.length?'<div class="decision-options">'+alts.map(alternativeCard).join('')+'</div>':'')+'</div>'}
 function taskDetails(t){var refs=pretty(t.refs),f=t.followup;
 return '<div class="details"><div class="kv">'+kv('kind',t.kind)+kv('status',t.status)+kv('project',t.project_id?(t.project_title||'')+' ('+t.project_id+')':'unprojected')+kv('lane',t.lane)+kv('review stage',t.stage)+kv('created by',t.created_by)+kv('created',stamp(t.created_at)+' · '+age(t.created_at))+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('closed',t.closed_at?stamp(t.closed_at):'')+kv('claimed by',t.claimed_by)+kv('lease expires',t.claim_expires_at)+kv('due',t.due_at?stamp(t.due_at)+' ('+(t.due_state||'terminal')+')':'')+kv('intent',t.intent)+'</div>'
 +(f?'<div class="kv">'+kv('follow-up',f.legacy_id)+kv('state',f.state)+kv('source',f.source)+kv('ref',f.ref)+kv('context',f.context)+kv('resolution',f.resolution)+kv('attention key',f.attention_key)+kv('resolved at',f.resolved_at?stamp(f.resolved_at):'')+'</div>':'')
++decisionBlock(t,f&&f.context?String(f.context).trim():'')
 +relatedLine('blocked by',blockedBy(t),t.blocked_by_titles)+relatedLine('blocks',t.blocks,t.blocks_titles)
 +(refs&&refs!=='{}'?'<div><span class="label">refs</span><pre>'+e(refs)+'</pre></div>':'')
 +history(taskEvents(t.id),'No events recorded for this task.')+'</div>'}
@@ -160,8 +237,130 @@ function attentionRows(){var ids=DATA.attention||[];return ids.map(task).filter(
 // toggle rather than mixed into the list above.
 function resolvedFollowups(){return (DATA.followups||[]).map(task).filter(function(t){return t&&t.followup&&t.followup.state==='resolved'})}
 function sourceBadge(t){var f=t.followup;return f&&f.source?'<span class="pill" title="source'+(f.ref?' · '+e(f.ref):'')+'">'+e(f.source)+'</span>':''}
-function attentionRow(t){var b=blockedBy(t);return '<details data-task="'+e(t.id)+'" class="task '+e(t.status)+(b.length?' is-blocked':'')+'"'+(OPEN_TASKS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+legacyBadge(t)+'</span><span class="status">'+e(t.status)+'</span><span>'+e(t.title)+' '+dueBadge(t)+blockedBadge(t)+projectBadge(t)+sourceBadge(t)+'</span><span>'+e(age(t.updated_at))+'</span></summary>'+taskDetails(t)+'</details>'}
-function drawAttention(){var list=ATTN_HISTORY?resolvedFollowups():attentionRows();if(!ATTN_HISTORY&&ATTN_FILTER!=='all')list=list.filter(function(t){return t.due_state===ATTN_FILTER});document.getElementById('attention-stats').innerHTML=stats(DATA.attention_counts,DUE_STATES);document.getElementById('attention-count').textContent=(ATTN_HISTORY?'history · ':'')+list.length+' shown'+(DATA.notice_days!=null?' · notice '+DATA.notice_days+'d':'');document.getElementById('attention').innerHTML=rows(list,attentionRow,ATTN_HISTORY?'No resolved follow-ups on file.':'Nothing is waiting on a person.')}
+// t-476 — the first line of WHY this is waiting, in the collapsed row. It
+// arrives on the snapshot as one line (lib/estate_work.decision_surface), never
+// as the whole context blob: a summary can hold one line, and shipping the rest
+// twice is a copy of the store. `context_field` says whether it came from the
+// follow-up envelope's `context` or from the task's `intent` column, and a row
+// with neither says so rather than rendering a blank strip.
+function contextLine(t){var text=t.context_line;return '<span class="attention-context'+(text?'':' missing')+'" title="'+e(text?(t.context_field||'context')+(t.context_line_clamped?' · clamped; the whole text is in the drill-down':''):'no context recorded on this item')+'">'+e(text||'No context recorded')+'</span>'}
+// t-721. THE ROW IS THE DECISION, NOT THE TITLE.
+//
+// The panel measured what these rows were showing: a title median of 131
+// characters rendered raw, and under it a "one-line" context strip with a
+// median of 500 because the server's first_line() cuts at a newline and most
+// blobs have none. Both numbers are clamped server-side now
+// (lib/estate_work.HEADLINE_MAX / CONTEXT_LINE_MAX), and the row shows the
+// stored question and recommendation where the refs envelope carries them —
+// the same two keys the proposal row has shown since t-476, on the surface
+// where the owner actually reads them. `headline` is a display cut of the title and
+// never the task's name: the full title is one click away in the drill-down
+// and rides in the tooltip.
+// A row outside the attention set carries no derived headline — the History
+// toggle's resolved follow-ups are the one such list here — and falls back to
+// its own title rather than to nothing. The tooltip appears only when there is
+// something behind the clamp to reveal.
+function headline(t){var text=t.headline||t.title;return '<b class="attention-headline"'+(t.headline_clamped?' title="'+e(t.title)+'"':'')+'>'+e(text)+'</b>'}
+// The absence, stated. Most rows on a real set carry no classification at
+// all, and the badge says so in the estate's own words rather than leaving the
+// gap where a decision should be. Nothing here infers one: an unclassified row
+// is unclassified, and `bin/estate proposal amend --classification` is the
+// door that changes that (docs/decision-classification-contract.md).
+var DECISION_BADGES={sketched:['sketch complete','question, options, recommendation and defer consequence all on file'],
+ incomplete:['sketch incomplete','filed as a decision with part of the sketch missing'],
+ stated:['',''],
+ unstated:['no decision stated','this row declares no classification — nothing here infers one']};
+function decisionBadge(t){var v=DECISION_BADGES[t.decision_state];if(t.classification&&t.decision_state==='stated')return '<span class="classification" title="declared classification">'+e(t.classification)+'</span>';if(!v||!v[0])return '';var missing=(t.decision_missing||[]).length?' · missing '+(t.decision_missing||[]).join(', '):'';return '<span class="pill decision-'+e(t.decision_state)+'" title="'+e(v[1]+missing)+'">'+e(v[0])+'</span>'}
+// Idle time, and the ONE comparison it is allowed to make. `idle_above_tier_
+// median` is computed against this row's own tier and nothing else — a
+// week-old decision and a week-old follow-up are not the same claim, and a
+// single estate-wide age ranking says only that nobody has touched the top of
+// it. Neither the list nor the tier is sorted by this.
+function idleBadge(t,tier){if(t.idle_days==null)return '';var hot=t.idle_above_tier_median===true;return '<span class="idle'+(hot?' above':'')+'" title="'+e('idle '+t.idle_days+'d'+(tier&&tier.idle_median!=null?' · this tier\'s median is '+tier.idle_median+'d over '+tier.total+' row(s)':'')+(hot?' · longer than half its tier':''))+'">'+e('idle '+t.idle_days+'d')+'</span>'}
+// Question and recommendation, each on its own labelled line, where the row
+// carries them. A row with neither falls back to the context strip, which is
+// what it always showed — this adds a body, it does not remove one.
+// The provenance badge fires when the answering key is neither the one this
+// estate already reads as this surface (SURFACE_CANONICAL, the server's table)
+// nor the key of the same name. A `recommendation` under "recommendation" is
+// not a fact worth a badge — it is the field doing exactly what it is called —
+// and on a follow-up row it is the ordinary case, where `desired_outcome` is
+// the proposal review grid's. An observation surfaced as a question still gets
+// the badge, which is the distinction t-476 introduced it for.
+function decisionLine(name,label,text,field){if(!text)return '';var note=(field&&field!==SURFACE_CANONICAL[name]&&field!==name)?' <span class="review-badge">from '+e(field)+'</span>':'';return '<span class="attention-decision"><span class="label">'+e(label)+'</span>'+note+' '+e(text)+'</span>'}
+function attentionBody(t){var q=decisionLine('question','question',t.question,t.question_field),r=decisionLine('recommendation','recommendation',t.recommendation,t.recommendation_field);
+// The context strip is dropped only when it would repeat what is already on
+// screen — the same sentence twice under two labels is noise, and a DIFFERENT
+// one is a fact neither decision line carries.
+var ctx=t.context_line;var dupe=ctx&&(ctx===t.question||ctx===t.recommendation);return q+r+((q||r)&&dupe?'':contextLine(t))}
+// t-721 — THE ONE WRITE VERB ON THIS ROW, and why it is this one.
+//
+// `bin/outcome-coverage --mechanism attention` counts the attention set's exit
+// arcs by how often each has actually been walked. Dropping an escalation has
+// never fired. Reopening one has, but the actor on every recorded instance is
+// an automated one rather than a person — so a hand-back button may only be
+// handing work back to the machine that hands it straight on again, which is
+// an open question rather than a settled one. Follow-up resolution is the arc
+// a person is demonstrably recorded walking. So resolution is the verb: the
+// largest tier, an arc that is really walked, and the only one with no control
+// anywhere.
+//
+// It appears on a row this verb can actually reach — a `followup`-kind row
+// that has not already finished — and nowhere else. An escalated follow-up
+// reads in the Escalations tier and still resolves from here, because
+// `bin/followups resolve` reaches it; the server re-checks both facts, so this
+// is which button to DRAW and never the authority for the write.
+function canResolve(t){return t&&t.kind==='followup'&&!terminal(t)}
+function resolveStatus(id,text,error){var s=document.querySelector('[data-resolve-status="'+id+'"]');if(s){s.textContent=text||'';s.classList.toggle('error',!!error)}}
+// Same shape as the proposal decision box, deliberately: one note field, one
+// button, one status line, and the note is REQUIRED — a resolution with no
+// sentence in it is the `refs.resolution` key filed empty, which is how a
+// closed follow-up stops saying why it closed.
+function resolveBox(t){if(!canResolve(t))return '';return '<div class="decision-box"><span class="label">Resolve this follow-up</span><textarea class="decision-note" data-resolve-note="'+e(t.id)+'" placeholder="Resolution note (required)">'+e(RESOLVE_NOTES[t.id]||'')+'</textarea><div class="decision-actions"><button type="button" class="decision resolved" data-resolve-id="'+e(t.id)+'">Resolve</button><span class="decision-status" data-resolve-status="'+e(t.id)+'"></span></div></div>'}
+// `decisionToken()` is JS_PROPOSALS'. One server token, one localStorage key,
+// one prompt — a second reader here would be a second key for the same secret,
+// and estate.html is the only surface carrying both sections.
+function resolveFollowup(button){var id=button.dataset.resolveId,t=task(id),note=document.querySelector('[data-resolve-note="'+id+'"]');if(!t||!note)return;var text=note.value.trim();if(!text){resolveStatus(id,'A resolution note is required.',true);note.focus();return}if(!window.confirm('Resolve '+id+'? This closes the follow-up.'))return;var tok=decisionToken();if(!tok){resolveStatus(id,'Write token required.',true);return}var buttons=document.querySelectorAll('[data-resolve-id="'+id+'"]');buttons.forEach(function(b){b.disabled=true});resolveStatus(id,'Resolving…',false);
+// `expected_status` is the RAW status column, which is what this row carries
+// and what the server compares — a 45s-old snapshot that has been overtaken
+// gets a 409 and changes nothing.
+fetch('followup-resolve',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Dashboard-Token':tok},body:JSON.stringify({id:id,expected_status:t.status,note:text})}).then(function(r){return r.json().catch(function(){return {error:'Request failed'}}).then(function(body){if(!r.ok){var x=Error(body.error||('HTTP '+r.status));x.status=r.status;throw x}return body})}).then(function(result){delete RESOLVE_NOTES[id];applyResolved(t,result);drawAttention()}).catch(function(err){if(err.status===401)try{localStorage.removeItem(TOKEN_KEY)}catch(_){}resolveStatus(id,err.message+(err.status===401?' Token cleared; retry to enter it again.':''),true);buttons.forEach(function(b){b.disabled=false})})}
+// The optimistic local patch, on the same terms decideProposal's is: the row
+// is edited in place so the section redraws immediately, and the next 30s
+// snapshot is what actually confirms it. The row LEAVES the attention set,
+// which means leaving both the flat id list and its tier — a tier whose total
+// still counted it would print "N of N shown" over N-1 rows.
+function applyResolved(t,result){var c=DATA.attention_counts,was=t.due_state||'undated';
+if(c){c[was]=Math.max(0,(c[was]||0)-1);c.total=Math.max(0,(c.total||0)-1)}
+// A terminal task carries no due state at all — the server's own rule, kept
+// here so the patched row and the next snapshot say the same thing.
+t.status=result.status||'done';t.is_attention=false;t.due_state=null;t.closed_at=result.resolved_at;t.updated_at=result.resolved_at;
+if(t.followup){t.followup.state='resolved';t.followup.resolution=result.resolution;t.followup.resolved_at=result.resolved_at}
+var ids=DATA.attention||[],at=ids.indexOf(t.id);if(at>=0)ids.splice(at,1);
+(DATA.attention_tiers||[]).forEach(function(tier){var i=(tier.ids||[]).indexOf(t.id);if(i>=0){tier.ids.splice(i,1);tier.total=Math.max(0,(tier.total||0)-1)}})}
+function attentionRow(t,tier){var b=blockedBy(t);return '<details data-task="'+e(t.id)+'" class="task '+e(t.status)+(b.length?' is-blocked':'')+'"'+(OPEN_TASKS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+legacyBadge(t)+'</span><span class="status">'+e(t.status)+'</span><span>'+headline(t)+' '+dueBadge(t)+blockedBadge(t)+decisionBadge(t)+idleBadge(t,tier)+projectBadge(t)+sourceBadge(t)+attentionBody(t)+'</span><span>'+e(age(t.updated_at))+'</span></summary>'+taskDetails(t)+resolveBox(t)+'</details>'}
+// t-721, P4 resolved UNCAPPED. Typed lifecycle tiers, every row rendered,
+// and BOTH counts on every section head — what is on screen after the filter,
+// and what the tier actually holds. A hard budget of five to seven was the
+// alternative and it was refused: a queue that hides its tail reports itself
+// healthy, and on a real set the tail it would hide is most of the set.
+// The tiers arrive derived and ordered from lib/estate_work.tiers(); nothing
+// here groups, re-sorts or re-counts.
+function tierHead(t,visible){var idle=t.idle_median==null?'no idle comparison':'idle median '+t.idle_median+'d'+(t.idle_max==null?'':' · oldest '+t.idle_max+'d');
+return '<div class="tier-head"><span class="tier-title">'+e(t.title)+'</span><span class="grow"></span><span class="tier-count'+(visible<t.total?' partial':'')+'">'+e(visible+' of '+t.total+' shown')+'</span><span class="tier-note">'+e(t.notice+' in the notice band · '+idle)+'</span></div>'}
+function attentionTiers(){return DATA.attention_tiers||[]}
+function drawAttention(){var visible=0,total=0,html='';
+if(ATTN_HISTORY){var list=resolvedFollowups();visible=total=list.length;html=rows(list,function(t){return attentionRow(t,null)},'No resolved follow-ups on file.')}
+else{var tiers=attentionTiers();
+ // A snapshot written before the tiers existed still has an ordered id list,
+ // and one flat section is a correct rendering of it. Absent is absent: this
+ // page does not group rows the server did not group.
+ if(!tiers.length){var flat=attentionRows();if(ATTN_FILTER!=='all')flat=flat.filter(function(t){return t.due_state===ATTN_FILTER});visible=flat.length;total=attentionRows().length;html=rows(flat,function(t){return attentionRow(t,null)},'Nothing is waiting on a person.')}
+ else{tiers.forEach(function(tier){var list=tier.ids.map(task).filter(Boolean);total+=tier.total;if(ATTN_FILTER!=='all')list=list.filter(function(t){return t.due_state===ATTN_FILTER});visible+=list.length;
+  html+='<section class="tier">'+tierHead(tier,list.length)+(list.length?list.map(function(t){return attentionRow(t,tier)}).join(''):'<div class="empty">No row in this tier matches the current filter — '+e(String(tier.total))+' are here.</div>')+'</section>'})}}
+document.getElementById('attention-stats').innerHTML=stats(DATA.attention_counts,DUE_STATES);
+document.getElementById('attention-count').textContent=(ATTN_HISTORY?'history · ':'')+visible+' of '+total+' shown'+(DATA.notice_days!=null?' · notice '+DATA.notice_days+'d':'');
+document.getElementById('attention').innerHTML=html||'<div class="empty">Nothing is waiting on a person.</div>'}
 """
 
 JS_INBOX = r"""
@@ -232,8 +431,32 @@ var PROPOSAL_TRANSITIONS={
 function reviewField(label,value,cls){var missing=!String(value||'').trim();return '<div class="review-field '+(cls||'')+(missing?' missing':'')+'"><span class="label">'+e(label)+'</span><br>'+e(missing?'not recorded (legacy proposal)':value)+'</div>'}
 function reviewBadges(p){var out=[];if(p.legacy)out.push('<span class="review-badge incomplete">incomplete record</span>');if(p.recurrences)out.push('<span class="review-badge recurring">recurring ×'+e(p.recurrences)+'</span>');return out.join('')}
 function decisionBox(t){var stages=PROPOSAL_TRANSITIONS[t.stage]||[];if(!stages.length)return '';var labels={'approved-backlog':'Approve to backlog','rejected':'Reject','resolved':'Mark resolved','stopped':'Stop','pending-review':'Return to review'};return '<div class="decision-box"><span class="label">Record stage decision</span><textarea class="decision-note" data-decision-note="'+e(t.id)+'" placeholder="Decision note (required)">'+e(DECISION_NOTES[t.id]||'')+'</textarea><div class="decision-actions">'+stages.map(function(s){return '<button type="button" class="decision '+e(s)+'" data-decision-id="'+e(t.id)+'" data-decision-stage="'+e(s)+'">'+e(labels[s]||s)+'</button>'}).join('')+'<span class="decision-status" data-decision-status="'+e(t.id)+'"></span></div></div>'}
-function proposalRow(t){var p=t.proposal||{},recommendation=p.desired_outcome||'Recommendation not recorded';return '<details data-proposal="'+e(t.id)+'" class="proposal"'+(OPEN_PROPOSALS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+'</span><span class="stage '+e(t.stage)+'">'+e(t.stage)+'</span><span class="proposal-title">'+e(t.title)+reviewBadges(p)+'</span><span class="proposal-recommendation"><span class="label">Recommendation</span><br>'+e(recommendation)+'</span><span>'+e(age(t.updated_at))+'</span></summary><div class="proposal-body">'+(p.legacy?'<div class="legacy-note">Review record incomplete: one or more evidence fields were never recorded.</div>':'')+'<div class="review-grid">'+reviewField('What was observed',p.condition)+reviewField('Recommendation',p.desired_outcome,'recommendation')+reviewField('Done when',p.completion_check)+'</div><div class="kv">'+kv('fingerprint',p.fingerprint||'not recorded')+kv('work status',t.status)+kv('created by',t.created_by)+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('recurrences',p.recurrences||0)+(p.last_recurrence_at?kv('last recurrence',stamp(p.last_recurrence_at)):'')+'</div>'+(t.intent?'<div class="review-field"><span class="label">intent</span><br>'+e(t.intent)+'</div>':'')+decisionBox(t)+history(taskEvents(t.id),'No events recorded for this proposal.')+'</div></details>'}
-function drawProposals(){var q=(document.getElementById('proposal-search').value||'').toLowerCase(),list=(DATA.proposals||[]).map(task).filter(Boolean);if(PROPOSAL_STAGE!=='all')list=list.filter(function(t){return t.stage===PROPOSAL_STAGE});if(q)list=list.filter(function(t){var p=t.proposal||{};return [t.id,t.title,t.intent,p.condition,p.desired_outcome,p.completion_check,p.fingerprint].join(' ').toLowerCase().indexOf(q)>=0});document.getElementById('proposal-stats').innerHTML=stats(DATA.proposal_counts,['pending-review','approved-backlog','rejected','stopped','resolved']);document.getElementById('proposal-count').textContent=list.length+' shown';document.getElementById('proposals').innerHTML=rows(list,proposalRow,'No proposals in this stage.')}
+// t-476 — the collapsed row carries the DECISION, not the title and a clamp of
+// one field. Which stored key is "the question" and which is "the
+// recommendation" is settled server-side in lib/estate_work.decision_surface;
+// `*_field` names it and the text is read from the envelope it already ships
+// in, so nothing here re-decides and nothing arrives twice.
+//
+// Absent is rendered as absent. A missing question prints "No question
+// recorded" in the muted `.missing` style rather than as an empty cell,
+// because a blank half of a two-field summary reads like "there is no question
+// to answer" — the exact misreading a decision surface exists to prevent.
+function surfaceText(p,name){var v=p[name];if(v!=null&&String(v).trim())return String(v);var f=p[name+'_field'];if(!f)return null;var x=p[f];return x!=null&&String(x).trim()?String(x):null}
+// The one-word provenance a reader needs when a surface was answered by a key
+// this estate does not already call by that name. SURFACE_CANONICAL is the
+// server's own table (lib/estate_work), injected rather than repeated: an
+// observation surfaced as a question is a real distinction and gets the badge,
+// while `desired_outcome` has been labelled "Recommendation" since proposals
+// existed and saying so on every row would be noise.
+var SURFACE_CANONICAL=__SURFACE_CANONICAL__;
+function surfaceNote(p,name){var f=p[name+'_field'];return f&&f!==SURFACE_CANONICAL[name]?'<span class="review-badge">from '+e(f)+'</span>':''}
+function summaryField(label,text,note,cls){return '<span class="'+e(cls)+(text?'':' missing')+'"><span class="label">'+e(label)+'</span>'+(text?note:'')+'<br>'+e(text||('No '+label.toLowerCase()+' recorded'))+'</span>'}
+function altRows(p){return Array.isArray(p.alternatives)?p.alternatives.filter(function(v){return v&&v.option}):[]}
+function decisionCard(id,cls,label,body,note){return '<div class="decision-card '+cls+'" role="button" tabindex="0" data-decision-card="'+e(id)+'" data-decision-prefill="'+e(note)+'"><span class="label">'+e(label)+'</span><br>'+body+'</div>'}
+function decisionSketch(p,id){if(!p.classification)return '<div class="sketch-note">Decision cards unavailable: this legacy proposal predates decision classification.</div>';var opts=altRows(p),recommendation=p.recommendation||'No recommendation recorded',defer=p.defer_consequence||'No defer consequence recorded';return '<div class="decision-sketch"><div class="decision-sketch-head"><b>Decision</b><span class="classification">'+e(p.classification||'unclassified')+'</span></div><div class="decision-question"><span class="label">Question</span><br>'+e(p.question||'No question recorded')+'</div><div class="decision-card-row">'+decisionCard(id,'recommendation','Recommendation',e(recommendation),'Owner clicked: '+recommendation)+decisionCard(id,'defer','If deferred',e(defer),'Owner clicked: defer — '+defer)+'</div><div class="decision-options">'+opts.map(function(v){var consequence=v.consequence||'No consequence recorded';return decisionCard(id,'option-card','Option','<b>'+e(v.option)+'</b><br>'+e(consequence),'Owner clicked: '+v.option+' — '+consequence)}).join('')+'</div></div>'}
+function proposalRow(t){var p=t.proposal||{},question=surfaceText(p,'question'),recommendation=surfaceText(p,'recommendation');return '<details data-proposal="'+e(t.id)+'" class="proposal"'+(OPEN_PROPOSALS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+'</span><span class="stage '+e(t.stage)+'">'+e(t.stage)+'</span><span class="proposal-question"><span class="proposal-caption">'+e(t.title)+reviewBadges(p)+'</span>'+summaryField('Question',question,surfaceNote(p,'question'),'proposal-question-text')+'</span>'+summaryField('Recommendation',recommendation,surfaceNote(p,'recommendation'),'proposal-recommendation')+'<span>'+e(age(t.updated_at))+'</span></summary><div class="proposal-body">'+(p.legacy?'<div class="legacy-note">Review record incomplete: one or more evidence fields were never recorded.</div>':'')+decisionSketch(p,t.id)+'<div class="review-grid">'+reviewField('What was observed',p.condition)+reviewField('Recommendation',p.desired_outcome,'recommendation')+reviewField('Done when',p.completion_check)+'</div><div class="kv">'+kv('fingerprint',p.fingerprint||'not recorded')+kv('work status',t.status)+kv('created by',t.created_by)+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('recurrences',p.recurrences||0)+(p.last_recurrence_at?kv('last recurrence',stamp(p.last_recurrence_at)):'')+'</div>'+(t.intent?'<div class="review-field"><span class="label">intent</span><br>'+e(t.intent)+'</div>':'')+decisionBox(t)+history(taskEvents(t.id),'No events recorded for this proposal.')+'</div></details>'}
+function drawProposals(){var q=(document.getElementById('proposal-search').value||'').toLowerCase(),list=(DATA.proposals||[]).map(task).filter(Boolean);if(PROPOSAL_STAGE!=='all')list=list.filter(function(t){return t.stage===PROPOSAL_STAGE});if(q)list=list.filter(function(t){var p=t.proposal||{};return [t.id,t.title,t.intent,p.condition,p.desired_outcome,p.completion_check,p.fingerprint,p.classification,p.question,p.recommendation,p.defer_consequence,JSON.stringify(p.alternatives||[])].join(' ').toLowerCase().indexOf(q)>=0});document.getElementById('proposal-stats').innerHTML=stats(DATA.proposal_counts,['pending-review','approved-backlog','rejected','stopped','resolved']);document.getElementById('proposal-count').textContent=list.length+' shown';document.getElementById('proposals').innerHTML=rows(list,proposalRow,'No proposals in this stage.')}
+function prefillDecision(card){var id=card.dataset.decisionCard,note=document.querySelector('[data-decision-note="'+id+'"]');if(!note)return;note.value=card.dataset.decisionPrefill||'';DECISION_NOTES[id]=note.value;note.focus()}
 var TOKEN_KEY='ops-dashboard-write-token';
 function decisionToken(){var t=null;try{t=localStorage.getItem(TOKEN_KEY)}catch(_){t=null}if(!t){try{t=window.prompt('Dashboard write token (required for proposal decisions):')||''}catch(_){t=''}if(t)try{localStorage.setItem(TOKEN_KEY,t)}catch(_){}}return t}
 function decisionStatus(id,text,error){var s=document.querySelector('[data-decision-status="'+id+'"]');if(s){s.textContent=text||'';s.classList.toggle('error',!!error)}}
@@ -246,7 +469,7 @@ function refreshSelectors(){var kinds={},projects=[];(DATA.tasks||[]).forEach(fu
 options('kind-filter',Object.keys(kinds).sort().map(function(k){return {value:k,text:k+' ('+kinds[k]+')'}}),KIND_FILTER,'any kind');
 (DATA.projects||[]).forEach(function(p){projects.push({value:p.unprojected?'unprojected':p.id,text:p.title+' ('+((p.rollup||{}).tasks||0)+')'})});
 options('project-filter',projects,PROJECT_FILTER,'any project')}
-function render(d){var box=document.getElementById('memory-body');if(box)MEMORY_SCROLL=box.scrollTop;document.querySelectorAll('[data-decision-note]').forEach(function(v){DECISION_NOTES[v.dataset.decisionNote]=v.value});OPEN_TASKS={};OPEN_EVENTS={};OPEN_PROJECTS={};OPEN_PROPOSALS={};document.querySelectorAll('[data-task][open]').forEach(function(v){OPEN_TASKS[v.dataset.task]=true});document.querySelectorAll('[data-event][open]').forEach(function(v){OPEN_EVENTS[v.dataset.event]=true});document.querySelectorAll('[data-project][open]').forEach(function(v){OPEN_PROJECTS[v.dataset.project]=true});document.querySelectorAll('[data-proposal][open]').forEach(function(v){OPEN_PROPOSALS[v.dataset.proposal]=true});var x=d.estate_activity||{},ex=x.extractions||{},lh=x.ledger_health||{},m=x.memories||{};DATA=x;
+function render(d){var box=document.getElementById('memory-body');if(box)MEMORY_SCROLL=box.scrollTop;document.querySelectorAll('[data-decision-note]').forEach(function(v){DECISION_NOTES[v.dataset.decisionNote]=v.value});document.querySelectorAll('[data-resolve-note]').forEach(function(v){RESOLVE_NOTES[v.dataset.resolveNote]=v.value});OPEN_TASKS={};OPEN_EVENTS={};OPEN_PROJECTS={};OPEN_PROPOSALS={};document.querySelectorAll('[data-task][open]').forEach(function(v){OPEN_TASKS[v.dataset.task]=true});document.querySelectorAll('[data-event][open]').forEach(function(v){OPEN_EVENTS[v.dataset.event]=true});document.querySelectorAll('[data-project][open]').forEach(function(v){OPEN_PROJECTS[v.dataset.project]=true});document.querySelectorAll('[data-proposal][open]').forEach(function(v){OPEN_PROPOSALS[v.dataset.proposal]=true});var x=d.estate_activity||{},ex=x.extractions||{},lh=x.ledger_health||{},m=x.memories||{};DATA=x;
 INDEX={};(x.tasks||[]).forEach(function(t){INDEX[t.id]=t});
 EVENT_INDEX={};Object.keys(x.task_events||{}).forEach(function(id){(x.task_events[id]||[]).forEach(function(v){EVENT_INDEX[v.seq]=v})});(x.events||[]).forEach(function(v){EVENT_INDEX[v.seq]=v});
 document.getElementById('estate-title').textContent=(d.estate||'estate')+' / '+(d.operator||'hub');
@@ -265,8 +488,14 @@ drawMemories(m);
 }
 """
 JS_TAIL = r"""
-// Every handler below is display-only except the explicitly named proposal
-// decision delegation above. No task/project/dependency mutation is exposed.
+// Every handler below is display-only except the two explicitly named
+// delegations — the proposal decision, and the follow-up resolution on the
+// attention row. No task/project/dependency mutation is exposed.
+// Delegated from the panel, not bound per row: the attention list is rebuilt
+// on every snapshot and a per-button handler would be re-bound once per row
+// on every refresh. The note textarea sits in the row's BODY rather than its
+// <summary>, so typing in it never toggles the disclosure.
+document.getElementById('attention').onclick=function(ev){var b=ev.target.closest('[data-resolve-id]');if(b)resolveFollowup(b)};
 document.querySelectorAll('[data-filter]').forEach(function(b){b.onclick=function(){FILTER=b.dataset.filter;document.querySelectorAll('[data-filter]').forEach(function(x){x.classList.toggle('active',x===b)});drawTasks()}});
 document.querySelectorAll('[data-attn]').forEach(function(b){b.onclick=function(){var v=b.dataset.attn;if(v==='history'){ATTN_HISTORY=!ATTN_HISTORY}else{ATTN_HISTORY=false;ATTN_FILTER=v}document.querySelectorAll('[data-attn]').forEach(function(x){x.classList.toggle('active',x.dataset.attn==='history'?ATTN_HISTORY:(!ATTN_HISTORY&&x.dataset.attn===ATTN_FILTER))});drawAttention()}});
 document.querySelectorAll('[data-dep]').forEach(function(b){b.onclick=function(){DEP_FILTER=b.dataset.dep;document.querySelectorAll('[data-dep]').forEach(function(x){x.classList.toggle('active',x===b)});drawDeps()}});
@@ -275,7 +504,8 @@ document.getElementById('kind-filter').onchange=function(){KIND_FILTER=this.valu
 document.getElementById('project-filter').onchange=function(){PROJECT_FILTER=this.value;drawTasks()};
 document.getElementById('search').oninput=drawTasks;
 document.getElementById('proposal-search').oninput=drawProposals;
-document.getElementById('proposals').onclick=function(ev){var b=ev.target.closest('[data-decision-id]');if(b)decideProposal(b)};
+document.getElementById('proposals').onclick=function(ev){var b=ev.target.closest('[data-decision-id]');if(b){decideProposal(b);return}var card=ev.target.closest('[data-decision-card]');if(card)prefillDecision(card)};
+document.getElementById('proposals').onkeydown=function(ev){var card=ev.target.closest('[data-decision-card]');if(card&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();prefillDecision(card)}};
 document.addEventListener('click',function(ev){var b=ev.target.closest('[data-full-note]');if(!b)return;var v=EVENT_INDEX[b.dataset.fullNote],dialog=document.getElementById('note-dialog');if(!v||!dialog)return;document.getElementById('note-dialog-title').textContent=(v.task_id?v.task_id+' · ':'')+v.summary;document.getElementById('note-dialog-body').innerHTML=markdown(v.detail||'');dialog.showModal()});
 document.getElementById('note-close').onclick=function(){document.getElementById('note-dialog').close()};
 function refresh(){fetch('dashboard.json?t='+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw Error('fetch failed');return r.json()}).then(render).catch(function(){document.getElementById('tasks').innerHTML='<div class="empty">Dashboard data could not be loaded.</div>'})}
@@ -283,15 +513,23 @@ refresh();setInterval(refresh,30000);
 })();
 """
 JS = (JS_HEAD + JS_ATTENTION + JS_INBOX + JS_PROJECTS + JS_DEPS + JS_PROPOSALS
-      + JS_BODY + JS_TAIL)
+      + JS_BODY + JS_TAIL).replace(
+    # t-476. The server's table, not a second copy of it. A renderer that
+    # hard-coded "desired_outcome is the recommendation" would be the second
+    # implementation lib/estate_work exists to prevent.
+    "__SURFACE_CANONICAL__", json.dumps(estate_work.SURFACE_CANONICAL,
+                                        sort_keys=True))
 
 # The page states its own deliberately narrow write contract. Proposal review
-# decisions are the sole estate mutation; every other control only changes the
-# display, and the server refuses proposal writes without its configured token.
+# decisions and follow-up resolutions are the only estate mutations; every
+# other control only changes the display, and the server refuses both writes
+# without its configured token.
 BANNER = ('<div class="readonly"><b>Narrow write surface</b>'
-          '<span>Proposal decisions write through the same audited lifecycle as '
-          '<code>bin/estate proposal stage</code> and require the dashboard '
-          'write token. Every other control only filters or expands.</span>'
+          '<span>Two controls write: a proposal decision through the same '
+          'audited lifecycle as <code>bin/estate proposal stage</code>, and a '
+          'follow-up resolution through <code>bin/followups resolve</code>. '
+          'Both require the dashboard write token. Every other control only '
+          'filters or expands.</span>'
           '<span class="spacer"></span>'
           '<span class="time" id="generated-at"></span></div>')
 
@@ -324,7 +562,6 @@ PROPOSAL_BUTTONS = ''.join(
                        ("approved-backlog", "Approved backlog"),
                        ("rejected", "Rejected"), ("stopped", "Stopped"),
                        ("resolved", "Resolved"), ("all", "All")))
-
 
 def render(dashboard, snapshot: dict) -> str:
     e=html.escape; name=f'{snapshot["estate"]} / {snapshot["operator"]}'

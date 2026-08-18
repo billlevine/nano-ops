@@ -162,6 +162,50 @@ class AttentionSetCase(unittest.TestCase):
             self.assertFalse(A.is_attention("rollout", status))
 
 
+class TierCase(unittest.TestCase):
+    """The three lifecycle tiers (t-721) — one set, three kinds of waiting."""
+
+    def test_a_staged_needs_owner_row_is_a_decision_and_a_bare_one_is_not(self):
+        self.assertEqual(A.tier("proposal", "needs-owner", "pending-review"),
+                         A.TIER_DECISION)
+        self.assertEqual(A.tier("proposal", "needs-owner", None),
+                         A.TIER_ESCALATION)
+        self.assertEqual(A.tier("inbox-message", "needs-owner", ""),
+                         A.TIER_ESCALATION)
+
+    def test_an_open_followup_is_its_own_tier(self):
+        self.assertEqual(A.tier("followup", "open", None), A.TIER_FOLLOWUP)
+
+    def test_status_wins_over_kind(self):
+        # An escalated follow-up is both. What the owner has to DO with it is the
+        # escalation, so that is the tier it reads in.
+        self.assertEqual(A.tier("followup", "needs-owner", None),
+                         A.TIER_ESCALATION)
+
+    def test_a_row_outside_the_set_has_no_tier_at_all(self):
+        self.assertIsNone(A.tier("rollout", "ready", None))
+        self.assertIsNone(A.tier("followup", "done", None))
+        self.assertIsNone(A.tier("proposal", "blocked", "pending-review"))
+
+    def test_idle_is_never_negative_and_unreadable_is_none(self):
+        self.assertEqual(
+            A.idle_days((NOON_UTC - dt.timedelta(days=2, hours=12)).isoformat(),
+                        NOON_UTC), 2.5)
+        # A stamp in the future is a clock disagreement, not negative neglect.
+        self.assertEqual(
+            A.idle_days((NOON_UTC + dt.timedelta(days=1)).isoformat(),
+                        NOON_UTC), 0.0)
+        self.assertIsNone(A.idle_days("not a timestamp", NOON_UTC))
+        self.assertIsNone(A.idle_days(None, NOON_UTC))
+
+    def test_the_median_ignores_what_nobody_could_read(self):
+        self.assertEqual(A.median([1, 5, 3]), 3.0)
+        self.assertEqual(A.median([1, 3, None, 5]), 3.0)
+        self.assertEqual(A.median([2, 4]), 3.0)
+        self.assertIsNone(A.median([]))
+        self.assertIsNone(A.median([None]))
+
+
 class ParseStatesCase(unittest.TestCase):
     def test_comma_separated_and_repeatable(self):
         self.assertEqual(A.parse_states(["overdue,due_today", "later"]),
