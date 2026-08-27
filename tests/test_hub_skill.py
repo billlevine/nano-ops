@@ -39,6 +39,15 @@ def sections(text):
     return {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
 
 
+def sub_section(text, heading_starts_with):
+    """Body of the "### " subsection whose heading starts with the given text."""
+    parts = re.split(r"^### +(.*)$", text, flags=re.MULTILINE)
+    for i in range(1, len(parts), 2):
+        if parts[i].strip().startswith(heading_starts_with):
+            return parts[i + 1]
+    raise AssertionError("no ### subsection starting %r" % heading_starts_with)
+
+
 class TestSkillGuard(unittest.TestCase):
     def setUp(self):
         self.text = read(SKILL)
@@ -100,6 +109,64 @@ class TestPublicClaim(unittest.TestCase):
         for line in read(EXAMPLE_TOML).splitlines():
             self.assertFalse(re.match(r"\s*slack_channel_id\s*=", line),
                              "loops.example.toml must leave slack_channel_id unset")
+
+
+class IntakeManifest(unittest.TestCase):
+    """The intake step counts messages instead of reminding itself.
+
+    A skill that tells a tick to notice a second message is a reminder, and a
+    reminder is what fails: an operator's two back-to-back asks get read
+    together, the first one acted on, the second left unseen for hours. What is
+    guarded here is the SHAPE of the machinery that replaces the reminder — a
+    literal count, a literal per-ts checklist, an accounting call against the
+    ledger rather than against the tick's memory, and the refusal that keeps a
+    tick from sleeping over an unticked box. An edit that softens any of the
+    four back into "remember to check" is the thing that already failed.
+    """
+
+    def setUp(self):
+        text = read(SKILL)
+        self.manifest = sub_section(text, "The intake manifest")
+        self.pace = sections(text)["6. Pacing and heartbeat"]
+
+    def test_the_manifest_has_its_own_subsection(self):
+        self.assertRegex(flat(self.manifest), r"(?i)newest-first")
+
+    def test_the_count_and_the_list_are_both_literal_output(self):
+        """A summary ("a couple of new ones") is what this replaces."""
+        self.assertRegex(self.manifest, r"N new: \[<ts1>, <ts2>, \.\.\.\]")
+        self.assertRegex(flat(self.manifest),
+                         r"(?i)literally, as text, before acting")
+        self.assertRegex(flat(self.manifest),
+                         r"(?i)bracketed list has exactly `N` entries")
+
+    def test_an_empty_read_still_writes_its_zero_line(self):
+        """No manifest and nothing new must not look the same afterwards."""
+        self.assertRegex(self.manifest, r"`0 new: \[\]`")
+
+    def test_the_checklist_is_per_ts(self):
+        self.assertRegex(self.manifest, r"processed: \[ \] <ts1> \[ \] <ts2>")
+
+    def test_the_accounting_is_checked_against_the_ledger(self):
+        """The checklist is what the tick believes; the ledger is what it holds."""
+        self.assertIn("state/ledger.jsonl", self.manifest)
+        self.assertRegex(self.manifest, r"processed <M> of <N>")
+
+    def test_the_tick_may_not_end_with_an_unticked_box(self):
+        self.assertRegex(self.manifest, r"`M` must equal `N`")
+        for step in ("sweeps", "drain", "wakeup", "ending the turn"):
+            self.assertIn(step, self.manifest,
+                          "the refusal has to name the steps it blocks")
+
+    def test_the_drain_re_read_is_gated_on_the_same_count(self):
+        """§6 is where the tick actually ends, so the gate must be reachable there."""
+        self.assertRegex(flat(self.pace),
+                         r"(?i)\*\*Clean means the manifest says so\*\*")
+        self.assertRegex(self.pace, r"`M == N`")
+
+    def test_the_manifest_is_skipped_channel_less(self):
+        self.assertIn(GUARD, self.manifest.lower())
+
 
 
 if __name__ == "__main__":

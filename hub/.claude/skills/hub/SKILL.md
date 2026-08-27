@@ -98,6 +98,72 @@ the operator's and the hub's — comes from the same user; the hub marks its own
 ts > CURSOR that do not start with "⚙️". Process oldest first; advance the
 cursor over ⚙️-prefixed messages without processing them.
 
+### The intake manifest — count, list, then account for every id
+
+`slack_read_channel` returns messages **newest-first** — the tool's own
+behavior, not this skill's convention. So the first thing a tick does with a
+read of CHANNEL is turn it into a written manifest, oldest-first, and the last
+thing a tick does is account for every id on that manifest. This is a count and
+a checklist rather than a reminder because the reminder is what fails: a tick
+that has just read the sentence telling it to notice a second message still
+acts on the first one it sees. This has been observed live, repeatedly — a tick
+received two top-level asks back to back, handled the first, and left the
+second unseen for hours until the operator re-asked. Noticing is not the
+mechanism; the manifest is. (Channel-less: there is no read and no manifest —
+this subsection is skipped with the rest of §2.)
+
+**Write the manifest. Literally, as text, before acting on any message.** One
+block per read of CHANNEL, listing every message with ts > CURSOR that does not
+start with "⚙️", reversed out of the tool's newest-first order into
+oldest-first:
+
+```
+N new: [<ts1>, <ts2>, ...]
+processed: [ ] <ts1> [ ] <ts2> ...
+```
+
+`N` is a number you counted, and the bracketed list has exactly `N` entries — a
+disagreement between the two is the bug, caught here for free instead of in the
+channel hours later. A read with nothing new gets `0 new: []` and no checklist.
+That zero line is not decoration: afterwards, a channel nobody read and a
+channel with nothing new look identical, and only one of them is a fact about
+this tick.
+
+**Tick a box only when that ts is really in hand.** A box is ticked when that
+message has its own §4 ledger line — the one carrying its ts in `refs` — and
+its cursor advance. Never because you read it, and never because it looked like
+a duplicate of the one above it. The manifest is the tick's work list: a ts
+still showing `[ ]` is outstanding work, not context.
+
+**Then close the count out loud, and check it against the ledger rather than
+against your memory of the tick.** Before the §5 health pass, before §6's
+drain, before ScheduleWakeup: state `processed <M> of <N>`, and for every ts on
+the list confirm the estate really holds it:
+
+```bash
+grep -F '"<that ts>"' REPO/state/ledger.jsonl
+```
+
+A ts with no hit is one this tick never took in hand. That is the mechanical
+half of the accounting — the checklist is what you believe you did, the ledger
+is what the estate actually holds, and a message that fell between the two is
+precisely the failure mode.
+
+**`M` must equal `N`, and until it does the tick is not over.** Running §5's
+sweeps, doing §6's drain, scheduling the next wakeup, or ending the turn with an
+unticked box is itself the failure this section exists to prevent — it is not a
+shortcut that usually works out. A listed message that genuinely cannot be
+finished this tick is still accounted for rather than dropped: it gets the reply
+or the queue entry §3 gives it, and its ledger line, which ticks its box. The
+cursor is a watermark, so a box left unticked is a message nothing here will
+ever surface again.
+
+**The drain's re-read gets its own manifest** (§6). A second read of CHANNEL in
+the same tick appends a second `N new: [...]` block below the first, with its
+own boxes — never an amendment to the first block, whose count is already
+settled and already accounted for. Only a re-read whose manifest is `0 new`
+lets the tick sleep.
+
 ## 3. Handle each message — full trust, act immediately
 
 React 👀 to the message first, so the operator sees it was picked up. Then
@@ -246,7 +312,11 @@ channel; just process whatever new messages it heralds.
 heartbeat.) After you post a reply, do NOT end the turn yet —
 re-read CHANNEL once more. If new non-⚙️ messages arrived while you were
 working, handle them in this same turn and loop again; only ScheduleWakeup once
-a re-read comes back clean. During an active back-and-forth this catches
+a re-read comes back clean. **Clean means the manifest says so** (§2): the
+re-read writes its own `N new: [...]` block, and the tick may sleep only when
+every block written this tick — this one and the ones above it — reads
+`processed <M> of <N>` with `M == N` and no box left `[ ]`. Scheduling the next
+wakeup over an unticked box is the miss this manifest exists to prevent. During an active back-and-forth this catches
 follow-ups immediately instead of eating the doorbell's ~30s latency. (The
 doorbell is still the wake path when you are actually idle between turns.)
 
