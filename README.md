@@ -64,7 +64,9 @@ persistent activation held open by a supervisor
 CLAUDE.md              what this repo is; the conventions that bind every session
 hub/                   the hub session's home — CLAUDE.md + the hub tick skill
 bin/ops                operator CLI: up|status|health|doctor|services|dashboard|compact
-bin/doorbell           zero-token Slack inbox poller (kicks the hub on activity)
+bin/doorbell           zero-token Slack inbox poller (kicks the hub on activity);
+                       also `read` (one warranted inbox read) and `panes`
+                       (the hourly report-only pane sweep)
 bin/dashboard          estate dashboard renderer (pure reader; --json regen path)
 bin/dashboard-refresh  keeps state/dashboard.json fresh via `dashboard --json`
 bin/dashboard-server   loopback-only static server for the dashboard (allowlist)
@@ -112,7 +114,8 @@ data are not — is what keeps it that way.
 `tests/test_followups.py` are self-contained `unittest` suites over the
 dashboard renderer, the inbox poller and the followups store. Each runs against
 a fresh tempdir and never touches real `state/`, real Slack, or a real
-`loops.toml`. `tests/test_hub_skill.py` covers the hub tick's channel-less
+`loops.toml` — `test_doorbell.py` covers the pane sweep too, with agent-deck
+and tmux injected rather than run. `tests/test_hub_skill.py` covers the hub tick's channel-less
 guard — the invariant behind "Slack is optional" — by checking the skill still
 states it everywhere the tick would otherwise touch the channel:
 
