@@ -74,6 +74,42 @@ deck_profile = "ops"
 # disposition = "conservative"
 # poll_seconds = 60
 
+# [hub.pane_watch] — the PANE SWEEP. bin/doorbell's second job, and the only
+# deterministic reader of the live terminal here: hourly it captures each live
+# session's pane tail, hashes it, and asks whether that pane has said anything
+# since these exact bytes were FIRST seen. agent-deck's own status string cannot
+# answer that — it reports `waiting` for a healthy between-ticks session and for
+# a dead one alike — so a session can sit at an empty prompt for a day while
+# every store-reading check calls it healthy.
+#
+# REPORT ONLY. Nothing is kicked, restarted or filed: an idle prompt is a
+# legitimate resting state, so a flag is a signal for a person, never a trigger.
+# `bin/doorbell panes --report` answers "what is flagged now" out of the last
+# sweep's file without looking again, and refuses to speak for the present when
+# that file is older than two sweep intervals.
+#
+# All keys are optional; the values below are the defaults the code uses with no
+# table at all.
+#
+# sweep_seconds  how often the daemon looks (minimum 60).
+# idle_seconds   how long an unchanged pane may sit before it is flagged.
+# capture_lines  how much of the pane tail is hashed (1..2000).
+#
+# [hub.pane_watch]
+# sweep_seconds = 3600
+# idle_seconds = 3600
+# capture_lines = 50
+#
+# [hub.pane_watch.overrides] — per-session thresholds, in seconds. Different
+# session CLASSES want different ones: an ephemeral worker quiet for an hour is
+# a stall, and a long-lived session with no cadence at all is doing what it is
+# for. 0 means never flag. A key matches a title exactly, or as a substring when
+# no exact key matches (longest key wins), so "ephemeral - " sets a class.
+#
+# [hub.pane_watch.overrides]
+# "ops (advisor)" = 0
+# "ephemeral - " = 1800
+
 [dashboard]
 # bin/dashboard-server binds here; bin/dashboard links to it in its output.
 # Port 8522 (not the 8422 default) so this can run ALONGSIDE another estate's

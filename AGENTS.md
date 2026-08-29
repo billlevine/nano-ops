@@ -22,7 +22,10 @@ private-fork/public-upstream shape.
 - `bin/ops` — up | status | health | doctor | services | dashboard | compact
 - `bin/doorbell` — zero-token poller over every `[[hub.inbox]]` in `loops.toml`
   (each on its own rate and cursor) that kicks the hub on new activity; its
-  token is a file at `state/secrets/slack-user-token`
+  token is a file at `state/secrets/slack-user-token`. `read --inbox <name>` is
+  the one-shot warranted read the hub falls back to when its Slack connector is
+  down, and `panes` is the hourly PANE SWEEP — the one deterministic reader of
+  the live terminal, report-only, configured under `[hub.pane_watch]`
 - `bin/dashboard`, `bin/dashboard-refresh`, `bin/dashboard-server` — the Tier-1
   local estate dashboard: renderer, regenerator, loopback-only server
 - `bin/usage-fetch` — writes `state/usage/budget.json`, the budget signal

@@ -41,10 +41,27 @@ treated as a single full-trust inbox named "self-dm".
 
 `bin/doorbell --check` prints the resolved inbox table and exits without
 polling (used by `bin/ops doctor`).
+
+`bin/doorbell read --inbox <name> [--oldest <ts>]` is the one-shot read the
+hub falls back to when its Slack connector is down. It reads the token off
+disk itself, makes the same `conversations.history` call the poller makes, and
+prints the messages with the WARRANT of the read attached
+(docs/absence-contract.md) — `observed`, `observed` + `partial` when Slack
+says there are older messages it did not return, or `failed`. Read-only,
+like everything else here: it advances no cursor and writes no state.
+
+    bin/doorbell read --inbox self-dm | jq '.warrant, .messages[].text'
+
+Exit 0 on a complete read, 2 on a partial one, 3 when nothing was observed.
+
+`bin/doorbell panes` is the hourly PANE SWEEP — the only deterministic reader
+of the live terminal here. See THE PANE SWEEP below.
 """
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -53,7 +70,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 TOKEN_FILE = os.path.join(REPO, "state", "secrets", "slack-user-token")
 HUB_DIR = os.path.join(REPO, "state", "hub")
 HUB_CURSOR = os.path.join(HUB_DIR, "cursor")
@@ -68,46 +85,26 @@ KICK_COOLDOWN_S = 120
 # fails on every poll. Log the first occurrence, then repeat it at most this
 # often, so one bad inbox can't bury the others' output in journald.
 ERROR_REPEAT_S = 600
+# ── the pane sweep (t-1094) ──────────────────────────────────────────────────
+PANE_STATE = os.path.join(STATE_DIR, "pane-hashes.json")
+PANE_STATE_VERSION = 1
+PANE_VOCAB = "pane-watch"
+PANE_DEFAULT_SWEEP_S = 3600      # how often the daemon looks
+PANE_DEFAULT_IDLE_S = 3600       # how long an unchanged pane may sit unflagged
+PANE_DEFAULT_LINES = 50          # how much of the pane tail is hashed
+PANE_MIN_SWEEP_S = 60
+PANE_MAX_LINES = 2000
+# agent-deck statuses that mean the session is alive — the same test
+# `bin/ops health` makes. Anything else has no live pane to be stalled at.
+PANE_ALIVE = ("running", "waiting")
+# What tmux says when the target is simply not there any more. Distinguished
+# from a broken tmux because they are chased differently: the first is a pane
+# that died under its agent-deck record, the second is weather.
+PANE_GONE_MARKERS = ("can't find pane", "can't find session", "no server running",
+                     "session not found", "no current session")
+
+
 DEFAULT_DISPOSITION = "conservative"  # unstated trust is never full trust
-
-
-def read_file(path, default=""):
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return default
-
-
-def safe_name(raw):
-    """Inbox names become filename suffixes — keep them boring."""
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw)).strip("-") or "inbox"
-
-
-def load_config(path=None):
-    with open(path or os.path.join(REPO, "loops.toml"), "rb") as f:
-        return tomllib.load(f)
-
-
-def hub_config():
-    """loops.toml [hub] — the per-installation operator identity. Never raises:
-    a missing/unparseable registry degrades to neutral defaults here, and main()
-    reports the real config error when it re-reads the file strictly."""
-    try:
-        hub = load_config().get("hub", {})
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
-    return hub if isinstance(hub, dict) else {}
-
-
-HUB = hub_config()
-# Persona is the display half of the agent-deck title convention
-# "<persona> (<loop name>)"; the hub's loop name is "hub". Public default is the
-# neutral "ops" — a real install sets its own in loops.toml.
-HUB_PERSONA = HUB.get("persona") or "ops"
-HUB_SESSION = HUB.get("session_title") or f"{HUB_PERSONA} (hub)"
-DECK_PROFILE = (os.environ.get("DOORBELL_DECK_PROFILE")
-                or HUB.get("deck_profile") or "ops")
 
 
 @dataclass(frozen=True)
@@ -127,6 +124,47 @@ class Inbox:
     @property
     def last_kick_path(self):
         return os.path.join(STATE_DIR, f"last_kick.{self.name}")
+
+
+def read_file(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def safe_name(raw):
+    """Inbox names become filename suffixes — keep them boring."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw)).strip("-") or "inbox"
+
+
+def load_config(path=None):
+    with open(path or os.path.join(REPO, "loops.toml"), "rb") as f:
+        return tomllib.load(f)
+
+def hub_config():
+    """loops.toml [hub] — the per-installation operator identity. Never raises:
+    a missing/unparseable registry degrades to neutral defaults here, and main()
+    reports the real config error when it re-reads the file strictly."""
+    try:
+        hub = load_config().get("hub", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return hub if isinstance(hub, dict) else {}
+
+
+HUB = hub_config()
+# Persona is the display half of the agent-deck title convention
+# "<persona> (<loop name>)"; the hub's loop name is "hub". Public default is the
+# neutral "ops" — a real install sets its own in loops.toml.
+HUB_PERSONA = HUB.get("persona") or "ops"
+HUB_SESSION = HUB.get("session_title") or f"{HUB_PERSONA} (hub)"
+# Pinned explicitly rather than left to the ambient default, because a service
+# or cron context resolves session titles against a different session store and
+# a kick sent there is lost while the wrapper still reports success.
+DECK_PROFILE = (os.environ.get("DOORBELL_DECK_PROFILE")
+                or HUB.get("deck_profile") or "ops")
 
 
 def load_inboxes(config):
@@ -178,7 +216,14 @@ def history_query(channel, oldest=None):
     return urllib.parse.urlencode(params)
 
 
-def fetch_messages(token, channel, oldest=None):
+def fetch_history(token, channel, oldest=None):
+    """One conversations.history call, envelope and all.
+
+    The poller wants the messages and nothing else, which is what
+    fetch_messages() below returns. The `read` verb wants the rest of the
+    envelope too, because Slack reports truncation in `has_more` /
+    `response_metadata.next_cursor` — and a read that drops those cannot say
+    whether it saw the whole window."""
     req = urllib.request.Request(
         f"https://slack.com/api/conversations.history?{history_query(channel, oldest)}",
         headers={"Authorization": f"Bearer {token}"},
@@ -187,7 +232,11 @@ def fetch_messages(token, channel, oldest=None):
         data = json.load(resp)
     if not data.get("ok"):
         raise RuntimeError(f"slack api error: {data.get('error')}")
-    return data.get("messages", [])
+    return data
+
+
+def fetch_messages(token, channel, oldest=None):
+    return fetch_history(token, channel, oldest).get("messages", [])
 
 
 def needs_kick(messages, cursor):
@@ -219,15 +268,25 @@ def kick(inbox_name):
     return result.returncode == 0
 
 
+def cursor_of(inbox):
+    """The inbox's committed cursor, as (raw string, float).
+
+    One reader, because the raw string is what Slack is asked to filter on and
+    the float is what a local newer-than check compares against — two readings
+    of the same file could disagree across a concurrent hub advance. Anything
+    unparseable is 0, which means "no oldest filter" rather than a guess."""
+    raw = read_file(inbox.cursor_path, "0") or "0"
+    try:
+        return raw, float(raw)
+    except ValueError:
+        return "0", 0.0
+
+
 def poll_inbox(token, inbox, now=None):
     """One poll of one inbox. Returns the ts that triggered a kick, else None."""
     # One cursor read drives both the server-side oldest filter and the local
     # newer-than check, so a concurrent hub cursor advance can't split the two.
-    cursor_str = read_file(inbox.cursor_path, "0") or "0"
-    try:
-        cursor = float(cursor_str)
-    except ValueError:
-        cursor_str, cursor = "0", 0.0
+    cursor_str, cursor = cursor_of(inbox)
     oldest = cursor_str if cursor > 0 else None
     ts = needs_kick(fetch_messages(token, inbox.channel_id, oldest), cursor)
     if not ts:
@@ -244,6 +303,797 @@ def poll_inbox(token, inbox, now=None):
     return ts
 
 
+def observation():
+    """lib/estate_observation, imported only on the `read` path.
+
+    The polling daemon stays stdlib-only — this import runs when somebody asks
+    for one read, never inside the systemd service's loop. There is no fallback
+    if it cannot be imported: a warrant that could not be derived is exactly
+    the thing this verb exists to refuse to guess at."""
+    lib = os.path.join(REPO, "lib")
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    import estate_observation
+    return estate_observation
+
+
+def read_inbox(token, inbox, oldest=None):
+    """One read of one inbox, as (warranted reading, messages).
+
+    Same call the poller makes and the same window: `oldest` is the inbox's
+    committed cursor unless a caller names one, and `history_query`'s limit is
+    untouched. So Slack answers with the NEWEST messages in the range and says
+    in `has_more` whether it left older ones behind — which is reported here as
+    `partial` rather than dropped. A partial read is still `observed` (the
+    messages it returned are real) and can never prove the inbox is quiet,
+    which is the whole point: advancing a cursor past a truncated read skips
+    the remainder permanently, since the poller writes no cursor of its own.
+    """
+    obs = observation()
+    source = f"conversations.history:{inbox.name}"
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    detail = {"channel_id": inbox.channel_id, "oldest": oldest}
+
+    def failed(outcome, exc):
+        return obs.reading("doorbell", source, outcome, at=at, why=str(exc),
+                           detail=detail), []
+
+    if not token:
+        return failed("no_credential", f"no token at {TOKEN_FILE}")
+    try:
+        data = fetch_history(token, inbox.channel_id, oldest)
+    except RuntimeError as exc:          # Slack answered `ok: false`
+        return failed("api_error", exc)
+    except ValueError as exc:            # the body would not parse as JSON
+        return failed("unreadable", exc)
+    except OSError as exc:               # URLError, HTTPError, timeout
+        return failed("unreachable", exc)
+
+    messages = data.get("messages") or []
+    next_cursor = str((data.get("response_metadata") or {}).get("next_cursor") or "")
+    partial = bool(data.get("has_more")) or bool(next_cursor)
+    detail = dict(detail, message_count=len(messages), next_cursor=next_cursor)
+    why = ("slack has more messages in this window than it returned — the older "
+           "ones were not read") if partial else None
+    return obs.reading("doorbell", source, "ok", partial=partial, at=at,
+                       why=why, detail=detail), messages
+
+
+READ_USAGE = "usage: doorbell read --inbox <name> [--oldest <ts>]"
+
+
+def read_main(argv, inboxes):
+    """`read` — one warranted read of one inbox, as JSON on stdout.
+
+    Exit 0 on a complete read, 2 on a partial one, 3 when nothing was observed,
+    so a shell caller can branch on the warrant without parsing the JSON."""
+    name, oldest, rest = None, None, list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--inbox" and rest:
+            name = rest.pop(0)
+        elif arg == "--oldest" and rest:
+            oldest = rest.pop(0)
+        else:
+            sys.exit(f"doorbell: {READ_USAGE}")
+    if not name:
+        sys.exit(f"doorbell: {READ_USAGE}")
+    inbox = next((ib for ib in inboxes if ib.name == safe_name(name)), None)
+    if inbox is None:
+        sys.exit(f"doorbell: no inbox named {name!r} in loops.toml "
+                 f"(have: {', '.join(ib.name for ib in inboxes)})")
+    if oldest is None:
+        raw, cursor = cursor_of(inbox)
+        oldest = raw if cursor > 0 else None
+    reading, messages = read_inbox(read_file(TOKEN_FILE), inbox, oldest)
+    print(json.dumps(dict(reading, inbox=inbox.name, messages=messages),
+                     indent=2, sort_keys=True))
+    if reading["warrant"] != "observed":
+        return 3
+    return 2 if reading["partial"] else 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE PANE SWEEP (t-1094)
+# ═══════════════════════════════════════════════════════════════════════════
+# The hub's charter names its own failure mode: a session sits idle at an empty
+# prompt for an hour, unseen. It has happened: a long-lived session once sat at
+# an empty prompt for roughly 27 hours while `agent-deck` reported it `running`
+# the whole time, and it was caught because a person happened to read the pane.
+#
+# Nothing else could have caught it. `bin/ops health` reads registry heartbeats;
+# every other standing check here reads a store or a git history. The stall was
+# only ever visible on the terminal itself, and agent-deck's status string is
+# documented-unreliable: it says `waiting` for a healthy between-ticks hub and
+# for a dead one alike.
+#
+# So this reads the pane. For every live session in the configured agent-deck
+# profile it captures the last N lines, hashes them, and asks one question:
+#
+#     has this pane said ANYTHING since the first time I saw these exact bytes?
+#
+# WHY THE BASELINE IS "FIRST SEEN", NOT "LAST SWEEP"
+# --------------------------------------------------
+# The entry keeps `first_seen_at` — the moment this exact hash first appeared —
+# and it is not touched while the hash holds. So the measurement is "unchanged
+# for 27h" rather than "unchanged since the previous look", which makes the
+# answer independent of how often anything sweeps. A hand-run `bin/doorbell
+# panes` between two daemon sweeps refines the record; it cannot reset the clock
+# and cannot manufacture or erase a stall.
+#
+# REPORT ONLY, AND ONE FLAG PER OBSERVATION
+# -----------------------------------------
+# Nothing is kicked, restarted or filed. An idle prompt is a legitimate resting
+# state for some sessions, so a flag is a signal for the hub's judgment or for
+# the operator, never a trigger. And a session is flagged ONCE per unchanged
+# pane (`flagged_hash`) — one flag per observation: without that rule a session
+# that is genuinely idle forever
+# would announce itself on every sweep until nobody read the output. A pane that
+# CHANGES re-arms the flag. The standing list survives in the state file —
+# `panes --report`
+# answers "what is flagged now" without looking again — so not-repeating is not
+# the same as forgetting.
+#
+# WHAT A FAILED LOOK MAY NOT BECOME
+# ---------------------------------
+# Both halves of this are absence claims (docs/absence-contract.md), and each has
+# its own way of going wrong. A tmux capture that failed produces the same "no
+# new bytes" as a pane that really said nothing, so a failed capture leaves the
+# stored entry UNTOUCHED and settles the row `unobservable` — it can neither
+# flag nor clear. And a sweep that could not enumerate the sessions produces the
+# same empty row list as an estate with nothing wrong, so it writes nothing at
+# all rather than pruning every entry it could not see. Every reading goes
+# through the `pane-watch` vocabulary in lib/estate_observation.py.
+#
+# CONFIG — loops.toml [hub.pane_watch]. All four keys are optional; the defaults
+# above are the same values the code uses with no table at all.
+#
+#     [hub.pane_watch]
+#     sweep_seconds = 3600     # how often the daemon looks
+#     idle_seconds = 3600      # unchanged-for, before a session is flagged
+#     capture_lines = 50       # how much of the pane tail is hashed
+#
+#     [hub.pane_watch.overrides]      # per-session thresholds, in seconds
+#     "ops (advisor)" = 0          # 0 = never flag; this one has no cadence
+#
+# Different session CLASSES want different thresholds, which is why the
+# overrides exist: an ephemeral dispatch worker quiet for an hour is a stall, and
+# a long-lived session with no cadence at all is doing what it is for. A key
+# matches a title exactly, or as a substring when no exact key matches (longest
+# key wins), so `"ephemeral - "` sets a class.
+def parse_seconds(raw, what):
+    """`30m` / `2h` / `1d` / a bare number of seconds. Raises ValueError."""
+    text = str(raw).strip().lower()
+    if not text:
+        raise ValueError(f"{what}: empty duration")
+    unit, mult = text[-1], {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if unit in mult:
+        text, factor = text[:-1], mult[unit]
+    else:
+        factor = 1
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{what}: {raw!r} is not a duration") from None
+    if value < 0:
+        raise ValueError(f"{what}: {raw!r} is negative")
+    return int(value * factor)
+
+
+@dataclass(frozen=True)
+class PaneWatch:
+    sweep_seconds: int
+    idle_seconds: int
+    capture_lines: int
+    overrides: tuple  # ((title-or-substring, seconds), ...), longest key first
+
+    def threshold(self, title):
+        """This session's unchanged-for threshold, in seconds. 0 = never flag.
+
+        Exact title first, so a specific session can always be named without a
+        broader class key stealing it; then the longest matching substring, so
+        `"ephemeral - "` can set a class and one member of it can still be
+        pinned by name.
+        """
+        for key, seconds in self.overrides:
+            if key == title:
+                return seconds
+        for key, seconds in self.overrides:
+            if key in title:
+                return seconds
+        return self.idle_seconds
+
+
+def load_pane_watch(config):
+    """[hub.pane_watch] → a PaneWatch. Absent table = the defaults.
+
+    A malformed table RAISES, exactly as a malformed inbox does: the doorbell
+    refuses to start on a config it does not understand, rather than starting
+    with a sweep quietly disabled — which is the shape of failure this whole
+    mechanism exists to remove.
+    """
+    hub = config.get("hub") or {}
+    raw = hub.get("pane_watch")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("[hub.pane_watch] must be a table")
+
+    def whole(key, default, floor, ceiling=None):
+        if key not in raw:
+            return default
+        try:
+            value = int(raw[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"[hub.pane_watch] {key}: "
+                             f"{raw[key]!r} is not a number") from None
+        if value < floor or (ceiling is not None and value > ceiling):
+            bound = f"{floor}..{ceiling}" if ceiling is not None else f">= {floor}"
+            raise ValueError(f"[hub.pane_watch] {key}: {value} is outside {bound}")
+        return value
+
+    overrides_raw = raw.get("overrides") or {}
+    if not isinstance(overrides_raw, dict):
+        raise ValueError("[hub.pane_watch.overrides] must be a table of "
+                         "\"<session title>\" = <seconds>")
+    overrides = []
+    for title, seconds in overrides_raw.items():
+        try:
+            value = int(seconds)
+        except (TypeError, ValueError):
+            raise ValueError(f"[hub.pane_watch.overrides] {title!r}: "
+                             f"{seconds!r} is not a number of seconds") from None
+        if value < 0:
+            raise ValueError(f"[hub.pane_watch.overrides] {title!r}: "
+                             "a threshold cannot be negative (0 = never flag)")
+        overrides.append((str(title), value))
+    overrides.sort(key=lambda pair: (-len(pair[0]), pair[0]))
+
+    return PaneWatch(
+        sweep_seconds=whole("sweep_seconds", PANE_DEFAULT_SWEEP_S, PANE_MIN_SWEEP_S),
+        idle_seconds=whole("idle_seconds", PANE_DEFAULT_IDLE_S, 0),
+        capture_lines=whole("capture_lines", PANE_DEFAULT_LINES, 1, PANE_MAX_LINES),
+        overrides=tuple(overrides),
+    )
+
+
+def pane_digest(text):
+    """The hash a stall is judged on.
+
+    Trailing whitespace is stripped per line and trailing blank lines dropped
+    before hashing, because tmux pads a captured line out to the pane width: a
+    resize would otherwise read as activity, and reading a redraw as activity is
+    the direction that HIDES a stall.
+    """
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return hashlib.sha256("\n".join(lines).encode("utf-8", "replace")).hexdigest()
+
+
+def read_deck_sessions(profile=None, fixture=None):
+    """{title: {status, tmux_session}} for the profile, plus (outcome, why).
+
+    Its own reader rather than a shared one: this runs inside the polling
+    daemon, where the stdlib-only rule holds. What must NOT be duplicated is the
+    profile, and it is not — `-p` comes from DECK_PROFILE, which is the one
+    reading of loops.toml [hub].deck_profile. A call without it silently reads
+    another profile's session store, which reads back as "no such session" and
+    would take every pane in the estate out of the sweep.
+    """
+    if fixture is not None:
+        try:
+            with open(fixture) as fh:
+                raw = fh.read()
+        except OSError as exc:
+            return {}, "deck_error", (f"--deck-json {fixture} could not be read "
+                                      f"({exc.strerror})")
+    else:
+        if shutil.which("agent-deck") is None:
+            return {}, "no_tool", ("agent-deck is not on PATH, so no session "
+                                   "can be enumerated")
+        try:
+            out = subprocess.run(
+                ["agent-deck", "-p", profile or DECK_PROFILE, "ls", "--json"],
+                capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {}, "deck_error", (f"agent-deck ls --json did not return "
+                                      f"({exc.__class__.__name__})")
+        if out.returncode != 0:
+            return {}, "deck_error", (f"agent-deck ls --json exited "
+                                      f"{out.returncode}: "
+                                      f"{(out.stderr or '').strip()[:160]}")
+        raw = out.stdout
+
+    try:
+        data = json.loads(raw or "[]")
+    except ValueError:
+        return {}, "unreadable", "agent-deck's answer was not JSON"
+    if not isinstance(data, list):
+        return {}, "unreadable", "agent-deck's answer was not a list of sessions"
+
+    sessions = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if not title or title in sessions:
+            continue  # first wins, as bin/ops health does
+        sessions[title] = {"status": str(item.get("status") or ""),
+                           "tmux_session": str(item.get("tmux_session") or "")}
+    return sessions, "ok", None
+
+
+def capture_pane(tmux_session, lines):
+    """The pane's last `lines` lines, plus (outcome, why).
+
+    `-t "=<name>:"` is exact: the bare name is a pattern match in tmux, and a
+    prefix that matched the wrong session would hash somebody else's terminal.
+    The trailing colon is what makes the target resolve to that session's active
+    pane — `=<name>` alone is not a pane target and tmux refuses it.
+    """
+    if shutil.which("tmux") is None:
+        return None, "no_tool", "tmux is not on PATH, so no pane can be read"
+    try:
+        out = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", f"={tmux_session}:",
+             "-S", f"-{int(lines)}"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "tmux_error", (f"tmux capture-pane did not return "
+                                    f"({exc.__class__.__name__})")
+    if out.returncode == 0:
+        return out.stdout, "ok", None
+    stderr = (out.stderr or "").strip()
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in PANE_GONE_MARKERS):
+        return None, "no_binding", (f"tmux has no live pane for "
+                                    f"`{tmux_session}` — it died under its "
+                                    f"agent-deck record")
+    return None, "tmux_error", (f"tmux capture-pane exited {out.returncode}: "
+                                f"{stderr[:160]}")
+
+
+def load_pane_state(path=None):
+    """The last sweep's record, or an empty one.
+
+    A file that is missing, unreadable or shaped wrong is an EMPTY baseline and
+    never an inherited stall: every session's clock restarts at the next sweep,
+    which costs one threshold of delay and cannot produce a flag nobody looked
+    for.
+    """
+    empty = {"version": PANE_STATE_VERSION, "last_sweep_at": None, "sessions": {}}
+    try:
+        with open(path or PANE_STATE) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(doc, dict) or not isinstance(doc.get("sessions"), dict):
+        return empty
+    sessions = {str(k): v for k, v in doc["sessions"].items() if isinstance(v, dict)}
+    return {"version": doc.get("version", PANE_STATE_VERSION),
+            "last_sweep_at": doc.get("last_sweep_at"),
+            "sessions": sessions}
+
+
+def save_pane_state(state, path=None):
+    target = path or PANE_STATE
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, target)   # a sweep interrupted mid-write leaves the old file
+
+
+# The verdicts, worst first — print order, and the order counts are reported in.
+PANE_STALLED = "stalled"          # unchanged past its threshold, flagged now
+PANE_HELD = "held"                # already flagged on these exact bytes
+PANE_UNOBSERVABLE = "unobservable"  # the pane could not be read at all
+PANE_SETTLING = "settling"        # unchanged, still inside its threshold
+PANE_ACTIVE = "active"            # the pane has said something since last look
+PANE_SKIPPED = "skipped"          # not alive, or exempt: no look was owed
+PANE_VERDICTS = (PANE_STALLED, PANE_HELD, PANE_UNOBSERVABLE, PANE_SETTLING,
+                 PANE_ACTIVE, PANE_SKIPPED)
+PANE_FLAGGED = (PANE_STALLED, PANE_HELD)
+
+
+def humanise_gap(seconds):
+    seconds = abs(float(seconds))
+    if seconds < 90 * 60:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 48 * 3600:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
+
+
+def check_pane(obs, title, record, prior, watch, now, capture):
+    """One session's verdict, and the entry to store for it.
+
+    Returns (row, entry) where entry is None when nothing should be remembered
+    about this session. A row that could not be observed carries `prior` back
+    UNCHANGED: a failed capture is not evidence that the pane moved, and
+    resetting the clock on one would clear a real stall for free.
+    """
+    threshold = watch.threshold(title)
+    tmux_session = record.get("tmux_session") or ""
+    row = {"title": title, "tmux_session": tmux_session or None,
+           "status": record.get("status") or "", "threshold": threshold,
+           "verdict": None, "idle_for": None, "flagged_at": None,
+           "first_look": False, "hash": None, "reading": None}
+
+    def settle(verdict, outcome, why, entry=None):
+        row["verdict"] = verdict
+        row["reading"] = obs.reading(PANE_VOCAB, f"tmux:{tmux_session or title}",
+                                     outcome, why=why)
+        return row, entry
+
+    if not any(word in row["status"] for word in PANE_ALIVE):
+        # Not alive: no live pane to be stalled at, and its liveness is
+        # `bin/ops health`'s question. The entry is dropped so a session that
+        # comes back starts a fresh baseline at the moment it comes back.
+        return settle(PANE_SKIPPED, "not_running",
+                      f"agent-deck reports `{row['status'] or 'unknown'}`")
+    if threshold <= 0:
+        return settle(PANE_SKIPPED, "exempt",
+                      "an idle prompt is this session's declared resting state "
+                      "([hub.pane_watch.overrides] = 0)")
+    if not tmux_session:
+        return settle(PANE_UNOBSERVABLE, "no_binding",
+                      "the agent-deck record names no tmux session", prior)
+
+    text, outcome, why = capture(tmux_session, watch.capture_lines)
+    if outcome != "ok":
+        return settle(PANE_UNOBSERVABLE, outcome,
+                      why or "the pane could not be captured", prior)
+
+    digest = pane_digest(text)
+    row["hash"] = digest
+    reading = obs.reading(PANE_VOCAB, f"tmux:{tmux_session}", "ok",
+                          detail={"lines": watch.capture_lines,
+                                  "threshold_seconds": threshold})
+    row["reading"] = reading
+    entry = {"tmux_session": tmux_session, "status": row["status"],
+             "hash": digest, "first_seen_at": now, "last_seen_at": now,
+             "flagged_at": None, "flagged_hash": None}
+
+    same = isinstance(prior, dict) and prior.get("hash") == digest
+    if not same:
+        # New bytes — the pane said something. This also covers the first look
+        # at a session, which is a baseline rather than evidence of activity.
+        row["verdict"] = PANE_ACTIVE
+        row["first_look"] = not isinstance(prior, dict)
+        row["idle_for"] = 0
+        return row, entry
+
+    first_seen = prior.get("first_seen_at")
+    first_seen = now if not isinstance(first_seen, (int, float)) else first_seen
+    entry["first_seen_at"] = first_seen
+    entry["flagged_at"] = prior.get("flagged_at")
+    entry["flagged_hash"] = prior.get("flagged_hash")
+    row["idle_for"] = max(0.0, now - first_seen)
+    row["flagged_at"] = entry["flagged_at"]
+
+    if row["idle_for"] < threshold:
+        row["verdict"] = PANE_SETTLING
+    elif entry["flagged_hash"] == digest:
+        # Already announced on these exact bytes. One flag per observation;
+        # the standing list is the state file.
+        row["verdict"] = PANE_HELD
+    elif obs.absence_is_evidence(reading):
+        # A flag is an absence claim about activity, so it is reachable only
+        # through the predicate — never from a capture that merely returned.
+        row["verdict"] = PANE_STALLED
+        entry["flagged_at"] = row["flagged_at"] = now
+        entry["flagged_hash"] = digest
+    else:
+        row["verdict"] = PANE_SETTLING
+    return row, entry
+
+
+def pane_sweep(watch, now=None, state=None, deck=None, capture=None, profile=None):
+    """One sweep. Returns a report; writes nothing.
+
+    `deck` and `capture` are injectable so the tests can run without agent-deck
+    or tmux — and so a caller can drive it from fixtures.
+    """
+    obs = observation()
+    now = time.time() if now is None else now
+    deck = deck or (lambda: read_deck_sessions(profile))
+    capture = capture or capture_pane
+    prior_state = load_pane_state() if state is None else state
+    prior_sessions = prior_state.get("sessions") or {}
+
+    sessions, outcome, why = deck()
+    deck_reading = obs.reading(PANE_VOCAB, "agent-deck", outcome, why=why,
+                               detail={"sessions": len(sessions)})
+    report = {"at": now, "reading": deck_reading, "rows": [],
+              "counts": {v: 0 for v in PANE_VERDICTS}, "state": None,
+              "idle_seconds": watch.idle_seconds,
+              "capture_lines": watch.capture_lines}
+    if not obs.absence_is_evidence(deck_reading):
+        # The enumeration failed. An empty row list here means "nobody looked",
+        # and pruning the state on it would erase every standing flag.
+        return report
+
+    rows, kept = [], {}
+    for title in sorted(sessions):
+        row, entry = check_pane(obs, title, sessions[title],
+                                prior_sessions.get(title), watch, now, capture)
+        rows.append(row)
+        if entry is not None:
+            kept[title] = entry
+    rows.sort(key=lambda r: (PANE_VERDICTS.index(r["verdict"]), r["title"]))
+    for row in rows:
+        report["counts"][row["verdict"]] += 1
+    report["rows"] = rows
+    # Sessions agent-deck no longer lists are dropped here, and only here: the
+    # listing was warranted, so their absence is evidence they are gone.
+    report["state"] = {"version": PANE_STATE_VERSION, "last_sweep_at": now,
+                       "sessions": kept}
+    return report
+
+
+def pane_row_line(row, now):
+    head = f"{row['verdict']:<13} {row['title']}"
+    if row["verdict"] == PANE_UNOBSERVABLE:
+        return f"{head} — {row['reading']['why']}"
+    if row["verdict"] == PANE_SKIPPED:
+        return f"{head} — {row['reading']['why']}"
+    if row["verdict"] == PANE_ACTIVE:
+        return f"{head} — {'first look, baseline recorded' if row['first_look'] else 'the pane changed'}"
+    idle, limit = humanise_gap(row["idle_for"]), humanise_gap(row["threshold"])
+    if row["verdict"] == PANE_SETTLING:
+        return f"{head} — unchanged {idle} (flags at {limit})"
+    flagged = row["flagged_at"]
+    since = f", flagged {humanise_gap(now - flagged)} ago" if flagged else ""
+    verb = "FLAGGED" if row["verdict"] == PANE_STALLED else "still unchanged"
+    return (f"{head} — {verb}: unchanged {idle}, past its {limit} threshold "
+            f"(status {row['status']}{since})")
+
+
+PANE_NOT_CHECKED = [
+    ("whether the session is actually stuck",
+     "this reads bytes, not intent. A session composing a long answer with no "
+     "output, and one waiting on a person, look identical from here — which is "
+     "why a flag is report-only and never a kick"),
+    ("a pane that renders a live clock, spinner or token counter",
+     "its bytes change every second, so it can never be flagged. That is the "
+     "safe direction (a false quiet, not a false alarm) and it is why the "
+     "sweep can miss a stall it has no way to see"),
+    ("sessions outside this installation's agent-deck profile",
+     "the sweep enumerates one profile, the one loops.toml declares"),
+    ("anything about what to DO with a flag",
+     "an idle prompt is a legitimate resting state. Nothing is kicked, "
+     "restarted or filed — the hub or the operator decides"),
+]
+
+
+def pane_report(state, watch, now):
+    """What is flagged NOW, out of the last sweep's record — no looking.
+
+    The staleness check is the point: a report from a sweeper that stopped
+    running is the reassuring answer with nobody behind it. Two sweep intervals
+    with no sweep and this refuses to speak for the present.
+    """
+    obs = observation()
+    last = state.get("last_sweep_at")
+    flagged = []
+    for title, entry in (state.get("sessions") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("flagged_at"):
+            continue
+        flagged.append({"title": title,
+                        "tmux_session": entry.get("tmux_session"),
+                        "status": entry.get("status"),
+                        "flagged_at": entry.get("flagged_at"),
+                        "first_seen_at": entry.get("first_seen_at"),
+                        "threshold": watch.threshold(title)})
+    flagged.sort(key=lambda r: -(r["flagged_at"] or 0))
+    if not isinstance(last, (int, float)):
+        reading = obs.reading(PANE_VOCAB, "pane-hashes.json", "no_state",
+                              why="no pane sweep has ever been recorded")
+    elif now - last > 2 * watch.sweep_seconds:
+        reading = obs.reading(
+            PANE_VOCAB, "pane-hashes.json", "stale_sweep",
+            why=(f"the last sweep was {humanise_gap(now - last)} ago, past two "
+                 f"{humanise_gap(watch.sweep_seconds)} intervals — is the "
+                 f"doorbell service running?"))
+    else:
+        reading = obs.reading(PANE_VOCAB, "pane-hashes.json", "ok",
+                              detail={"last_sweep_at": last,
+                                      "sessions": len(state.get("sessions") or {})})
+    return {"at": now, "reading": reading, "last_sweep_at": last,
+            "flagged": flagged}
+
+
+PANES_USAGE = ("usage: doorbell panes [--json] [--report [--since <dur>]] "
+               "[--list] [--deck-json FILE]")
+
+
+def panes_main(argv, config):
+    """`panes` — the sweep, its standing report, and its definitions.
+
+    Exit 0 nothing flagged, 2 something could not be observed, 3 something is
+    flagged. 3 outranks 2 because it is the actionable one.
+    """
+    as_json = report_only = list_only = False
+    fixture, since = None, None
+    rest = list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--json":
+            as_json = True
+        elif arg == "--report":
+            report_only = True
+        elif arg == "--list":
+            list_only = True
+        elif arg == "--deck-json" and rest:
+            fixture = rest.pop(0)
+        elif arg == "--since" and rest:
+            try:
+                since = parse_seconds(rest.pop(0), "--since")
+            except ValueError as exc:
+                sys.exit(f"doorbell: {exc}")
+        else:
+            sys.exit(f"doorbell: {PANES_USAGE}")
+
+    watch = load_pane_watch(config)
+    now = time.time()
+
+    if list_only:
+        return panes_list(watch)
+
+    if report_only:
+        doc = pane_report(load_pane_state(), watch, now)
+        rows = doc["flagged"]
+        if since is not None:
+            rows = [r for r in rows if now - (r["flagged_at"] or 0) <= since]
+        obs = observation()
+        if as_json:
+            print(json.dumps(dict(doc, flagged=rows, since_seconds=since),
+                             indent=2, sort_keys=True))
+        else:
+            warranted = obs.absence_is_evidence(doc["reading"])
+            when = ("never" if not doc["last_sweep_at"]
+                    else f"{humanise_gap(now - doc['last_sweep_at'])} ago")
+            print(f"pane sweep · last swept {when} · {len(rows)} flagged"
+                  + (f" in the last {humanise_gap(since)}" if since is not None
+                     else ""))
+            if not warranted:
+                print(f"   [?????] {doc['reading']['why']}")
+                print("           an empty list below is not evidence that "
+                      "nothing is stalled")
+            for row in rows:
+                idle = humanise_gap(now - (row["first_seen_at"] or now))
+                print(f"   stalled  {row['title']} — pane unchanged {idle} "
+                      f"(agent-deck says {row['status']}, flagged "
+                      f"{humanise_gap(now - row['flagged_at'])} ago)")
+            if rows:
+                print("   REPORT ONLY. Read the pane before acting: "
+                      "`tmux capture-pane -p -t \"=<tmux session>:\"`")
+        if rows:
+            return 3
+        return 0 if obs.absence_is_evidence(doc["reading"]) else 2
+
+    doc = pane_sweep(watch, now=now, deck=(lambda: read_deck_sessions(
+        fixture=fixture)) if fixture else None)
+    obs = observation()
+    if doc["state"] is not None:
+        save_pane_state(doc["state"])
+    if as_json:
+        print(json.dumps(doc, indent=2, sort_keys=True, default=str))
+    else:
+        sys.stdout.write(render_panes(doc, watch, now))
+    if doc["counts"][PANE_STALLED] or doc["counts"][PANE_HELD]:
+        return 3
+    if doc["counts"][PANE_UNOBSERVABLE] or not obs.absence_is_evidence(doc["reading"]):
+        return 2
+    return 0
+
+
+def render_panes(doc, watch, now):
+    obs = observation()
+    counts = doc["counts"]
+    lines = [f"pane sweep · {time.strftime('%Y-%m-%dT%H:%M', time.localtime(now))}"
+             f" · {watch.capture_lines} lines · default threshold "
+             f"{humanise_gap(watch.idle_seconds)}",
+             f"{counts[PANE_STALLED]} STALLED · {counts[PANE_HELD]} held · "
+             f"{counts[PANE_UNOBSERVABLE]} unobservable · "
+             f"{counts[PANE_SETTLING]} settling · {counts[PANE_ACTIVE]} active · "
+             f"{counts[PANE_SKIPPED]} skipped"]
+    mark = "ok   " if obs.absence_is_evidence(doc["reading"]) else "?????"
+    lines.append(f"   [{mark}] agent-deck  "
+                 f"{(doc['reading'].get('detail') or {}).get('sessions', 0)} "
+                 f"session(s)")
+    if doc["reading"]["why"]:
+        lines.append(f"           · {doc['reading']['why']}")
+        lines.append("           nothing was written; an empty list is not "
+                     "evidence that nothing is stalled")
+    lines.append("")
+    for row in doc["rows"]:
+        lines.append(pane_row_line(row, now))
+    if counts[PANE_STALLED] or counts[PANE_HELD]:
+        lines.append("")
+        lines.append("REPORT ONLY — nothing was kicked, restarted or filed. An "
+                     "idle prompt is a legitimate")
+        lines.append("resting state for some sessions. Read the pane before "
+                     "acting on a flag.")
+    lines.append("")
+    lines.append("── deliberately not checked here")
+    for what, why in PANE_NOT_CHECKED:
+        lines.append(f"   · {what}")
+        lines.append(f"     {why}")
+    return "\n".join(lines) + "\n"
+
+
+def panes_list(watch):
+    obs = observation()
+    print("doorbell panes — definitions (reads no state)")
+    print()
+    print("the question, per live session in the configured agent-deck profile")
+    print("  has this pane said anything since the first time these exact bytes")
+    print("  were seen? agent-deck's own status cannot answer it: it reports")
+    print("  `waiting` for a healthy session and a dead one alike.")
+    print()
+    print("verdicts")
+    print(f"  {PANE_STALLED:<13} unchanged past its threshold — flagged, once")
+    print(f"  {PANE_HELD:<13} already flagged on these exact bytes")
+    print(f"  {PANE_UNOBSERVABLE:<13} the pane could not be read at all")
+    print(f"  {PANE_SETTLING:<13} unchanged, still inside its threshold")
+    print(f"  {PANE_ACTIVE:<13} the pane changed (or this is the first look)")
+    print(f"  {PANE_SKIPPED:<13} not alive, or exempt — no look was owed")
+    print()
+    print("thresholds (loops.toml [hub.pane_watch])")
+    print(f"  sweep_seconds  {watch.sweep_seconds}")
+    print(f"  idle_seconds   {watch.idle_seconds}   (0 in an override = never flag)")
+    print(f"  capture_lines  {watch.capture_lines}")
+    for key, seconds in watch.overrides:
+        print(f"  override       {key!r} = {seconds}")
+    print()
+    print("outcome words (lib/estate_observation.py, vocabulary `pane-watch`)")
+    vocab = obs.vocabulary(PANE_VOCAB)
+    for warrant in obs.CLASSES:
+        words = vocab.outcomes_in(warrant)
+        if words:
+            print(f"  {warrant:<14} {', '.join(words)}")
+    print()
+    print("exit: 0 nothing flagged · 3 something flagged · 2 something "
+          "unobservable")
+    print()
+    print("deliberately not checked")
+    for what, why in PANE_NOT_CHECKED:
+        print(f"  · {what}")
+        print(f"      {why}")
+    return 0
+
+
+def sweep_panes_once(watch, **kwargs):
+    """The daemon's hourly sweep: one pass, saved, with new stalls on stdout.
+
+    Only a NEW flag is printed — the standing list lives in the state file and
+    `panes --report` answers out of it. Raises nothing the caller must catch
+    beyond what pane_sweep itself raises; the caller keeps polling regardless.
+    """
+    doc = pane_sweep(watch, **kwargs)
+    if doc["state"] is None:
+        print(f"doorbell: pane sweep could not enumerate sessions: "
+              f"{doc['reading']['why']}", file=sys.stderr, flush=True)
+        return doc
+    save_pane_state(doc["state"])
+    for row in doc["rows"]:
+        if row["verdict"] != PANE_STALLED:
+            continue
+        print(f"doorbell: pane-stall {row['title']} — pane unchanged for "
+              f"{humanise_gap(row['idle_for'])} (tmux {row['tmux_session']}, "
+              f"agent-deck says {row['status']}) — REPORT ONLY, not kicked",
+              flush=True)
+    unobservable = doc["counts"][PANE_UNOBSERVABLE]
+    if unobservable:
+        print(f"doorbell: pane sweep: {unobservable} session(s) unobservable",
+              file=sys.stderr, flush=True)
+    return doc
+
+
 def mark_alive():
     """Stamp DOORBELL_ALIVE every poll iteration, independent of Slack fetch
     outcome — this is what tells the dashboard the poller itself is up, so a
@@ -253,17 +1103,35 @@ def mark_alive():
 
 
 def main():
-    check_only = "--check" in sys.argv[1:]
+    argv = sys.argv[1:]
+    check_only = "--check" in argv
     try:
-        inboxes = load_inboxes(load_config())
+        config = load_config()
+        inboxes = load_inboxes(config)
+        # Parsed here, on every path, so a malformed [hub.pane_watch] is a
+        # startup failure and an `ops doctor` FAIL rather than a sweep that
+        # silently never runs.
+        watch = load_pane_watch(config)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
         sys.exit(f"doorbell: bad inbox config: {exc}")
+    # `panes` is dispatched BEFORE the inbox guard: the pane sweep watches
+    # agent-deck sessions and has nothing to do with Slack, so an install that
+    # has configured no inbox at all — which this core ships as its default —
+    # must still be able to run it. `read` stays behind the guard, because it
+    # reads one named inbox and there is nothing for it to read.
+    if argv and argv[0] == "panes":
+        sys.exit(panes_main(argv[1:], config))
     if not inboxes:
         sys.exit("doorbell: no inboxes configured ([[hub.inbox]] in loops.toml)")
+    if argv and argv[0] == "read":
+        sys.exit(read_main(argv[1:], inboxes))
     if check_only:
         for ib in inboxes:
             flag = " (primary)" if ib.primary else ""
             print(f"{ib.name}\t{ib.channel_id}\t{ib.disposition}\t{ib.poll_seconds}s{flag}")
+        print(f"pane-watch\tevery {watch.sweep_seconds}s\tflags at "
+              f"{watch.idle_seconds}s\t{watch.capture_lines} lines\t"
+              f"{len(watch.overrides)} override(s)")
         return
     token = read_file(TOKEN_FILE)
     if not token:
@@ -273,14 +1141,27 @@ def main():
     for ib in inboxes:
         print(f"doorbell: watching {ib.name} ({ib.channel_id}, {ib.disposition}) "
               f"every {ib.poll_seconds}s", flush=True)
-    print(f"doorbell: kicking {HUB_SESSION!r} (profile {DECK_PROFILE})", flush=True)
+    print(f"doorbell: pane sweep every {watch.sweep_seconds}s, flagging a pane "
+          f"unchanged for {watch.idle_seconds}s (report only)", flush=True)
     # Independent timers: each inbox is due on its own poll_seconds, measured
     # from the start of its previous poll. All are due immediately at startup.
     due = {ib.name: 0.0 for ib in inboxes}
+    # The pane sweep runs on its own timer beside them. Its first pass is a
+    # baseline — nothing can be flagged until a hash has held for a threshold —
+    # so starting it immediately costs one agent-deck call and buys the clock.
+    pane_due = 0.0
     last_error = {}  # inbox name → (message, when it was last printed)
     while True:
         mark_alive()
         now = time.time()
+        if now >= pane_due:
+            pane_due = now + watch.sweep_seconds
+            try:
+                sweep_panes_once(watch)
+            except Exception as exc:  # a sweep must never stop the polling
+                print(f"doorbell: pane sweep failed: "
+                      f"{exc.__class__.__name__}: {exc}",
+                      file=sys.stderr, flush=True)
         for ib in inboxes:
             if now < due[ib.name]:
                 continue
