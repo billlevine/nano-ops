@@ -496,3 +496,43 @@ CLOSURE = register("closure", {
     "unreadable": FAILED,        # the store errored, or would not open
     "no_state": NOT_ATTEMPTED,   # there is no estate store to read
 })
+
+# The pane sweep (`bin/doorbell panes`, t-1094). It asks whether a live
+# session's terminal has said anything since the last look, and the answer it
+# must never manufacture is `active`. Every other check here reads a STORE or a
+# git history; this one reads the only surface a stalled session is visible on,
+# because a long-lived session once sat at an empty prompt for roughly 27 hours
+# while agent-deck reported `running` the whole time. agent-deck's status string
+# is documented-unreliable: it says `waiting` for a healthy between-ticks hub and
+# for a dead one alike.
+#
+# The absence claim here is subtler than its siblings' and runs BOTH ways, which
+# is why the vocabulary is needed twice over. "This pane has not changed" is an
+# absence of activity, and it is what a flag rests on — so a capture that failed
+# must never become a stall. "Nothing is stalled" is an absence of findings, and
+# a sweep that could not enumerate the sessions produces exactly the same empty
+# row list as an installation where every pane is busy.
+#
+# The two NOT_DUE words are boundaries and not holes. `not_running` is a session
+# agent-deck reports stopped or errored: it has no live pane to be stalled at,
+# and its liveness is `bin/ops health`'s question rather than this one. `exempt`
+# is a session whose configured idle threshold is zero, which is a declaration
+# that an idle prompt is its resting state — a long-lived session with no
+# cadence at all. Neither was owed a look.
+#
+# `stale_sweep` and `no_state` belong to `panes --report`, which reads the last
+# sweep's file rather than looking itself. A report out of a sweeper that stopped
+# running an hour ago is the reassuring answer with nobody behind it, which is
+# this whole module's bug in one more place.
+PANE_WATCH = register("pane-watch", {
+    "ok": OBSERVED,
+    "deck_error": FAILED,        # agent-deck ran and would not answer
+    "tmux_error": FAILED,        # tmux ran and would not answer
+    "unreadable": FAILED,        # an answer came back and would not parse
+    "no_tool": NOT_ATTEMPTED,    # agent-deck or tmux is not on PATH
+    "no_binding": NOT_ATTEMPTED,  # the record names no live tmux pane
+    "stale_sweep": NOT_ATTEMPTED,  # the recorded sweep is too old to speak for now
+    "no_state": NOT_ATTEMPTED,   # no sweep has ever been recorded
+    "not_running": NOT_DUE,      # not alive; there is no live pane to watch
+    "exempt": NOT_DUE,           # an idle prompt is this session's resting state
+})
