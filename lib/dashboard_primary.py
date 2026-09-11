@@ -125,7 +125,7 @@ PRIMARY_JS = r"""
       ['sec-brief','col-12'],
       ['sec-loops','col-7'],
       ['sec-night','col-5'],
-      ['sec-ephemeral','col-12'],
+      ['sec-dispatch-sessions','col-12'],
       ['sec-ledger','col-7'],
       ['sec-mech','col-12']
     ].forEach(function(spec){
@@ -402,7 +402,7 @@ def proposal_review_js() -> str:
                            ("resolved", "Resolved"), ("all", "All")))
     adapter_head = r"""
 (function(){
-var DATA={},INDEX={},PROPOSAL_STAGE='pending-review',OPEN_PROPOSALS={},DECISION_NOTES={};
+var DATA={},INDEX={},EVENT_INDEX={},PROPOSAL_STAGE='pending-review',OPEN_PROPOSALS={},DECISION_NOTES={},DECISION_CHOICES={};
 function e(v){var d=document.createElement('div');d.textContent=v==null?'':String(v);return d.innerHTML}
 function age(v){if(!v)return '—';var n=typeof v==='number'?v*1000:Date.parse(v),s=Math.max(0,(Date.now()-n)/1000);if(s<90)return Math.round(s)+'s ago';if(s<5400)return Math.round(s/60)+'m ago';if(s<172800)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago'}
 function stamp(v){if(!v)return '—';var s=String(v),utc=/(\+00:00|Z)$/.test(s);return s.replace('T',' ').slice(0,16)+(utc?'Z':'')}
@@ -410,7 +410,6 @@ function rows(a,fn,msg){return a&&a.length?'<div class="estate-list">'+a.map(fn)
 function stats(c,names){return '<div class="estate-grid">'+names.map(function(k){return '<div class="estate-stat"><b>'+e((c||{})[k]||0)+'</b><span>'+e(k)+'</span></div>'}).join('')+'</div>'}
 function kv(label,value){return value==null||value===''?'':'<span class="label">'+e(label)+'</span><span>'+e(value)+'</span>'}
 function task(id){return INDEX[id]}
-function taskEvents(id){var m=DATA.task_events;return m&&m[id]?m[id]:[]}
 function who(v){var a=v.actor||'unknown';return e(v.session_id?a+' · '+v.session_id:a)}
 function historyLine(v){return '<div class="history-entry"><div class="history-meta"><span class="time">'+e(stamp(v.ts))+'</span> <b>'+e(v.summary)+'</b> · '+who(v)+(v.kind?' · '+e(v.kind):'')+(v.phase?' · '+e(v.phase):'')+'</div></div>'}
 function history(list,msg){return '<div class="hist"><span class="label">history ('+e(list.length)+')</span>'+(list.length?list.map(historyLine).join(''):'<div>'+e(msg)+'</div>')+'</div>'}
@@ -423,10 +422,16 @@ function install(){
   /* t-390: `sec-mech` is unmanaged here too — this panel is rendered entirely
      from `estate_activity`, so an estate store that could not be opened used
      to show an empty proposal list and nothing else. */
-  body.className='pbody';body.innerHTML='<div id="proposal-state"></div><div id="proposal-stats"></div><div class="proposal-toolbar">__BUTTONS__<input class="search" id="proposal-search" placeholder="Filter proposals…"></div><div id="proposals"></div>';
+  body.className='pbody';body.innerHTML='<div id="proposal-state"></div><div id="proposal-stats"></div><div class="proposal-toolbar">__BUTTONS__<input class="search" id="proposal-search" placeholder="Filter by id, kind or text…"></div><div id="proposals"></div>';
   document.querySelectorAll('[data-proposal-stage]').forEach(function(b){b.onclick=function(){PROPOSAL_STAGE=b.dataset.proposalStage;document.querySelectorAll('[data-proposal-stage]').forEach(function(x){x.classList.toggle('active',x===b)});drawProposals()}});
   document.getElementById('proposal-search').oninput=drawProposals;
-  body.onclick=function(ev){var b=ev.target.closest('[data-decision-id]');if(b)decideProposal(b)};
+  /* t-1794: the option cards are a SELECTION now, not only a note
+     prefill, so this page has to wire them too — approving a
+     decision-classified proposal is refused without one, and a card
+     nothing listens to would make that refusal unanswerable here. */
+  body.onclick=function(ev){var b=ev.target.closest('[data-decision-id]');if(b){decideProposal(b);return}var card=ev.target.closest('[data-decision-card]');if(card)prefillDecision(card)};
+  body.onkeydown=function(ev){var card=ev.target.closest('[data-decision-card]');if(card&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();prefillDecision(card)}};
+  installDetailWiring();
 }
 install();
 document.addEventListener('ops-dashboard-data',function(ev){
@@ -434,13 +439,23 @@ document.addEventListener('ops-dashboard-data',function(ev){
   OPEN_PROPOSALS={};document.querySelectorAll('[data-proposal][open]').forEach(function(v){OPEN_PROPOSALS[v.dataset.proposal]=true});
   var state=document.getElementById('proposal-state');
   if(state)state.innerHTML=((ev.detail&&ev.detail.panel_state_html)||{}).estate_activity||'';
-  DATA=(ev.detail&&ev.detail.estate_activity)||{};INDEX={};(DATA.tasks||[]).forEach(function(t){INDEX[t.id]=t});drawProposals();
+  DATA=(ev.detail&&ev.detail.estate_activity)||{};INDEX={};(DATA.tasks||[]).forEach(function(t){INDEX[t.id]=t});
+  EVENT_INDEX={};(DATA.events||[]).forEach(function(v){EVENT_INDEX[v.seq]=v});
+  reindexDetailEvents();
+  drawProposals();
+  /* t-1450: a proposal re-rendered open fires no toggle event, so it asks for
+     its history here. `estate_activity` no longer embeds one. */
+  ensureOpenDetails();
 });
 })();
 """.replace('__BUTTONS__', buttons)
     # Rows, badges, decision transitions and the authenticated write request
-    # are owned by dashboard_estate and embedded byte-for-byte here.
-    return adapter_head + dashboard_estate.JS_PROPOSALS + adapter_tail
+    # are owned by dashboard_estate and embedded byte-for-byte here — and
+    # since t-1450 so is the drill-down fetch (JS_DETAIL), because a proposal's
+    # history is no longer in the snapshot and one implementation of asking for
+    # it is the point.
+    return (adapter_head + dashboard_estate.JS_DETAIL
+            + dashboard_estate.JS_PROPOSALS + adapter_tail)
 
 
 def render(dashboard, snapshot: dict) -> str:

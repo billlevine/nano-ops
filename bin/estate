@@ -12,6 +12,8 @@ SUBCOMMANDS
   estate proposal add|amend|list|show|stage|classify|fingerprint ...
   estate decision check '<json>'
   estate ready [--kind K] [--actor A] [--auto-promoted]
+  estate decided-not-acted [--within MINUTES] [--owed-only] [--json]
+  estate pickup <id> "<what took it>" --route R [--ref X]
   estate log | note | mark-ready | claim | extend | retry
   estate event --actor A --kind K --summary S
                [--subsystem X --phase P] [--fingerprint F] [--at TS] ...
@@ -22,9 +24,10 @@ SUBCOMMANDS
                 [--limit N] [--detail] [--json]
   estate runs [--subsystem S] [--days N] [--attention] [--all] [--json]
   estate release | block | needs-owner | done | reopen | drop
+  estate verified <id> "<evidence>" --actor A   (needs-owner -> done, t-1063)
   estate dep add|list ... | orphans [--sweep] | stale [--days N]
   estate due [--within N] [--kind K] [--json]
-  estate attention [--notice N] [--state S] [--kind K] [--json] [--counts]
+  estate attention [--notice N] [--state S] [--kind K] [--json] [--counts] [--no-collapse]
   estate memory recall --scope X [--kind K] [--json] [--refs] [--no-touch]
   estate memory reconcile [--memory-dir D] [--min-score F] [--top N] [--json]
   estate memory add|list|query|show|log|promote|supersede|merge ...
@@ -64,6 +67,8 @@ import estate_attention  # noqa: E402
 import estate_decisions  # noqa: E402
 import estate_deps  # noqa: E402
 import estate_events  # noqa: E402
+import estate_pairs  # noqa: E402
+import estate_pickup  # noqa: E402
 import estate_ledger  # noqa: E402
 import estate_memory  # noqa: E402
 import estate_reconcile  # noqa: E402
@@ -95,7 +100,9 @@ TRANSITIONS = {
     "ready": {"claim": "claimed", "drop": "dropped"},
     "claimed": {"done": "done", "block": "blocked", "needs-owner": "needs-owner",
                 "release": "ready", "drop": "dropped"},
-    "needs-owner": {"reopen": "ready", "drop": "dropped"},
+    # `verified` is the third exit, and it is deliberately NOT spelled `done`
+    # (t-1063). See THE VERIFIED EXIT below for why the name is the gate.
+    "needs-owner": {"reopen": "ready", "drop": "dropped", "verified": "done"},
     "blocked": {"reopen": "ready", "drop": "dropped"},
     "done": {"reopen": "ready"},
     "dropped": {},
@@ -1706,6 +1713,255 @@ def cmd_done(args) -> int:
     print(f"{key}: {old} -> {nxt}"); return 0
 
 
+# THE VERIFIED EXIT (t-1063).
+#
+# `needs-owner` had exactly two exits, `reopen` and `drop`, and a triage of the
+# attention set will find rows that neither one fits: those whose underlying
+# work is verifiably finished while the row still renders as a question for the
+# owner. `drop` means the work was abandoned, so taking it would file a false
+# record. `reopen` puts a finished item back in the pool where `estate ready`
+# offers it to a worker. So such a pass can close some items and has to leave
+# the ones it has PROVED were done — a large share of what it settled it could
+# not record.
+#
+# THE NAME IS THE GATE. The verb is `verified`, not `done`, and that is the
+# whole of what keeps this edge from being a hole. `cmd_done` calls
+# transition(..., "done"), and `TRANSITIONS['needs-owner']` still has no `done`
+# key, so `estate done` on a parked row is refused exactly as it was before —
+# mechanically, not by a convention a tired reader skips. The only way across
+# this edge is the one command below, and that command cannot run without the
+# evidence. Spelling the verb `done` would have made the gate a property of
+# which function you happened to call.
+#
+# THE EVIDENCE IS THE CALLER'S SENTENCE, never derived from the fact that a
+# command ran — bin/dispatches `resolve --verified` struck this bargain first
+# and this is the same one. It is a required positional, so omitting it is an
+# argparse error before the store is opened, and a blank or whitespace-only
+# one is refused here with nothing written. What it must say is what an
+# independent look SAW: the tracker issue that is Done, the PR that merged,
+# the checks that are green today.
+#
+# ANY ACTOR MAY TAKE IT, and the owner is not hard-coded anywhere in it. That
+# reads backwards until you count the arc it sits beside: an outcome census of
+# the `needs-owner -> ready` exits reports the actor on essentially all of them
+# as `cli` or an automated session, and practically never the owner. Whoever
+# establishes that a parked question is already answered is, in an estate's
+# recorded history, usually a machine — so restricting the edge to the owner
+# would build a path nobody walks, next to two others they do not walk
+# either. What the edge distinguishes is not WHO is closing but WHAT they are
+# claiming: "I verified the thing you were asked about already happened" comes
+# with the evidence attached, and "I decided you did not need to answer"
+# cannot be said at all, because there is no way to take this edge without
+# saying what you saw.
+#
+# It does NOT require the row to be claimed by the caller, which `cmd_done`
+# does. A parked row's `claimed_by` is whoever escalated it, and the actor who
+# later establishes the work is finished is routinely somebody else. Requiring
+# a match would force the reopen -> claim -> done laundering this exists to
+# replace.
+VERIFIED_VERB = "verified"
+
+
+def cmd_verified(args) -> int:
+    """Close a `needs-owner` row whose work turned out to be already finished.
+
+    The evidence rides in an `evidence` event written in the SAME transaction
+    as the status change — cmd_transition's bargain, for cmd_transition's
+    reason: evidence appended by a second command is one failed call away from
+    a row closed with nothing on file to show the precondition was met.
+    """
+    init_db(); key = ident(args.id, "t")
+    evidence = (args.evidence or "").strip()
+    if not evidence:
+        return fail(
+            "the evidence is the whole of this edge: what an INDEPENDENT look "
+            "saw that shows the parked question is already answered (the "
+            "tracker issue that is Done, the PR that merged, the checks that "
+            "are green today). A blank one is the bare 'cleared' this "
+            f"argument exists to stop accepting. {key} is unchanged.")
+    try:
+        extras = json.loads(args.refs) if args.refs else {}
+        if not isinstance(extras, dict): raise ValueError("--refs JSON must be an object")
+    except (json.JSONDecodeError, ValueError) as exc: return fail(str(exc))
+    envelope = {"verification": evidence, "summary": args.summary or None}
+    envelope.update(extras)
+    # After `extras`, for cmd_done's reason: the flag is first-class and the
+    # JSON blob is where a caller that predates it reaches the same key.
+    envelope.update(landed_claim(args))
+    try:
+        with connect() as conn:
+            begin(conn)
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+            if not row: conn.rollback(); return fail(f"no task matches '{key}'")
+            old, nxt = transition(conn, key, VERIFIED_VERB, args.actor,
+                                  args.summary or "")
+            event(conn, args.actor, "evidence", "verified-superseded evidence",
+                  task_id=key, project_id=row["project_id"],
+                  refs=json.dumps(envelope, sort_keys=True))
+    except (LookupError, ValueError) as exc: return fail(str(exc))
+    print(f"{key}: {old} -> {nxt}"); return 0
+
+
+# THE RE-EVIDENCE VERB (t-1505).
+#
+# A landing claim is written once, at the close, and until now nothing could
+# ever correct it. That is fine while the claim is true and a permanent lie
+# when it is not: a task closed `done` citing a commit that never merged, and
+# genuinely re-landed later by a DIFFERENT commit, keeps its original evidence
+# and nothing moves it. So
+# bin/landed-reconciler reported them `not_landed` every night after the real
+# fix was on main, exactly as it had before — a standing check accusing work
+# that is done, which is how a standing check stops being read.
+#
+# WHY IT IS A VERB AND NOT AN EDIT. The alternative on the table was hand-
+# editing the store on the confirmed cases. That corrects two rows and records
+# nothing: the next false-done recovery repeats the same silent staleness, and
+# a field that changed with no event behind it is indistinguishable from a
+# field that was always that way. A correction to a completion claim is
+# precisely the thing that has to be inspectable later.
+#
+# THREE GATES, and each closes a different way this could become a laundering
+# path for a completion nobody earned:
+#
+#   `done` only        — this corrects a COMPLETION claim. A task that has not
+#                        claimed to be finished has no completion claim to
+#                        correct, and letting `re-land` write one would make it
+#                        a back door around `estate done` and around
+#                        `TRANSITIONS` entirely. The refusal names the status.
+#   `--reason` required — this is a correction, not an ordinary edit. The
+#                        reason is the whole of what makes it auditable, and a
+#                        blank one is refused with nothing written — the bargain
+#                        `estate verified` and `dispatches resolve --verified`
+#                        already strike for their own evidence.
+#   nothing is a no-op  — a call that would leave the claim exactly as it
+#                        already is corrects nothing, and writing two events to
+#                        say so would put noise in the one history a reader
+#                        goes to when they want to know what changed.
+#
+# WHAT IT WRITES, and why it is two events rather than a field:
+#
+#   a `correction` event carrying BOTH the previous claim and the new one, plus
+#     the reason. This is the audit record. `correction` is an existing kind in
+#     this store (estate_ledger maps it to the `transition` phase), and the old
+#     values live here whatever any later reader does with the envelope;
+#   an `evidence` event carrying the corrected envelope, because the reconciler
+#     reads the LAST evidence row for a task and nothing else. Without this the
+#     correction would be on file and inert.
+#
+# Nothing is overwritten and nothing is deleted: the original completion
+# envelope stays exactly where it was, and `estate log <task>` shows the claim,
+# the correction and the corrected claim in the order they happened.
+#
+# THE CORRECTED CLAIM IS WHAT THIS CALL SUPPLIES, and old landing keys that are
+# not re-supplied are dropped rather than carried forward. A new sha beside the
+# old branch would be a record nobody asserted — t-1330's original branch never
+# merged and its real landing came from somewhere else entirely — and the old
+# values are preserved in the correction event either way.
+#
+# IT DOES NOT REQUIRE THE CALLER TO HOLD THE CLAIM, for `cmd_verified`'s
+# reason: a `done` task's `claimed_by` is whoever closed it, and whoever later
+# establishes that the work really landed somewhere else is routinely somebody
+# else.
+#
+# Contract: docs/landed-reconciliation-contract.md, THE WRITE SIDE.
+#
+# The keys a landing claim can hide in — the three first-class ones plus the
+# legacy spellings `extract_claim` still parses (t-704's `commits`/`branch`,
+# t-102's `artifacts`). Recorded as the PREVIOUS claim so the correction says
+# what it superseded in whatever shape the original caller wrote it.
+PRIOR_CLAIM_KEYS = LANDED_KEYS + ("branch", "commits", "artifacts")
+
+
+def prior_claim(envelope: dict) -> dict:
+    """Whatever of an envelope a landing claim could have been written in."""
+    return {key: envelope[key] for key in PRIOR_CLAIM_KEYS
+            if isinstance(envelope, dict) and envelope.get(key)}
+
+
+def last_evidence(conn, key: str):
+    """The evidence row that IS the live claim, and its seq.
+
+    The last one, ordered by `seq`, which is what bin/landed-reconciler reads:
+    a task closed, reopened and closed again has two envelopes and only the
+    latest is what any reader sees. `seq` and not `ts`, for the reconciler's
+    reason — two rows can share a timestamp and `seq` is the store's only total
+    order.
+    """
+    row = conn.execute(
+        "SELECT seq, refs FROM events WHERE task_id=? AND kind='evidence' "
+        "ORDER BY seq DESC LIMIT 1", (key,)).fetchone()
+    if row is None:
+        return None, {}
+    try:
+        envelope = json.loads(row["refs"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        envelope = {}
+    return row["seq"], envelope if isinstance(envelope, dict) else {}
+
+
+def claim_line(claim: dict) -> str:
+    """One landing claim as a reader sees it in a summary line."""
+    if not claim:
+        return "(none)"
+    return ", ".join(f"{key}={claim[key]}" for key in sorted(claim))
+
+
+def cmd_re_land(args) -> int:
+    """Correct the landing claim on a task already closed `done` (t-1505)."""
+    init_db(); key = ident(args.id, "t")
+    reason = (args.reason or "").strip()
+    if not reason:
+        return fail(
+            "--reason is the whole of what makes this correction auditable: "
+            "why the claim on file is wrong and what makes the new commit the "
+            "real landing (the branch that actually merged, the PR, the "
+            f"re-run that proved it). A blank one is refused. {key} is "
+            "unchanged.")
+    claim = landed_claim(args)
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if not row:
+            conn.rollback(); return fail(f"no task matches '{key}'")
+        if row["status"] != "done":
+            conn.rollback()
+            return fail(
+                f"{key} is {row['status']}, not done. `re-land` corrects the "
+                "landing claim on a COMPLETION — a task that has not claimed "
+                "to be finished has no completion claim to correct, and "
+                "recording one here would be a way around `estate done` and "
+                "the status machine it moves. Close it the ordinary way with "
+                "the right --landed-sha, or (for a parked row whose work is "
+                f"already finished) `estate verified {key} \"<evidence>\"`. "
+                f"{key} is unchanged.")
+        seq, envelope = last_evidence(conn, key)
+        previous = prior_claim(envelope)
+        if {k: v for k, v in previous.items() if k in LANDED_KEYS} == claim:
+            conn.rollback()
+            return fail(
+                f"{key} already records exactly this claim "
+                f"({claim_line(claim)}), so there is nothing to correct. A "
+                "correction with no change is two events saying nothing, in "
+                "the one history somebody reads to find out what changed.")
+        corrected = {k: v for k, v in envelope.items() if k not in LANDED_KEYS}
+        corrected.update(claim)
+        record = {"reason": reason, "previous": previous, "corrected": claim,
+                  "prior_evidence_seq": seq}
+        corrected["landed_correction"] = dict(record, at=NOW.isoformat(),
+                                              actor=args.actor)
+        event(conn, args.actor, "correction",
+              f"landing claim corrected: {claim_line(previous)} -> "
+              f"{claim_line(claim)}",
+              task_id=key, project_id=row["project_id"], detail=reason,
+              refs=json.dumps({"landed_correction": record}, sort_keys=True))
+        event(conn, args.actor, "evidence", "corrected completion evidence",
+              task_id=key, project_id=row["project_id"],
+              refs=json.dumps(corrected, sort_keys=True))
+    print(f"{key}: landing claim corrected: {claim_line(previous)} -> "
+          f"{claim_line(claim)}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # the proposal review lifecycle (gap audit P-02)
 # --------------------------------------------------------------------------- #
@@ -1901,6 +2157,23 @@ def cmd_proposal_show(args) -> int:
             """SELECT ts FROM events WHERE task_id=? AND kind='note'
                AND summary LIKE 'condition observed again%' ORDER BY seq""",
             (key,)))
+        # t-1794. The branch this proposal's approval took, read back out of
+        # the event that recorded it. A captured record nobody can read is not
+        # captured — the same argument that put the classification keys on this
+        # view in the first place — and reading it HERE rather than from the
+        # row is the whole point: `proposal amend` may since have replaced the
+        # alternatives, and the event says what they were.
+        #
+        # Only while the proposal IS approved. A row reopened to
+        # `pending-review` has an old approval on file and printing its choice
+        # under a "pending" header would read as a decision that still stands.
+        decided_seq = (decision_instant(conn, key)[0]
+                       if stage == APPROVED else None)
+        approval = conn.execute(
+            "SELECT refs FROM events WHERE task_id=? AND seq=?",
+            (key, decided_seq)).fetchone() if decided_seq else None
+        pickups = (pickup_signals(conn, key, decided_seq)[0]
+                   if decided_seq else [])
     refs = task_refs(row)
     print(task_line(row))
     print(f"  fingerprint       {refs.get(FINGERPRINT_KEY) or '(none)'}")
@@ -1917,6 +2190,25 @@ def cmd_proposal_show(args) -> int:
     # to mine that out of a desired-outcome paragraph.
     for line in estate_decisions.review_lines(refs):
         print(line)
+    if approval:
+        try:
+            chosen = estate_pickup.choice_of(json.loads(approval["refs"] or "{}"))
+        except (TypeError, ValueError):
+            chosen = None
+        if chosen:
+            print(f"  {'chosen':<17} {estate_pickup.choice_line(chosen)}")
+            for position, entry in enumerate(
+                    chosen.get(estate_pickup.ALTERNATIVES_KEY) or [], start=1):
+                mark = "->" if position == chosen.get(
+                    estate_pickup.POSITION_KEY) else "  "
+                label = "at decision" if position == 1 else ""
+                print(f"  {label:<17} {mark} "
+                      f"{estate_decisions.alternative_line(entry)}")
+    if pickups:
+        latest = pickups[-1]
+        ref = latest.get(estate_pickup.REF_KEY)
+        print(f"  {'picked up':<17} {latest.get(estate_pickup.ROUTE_KEY)}"
+              + (f" ({ref})" if ref else ""))
     if row_get(row, "intent"):
         print(f"  intent            {row['intent']}")
     if recurrences:
@@ -2246,6 +2538,43 @@ def stage_detail(lead: str, note: str):
     return f"{lead}: {note}" if note else lead
 
 
+def proposal_choice(row, target: str, chosen):
+    """The chosen-alternative record this stage move must carry, or None.
+
+    Three answers and no fourth:
+
+      a record   the proposal declares `decision`, this is an approval, and a
+                 position was supplied
+      None       there is nothing to record — the proposal is an `action`, a
+                 `clarification` or a legacy row with no classification, or
+                 the move is not an approval
+      raise      the proposal is a `decision` being approved with no position,
+                 or with one that does not name an alternative on file
+
+    Nothing is retrofitted and nothing is inferred: a row filed before
+    docs/decision-classification-contract.md existed declares no
+    classification, owes no choice, and approves exactly as it always did.
+    On an established store that is most of what is already at
+    `approved-backlog`, and most of what was ever approved.
+    """
+    refs = json.loads(row["refs"] or "{}") if row_get(row, "refs") else {}
+    if not isinstance(refs, dict):
+        refs = {}
+    if target != APPROVED or not estate_pickup.is_decision(refs):
+        if chosen is not None:
+            raise estate_pickup.ChoiceRefused(
+                f'"{estate_pickup.CHOSEN_KEY}" was supplied for a proposal '
+                f"classified "
+                f"{refs.get(estate_decisions.CLASSIFICATION_KEY) or 'nothing'}; "
+                f"only a `{estate_decisions.DECISION}` has alternatives to "
+                "choose among")
+        return None
+    if chosen is None:
+        raise estate_pickup.ChoiceRefused(
+            estate_pickup.missing_choice_message(refs))
+    return estate_pickup.chosen_record(refs, chosen)
+
+
 class ProposalStageError(ValueError):
     """A refused proposal decision; safe to show to a CLI or HTTP caller."""
 
@@ -2255,17 +2584,33 @@ class ProposalStageConflict(ProposalStageError):
 
 
 def apply_proposal_stage(key: str, target: str, note: str, who: str,
-                         *, expected_stage: str | None = None) -> dict:
+                         *, expected_stage: str | None = None,
+                         chosen: int | None = None) -> dict:
     """Apply one audited proposal decision and return its resulting shape.
 
     This is the one mutation path shared by ``estate proposal stage`` and the
     dashboard's narrow POST endpoint.  The optional expected stage is an
     optimistic lock for a browser acting on a periodically refreshed snapshot;
     the CLI deliberately omits it and retains its historical behavior.
+
+    ``chosen`` is the 1-based position of the alternative that was picked
+    (t-1794).  Approving a proposal classified ``decision`` REQUIRES it, and
+    the gate is here rather than at either caller for the reason
+    docs/decision-classification-contract.md already gives about its own
+    validator: one copy, reached by both doors, cannot drift.  The record
+    lands on the stage-transition event's own refs and never on the task's,
+    so a later ``proposal amend`` replacing the alternative set cannot
+    retro-change what was chosen.
     """
     if target not in PROPOSAL_STAGES:
         raise ProposalStageError(
             f"stage must be one of {', '.join(PROPOSAL_STAGES)}")
+    if chosen is not None and target != APPROVED:
+        raise ProposalStageError(
+            f"a chosen alternative belongs to an approval; this decision is "
+            f"'{target}'. Rejecting, resolving or stopping a proposal picks "
+            "none of its alternatives, which is a different fact and is "
+            "already recorded by the stage itself")
     key = ident(key, "t")
     note = (note or "").strip()
     moved = None
@@ -2307,10 +2652,23 @@ def apply_proposal_stage(key: str, target: str, note: str, who: str,
             raise ProposalStageError(
                 f"{key} is '{was}'; cannot move to '{target}'. Allowed from here: "
                 f"{', '.join(STAGE_TRANSITIONS.get(was, ())) or '(none)'}")
+        # t-1794. The choice is resolved against the alternatives as they stand
+        # at this instant and frozen onto the event, INSIDE the same
+        # transaction as the stage write — a decision that recorded the move
+        # and not the branch is exactly the state this exists to make
+        # impossible, which is the argument the closure side effect below
+        # already makes for itself.
+        try:
+            choice = proposal_choice(row, target, chosen)
+        except estate_pickup.ChoiceRefused as exc:
+            conn.rollback()
+            raise ProposalStageError(str(exc)) from exc
         conn.execute("UPDATE tasks SET stage=?, updated_at=? WHERE id=?",
                      (target, NOW.isoformat(), key))
         event(conn, who, "transition", f"stage: {was} -> {target}",
-              task_id=key, project_id=row["project_id"], detail=note or None)
+              task_id=key, project_id=row["project_id"], detail=note or None,
+              refs=(json.dumps({estate_pickup.CHOSEN_KEY: choice},
+                               sort_keys=True) if choice else None))
         # Same transaction as the stage write, on purpose: a decision that
         # recorded the review but not the closure is precisely the state this
         # exists to make impossible.
@@ -2322,13 +2680,15 @@ def apply_proposal_stage(key: str, target: str, note: str, who: str,
     return {"id": key, "from_stage": was, "stage": target,
             "task_status": moved[1] if moved else row["status"],
             "task_transition": list(moved) if moved else None,
+            "chosen": choice,
             "retroactive": False}
 
 
 def cmd_proposal_stage(args) -> int:
     """Record a review decision. The audited half of the lifecycle (S32)."""
     try:
-        result = apply_proposal_stage(args.id, args.stage, args.note or "", actor(args))
+        result = apply_proposal_stage(args.id, args.stage, args.note or "",
+                                      actor(args), chosen=args.chosen)
     except ProposalStageError as exc:
         return fail(str(exc))
     if result["retroactive"]:
@@ -2337,6 +2697,9 @@ def cmd_proposal_stage(args) -> int:
               f"task {moved[0]} -> {moved[1]}")
         return 0
     print(f"{result['id']}: {result['from_stage']} -> {result['stage']}")
+    if result.get("chosen"):
+        print(f"{result['id']}: chose "
+              f"{estate_pickup.choice_line(result['chosen'])}")
     moved = result["task_transition"]
     if moved: print(f"{result['id']}: task {moved[0]} -> {moved[1]}")
     return 0
@@ -2409,6 +2772,182 @@ def cmd_ready(args) -> int:
         params += [AUTO_PROMOTE_KIND, CLAIM_SUMMARY]
     with connect() as conn:
         for row in conn.execute("SELECT t.* FROM tasks t WHERE " + " AND ".join(clauses) + " ORDER BY t.seq", params): print(task_line(row))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# t-1794. Decided, and then what?
+# --------------------------------------------------------------------------- #
+
+APPROVAL_FILED_SUMMARY = f"proposal filed ({APPROVED})"
+APPROVAL_TRANSITION_SUFFIX = f"-> {APPROVED}"
+
+
+def decision_instant(conn, key: str):
+    """(seq, when, actor) of the event that put this row at approved-backlog.
+
+    Two shapes, because there are two ways to arrive: the ordinary
+    `stage: X -> approved-backlog` transition, and `proposal add --stage
+    approved-backlog`, which files straight there and writes an `activity` row
+    instead. The LAST one wins — a proposal reopened to pending-review and
+    approved again was decided the second time, and measuring from the first
+    would age a fresh decision by however long the reconsideration took.
+
+    None when neither exists. That is a real state (three rows on file were
+    approved before the store recorded stages at all) and it must never read
+    as an accusation: see estate_pickup.verdict's `unobservable`.
+    """
+    row = conn.execute(
+        "SELECT seq, ts, actor, kind, summary FROM events WHERE task_id=? "
+        "AND ((kind='transition' AND summary LIKE ?) OR summary=?) "
+        "ORDER BY seq DESC LIMIT 1",
+        (key, f"%{APPROVAL_TRANSITION_SUFFIX}", APPROVAL_FILED_SUMMARY)).fetchone()
+    if not row:
+        return None, None, None
+    return row["seq"], estate_pickup.parse_iso(row["ts"]), row["actor"]
+
+
+def pickup_signals(conn, key: str, since_seq: int):
+    """(pickup records, queued, claimed) for one task, after `since_seq`.
+
+    Everything is read out of the events table in ONE pass, and only the three
+    shapes estate_pickup documents count. A `note` is deliberately not one of
+    them — t-777 and t-1329 carry nineteen mechanic notes between them since
+    their approvals and are the two most stuck rows in the store.
+    """
+    records, queued, claimed = [], False, False
+    for row in conn.execute(
+            "SELECT kind, summary, refs FROM events WHERE task_id=? AND seq > ? "
+            "ORDER BY seq", (key, since_seq)):
+        try:
+            refs = json.loads(row["refs"]) if row["refs"] else None
+        except (TypeError, ValueError):
+            refs = None
+        record = estate_pickup.pickup_of(refs)
+        if record:
+            records.append(record)
+        if estate_pickup.has_queue_key(refs):
+            queued = True
+        if row["kind"] == "transition" and row["summary"] == CLAIM_SUMMARY:
+            claimed = True
+    return records, queued, claimed
+
+
+def decided_not_acted_rows(conn, grace_minutes: float):
+    """Every live approved proposal, with what became of the decision."""
+    placeholders = ",".join("?" * len(TERMINAL))
+    out = []
+    for row in conn.execute(
+            f"SELECT * FROM tasks WHERE stage=? AND status NOT IN ({placeholders}) "
+            "ORDER BY seq", (APPROVED, *TERMINAL)):
+        seq, when, who = decision_instant(conn, row["id"])
+        if seq is None:
+            records, queued, claimed = [], False, False
+        else:
+            records, queued, claimed = pickup_signals(conn, row["id"], seq)
+        state = estate_pickup.verdict(
+            status=row["status"], decided_at=when, pickups=records,
+            queued=queued, claimed=claimed, now=NOW,
+            grace_minutes=grace_minutes)
+        out.append(dict(state, id=row["id"], title=row["title"],
+                        status=row["status"], decided_at=(when.isoformat()
+                                                          if when else None),
+                        decided_by=who))
+    # Owed first, oldest at the top: the row that has been sitting longest is
+    # the one the sweep is for. Unobservable sorts to the end because it is a
+    # record to repair, not work to route.
+    order = {estate_pickup.OWED: 0, estate_pickup.FRESH: 1,
+             estate_pickup.PARKED_V: 2, estate_pickup.PICKED_UP: 3,
+             estate_pickup.UNOBSERVABLE: 4}
+    out.sort(key=lambda r: (order.get(r["verdict"], 9),
+                            -(r["age_hours"] or 0)))
+    return out
+
+
+DECIDED_LINE_VERDICT_WIDTH = 12
+
+
+def decided_line(row: dict) -> str:
+    age = row["age_hours"]
+    when = "age unknown" if age is None else (
+        f"{age / 24:.1f}d" if age >= 48 else f"{age:.1f}h")
+    route = f" [{row['route']}]" if row.get("route") else ""
+    return (f"{row['verdict']:<{DECIDED_LINE_VERDICT_WIDTH}} {row['id']:<8} "
+            f"{when:>10}  {row['title'][:64]}{route}")
+
+
+def cmd_decided_not_acted(args) -> int:
+    """Approved decisions, and whether anything ever picked them up (t-1794).
+
+    The half `bin/estate ready` cannot answer. `ready` says a row is
+    CLAIMABLE; this says whether the decision that made it claimable has been
+    acted on since. Read-only, one connection, no subprocesses.
+
+    Exit 0 nothing owed, 3 a row is owed, 2 a decision instant could not be
+    read. `owed` wins, because a run with both has something to DO about the
+    first (bin/skill-drift's own precedence, for its own reason).
+    """
+    if args.within < 0:
+        return fail("--within must be >= 0")
+    init_db()
+    with connect() as conn:
+        rows = decided_not_acted_rows(conn, args.within)
+    if args.owed_only:
+        rows = [r for r in rows if r["verdict"] == estate_pickup.OWED]
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            print(decided_line(row))
+            print(f"{'':<{DECIDED_LINE_VERDICT_WIDTH}} {'':<8} "
+                  f"{'':>10}  {row['why']}"
+                  + (f" (decided by {row['decided_by']})"
+                     if row.get("decided_by") else ""))
+        if not rows:
+            print("no live approved proposals", file=sys.stderr)
+    return estate_pickup.exit_status(r["verdict"] for r in rows)
+
+
+def cmd_pickup(args) -> int:
+    """Record that something took an approved decision on (t-1794).
+
+    One event, one route, one sentence. This is the signal `decided-not-acted`
+    reads and the signal the hub's SKILL.md step 3 skip check was reaching for
+    with `refs.queue_key` — which is on no task at all.
+
+    It records and does not transition: routing work to an executor is not the
+    same act as claiming it, and the four executors claim through their own
+    doors (`estate claim`, the night shift's queue, a dispatch's own lease).
+    Recording the route here and the claim there is what lets the sweep tell
+    "handed to the extractor, which runs on its own cadence" from "nobody has
+    touched this".
+    """
+    init_db()
+    key = ident(args.id, "t")
+    try:
+        record = estate_pickup.pickup_record(args.route, args.note, args.ref or "")
+    except estate_pickup.ChoiceRefused as exc:
+        return fail(str(exc))
+    with connect() as conn:
+        begin(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (key,)).fetchone()
+        if not row:
+            conn.rollback(); return fail(f"no task matches '{key}'")
+        # A pickup is a claim about a DECIDED row. Marking an undecided one
+        # would make the sweep skip a proposal nobody approved, which is the
+        # gate P-02 built and this must not route around.
+        if row_get(row, "stage") != APPROVED:
+            conn.rollback()
+            return fail(f"{key} is at stage "
+                        f"'{row_get(row, 'stage') or 'none'}'; only an "
+                        f"'{APPROVED}' proposal has a decision to pick up")
+        event(conn, actor(args), estate_pickup.PICKUP_KIND,
+              f"{estate_pickup.PICKUP_SUMMARY}: {args.route}", task_id=key,
+              project_id=row["project_id"], detail=args.note.strip(),
+              refs=json.dumps({estate_pickup.PICKUP_KEY: record},
+                              sort_keys=True))
+    print(f"{key}: picked up by {args.route}"
+          + (f" ({args.ref})" if args.ref else ""))
     return 0
 
 
@@ -3549,6 +4088,31 @@ def attention_rows(conn, notice: float, states=(), kind=None):
     return out
 
 
+# t-1061 — THE PAIR IS ONE QUESTION, SO IT IS ONE ROW.
+#
+# The collapse happens HERE and not in `attention_rows`, and that placement is
+# the same one t-476 chose for the same reason: `awaiting` reads
+# `attention_rows` too, and a rendering decision that reached into the shared
+# selector would change a caller that never asked for it. The selector still
+# returns every row; this command decides what to print.
+#
+# `--no-collapse` restores the old output byte for byte, for a script that
+# genuinely wants both halves. It is an opt-OUT rather than an opt-in because
+# the duplication is the defect: a fix nobody turns on is a fix nobody has.
+def attention_pairs(conn, rows):
+    """Pairing records for an attention listing, keyed by follow-up id.
+
+    "In this view" is the listing itself, so a proposal filtered out by
+    `--state` or `--kind` leaves its follow-up rendering alone under the `half`
+    verdict rather than being collapsed into a row that is not on the page.
+    """
+    present = {row["id"] for row, _, _ in rows}
+    return estate_pairs.pair_view(
+        conn,
+        [(row["id"], row) for row, _, _ in rows],
+        refs_of=task_refs, present_ids=present)
+
+
 def cmd_attention(args) -> int:
     if args.notice < 0:
         return fail("--notice must be >= 0")
@@ -3557,10 +4121,21 @@ def cmd_attention(args) -> int:
     init_db()
     with connect() as conn:
         rows = attention_rows(conn, args.notice, states, args.kind)
+        pairs = {} if args.no_collapse else attention_pairs(conn, rows)
+        hidden = estate_pairs.collapsed_ids(pairs)
+        absorbed = estate_pairs.by_proposal(pairs)
+        rows = [triple for triple in rows if triple[0]["id"] not in hidden]
         blockers = estate_deps.blocked_by(conn, {row["id"] for row, _, _ in rows})
         if args.json:
+            # The pairing record rides on BOTH halves of a pair that is still
+            # two rows, and on the surviving half of one that is not — so a
+            # consumer never has to join the array against itself to find out
+            # why a row it expected is absent.
             print(json.dumps([dict(dict(row), due_state=state, days_left=left,
-                                   blocked_by=blockers.get(row["id"], []))
+                                   blocked_by=blockers.get(row["id"], []),
+                                   derived_pairs=(
+                                       [pairs[row["id"]]] if row["id"] in pairs
+                                       else absorbed.get(row["id"], [])))
                               for row, state, left in rows],
                              indent=2, sort_keys=True))
             return 0
@@ -3568,12 +4143,22 @@ def cmd_attention(args) -> int:
             counts = {state: 0 for state in estate_attention.ALL_STATES}
             for _, state, _ in rows:
                 counts[state] = counts.get(state, 0) + 1
-            print(json.dumps(dict(counts, total=len(rows)), indent=2, sort_keys=True))
+            # `collapsed` is printed beside the total and never folded into it.
+            # The whole claim of this feature is that the set got smaller, and
+            # a number that cannot be checked against the one before it is not
+            # a claim anybody can audit.
+            print(json.dumps(dict(counts, total=len(rows),
+                                  collapsed=len(hidden)),
+                             indent=2, sort_keys=True))
             return 0
         for row, state, left in rows:
             when = "" if left is None else f" {left}d"
+            marks = [estate_pairs.badge(rec)
+                     for rec in ([pairs[row["id"]]] if row["id"] in pairs
+                                 else absorbed.get(row["id"], []))]
+            tail = f"  [{' · '.join(marks)}]" if marks else ""
             print(f"{task_line(row, blockers.get(row['id'], ()))}  "
-                  f"({state}{when})")
+                  f"({state}{when}){tail}")
     return 0
 
 
@@ -3738,6 +4323,41 @@ def awaiting_defer(item, index: int, total: int) -> str:
     return " · ".join(parts)
 
 
+# t-1742. THE PRE-PRESENTATION FILTER, AND WHY IT ONLY EVER SUBTRACTS
+#
+# A proposal-body audit recommended "a pre-presentation readiness filter (real
+# recommendation, current context, nonterminal task)" and nothing derived one:
+# every row awaiting the owner arrived looking alike, whether it was
+# decidable in ten seconds or waiting on somebody to finish thinking. The rule
+# is `lib/estate_work.readiness` — ONE implementation, shared with
+# /estate.html's badge, for the same reason the t-721 clamps live there.
+#
+# It removes rows and never reorders them: the groups are already ordered by
+# the question each answers, and a filter that also re-sorted would make two
+# runs of the same command incomparable. What it drops is COUNTED and printed
+# beside what it kept, the way `attention --json`'s `collapsed` is — a number
+# that cannot be checked against the one before it is not a claim anybody can
+# audit. The `#N of M` on each item's Deferred line then counts the FILTERED
+# queue, which is the queue that view is about; the header above it says how
+# many rows are not in that count, so the denominator can never be read as the
+# whole set by accident.
+def awaiting_filter(groups: dict, ready_only: bool):
+    """(groups to render, {group: how many this filter removed}).
+
+    Off, it is the identity: `--ready-only` absent must leave every existing
+    caller byte-identical, which is the same promise t-476 made when it built
+    this verb rather than adding a flag to `proposal list`.
+    """
+    if not ready_only:
+        return groups, {name: 0 for name in groups}
+    kept, hidden = {}, {}
+    for name, items in groups.items():
+        keep = [i for i in items
+                if i["surface"]["readiness"] == estate_work.REACH]
+        kept[name], hidden[name] = keep, len(items) - len(keep)
+    return kept, hidden
+
+
 def cmd_awaiting(args) -> int:
     """The grouped review view. Prints; writes nothing; re-derives nothing."""
     if args.notice < 0: return fail("--notice must be >= 0")
@@ -3752,12 +4372,16 @@ def cmd_awaiting(args) -> int:
         groups = awaiting_items(conn, args.notice, args.days)
         blockers = estate_deps.blocked_by(
             conn, {i["row"]["id"] for g in groups.values() for i in g})
+    groups, hidden = awaiting_filter(groups, args.ready_only)
 
     wanted = (args.group,) if args.group else AWAITING_GROUPS
     if args.json:
         print(json.dumps({
             name: {"question": AWAITING_QUESTIONS[name],
                    "note": AWAITING_NOTES[name],
+                   # What the filter removed, per group, beside what it kept —
+                   # never folded into the item count.
+                   "not_ready_hidden": hidden[name],
                    "items": [dict(dict(item["row"]), **item["surface"],
                                   defer=awaiting_defer(item, n, len(groups[name])),
                                   blocked_by=blockers.get(item["row"]["id"], []))
@@ -3767,8 +4391,14 @@ def cmd_awaiting(args) -> int:
 
     totals = " · ".join(f"{len(groups[n])} {n}" for n in AWAITING_GROUPS
                         if groups[n] or n != "unstated")
+    # The filter announces itself and its cost on the line above the rows. A
+    # view that quietly held things back would be the silent default this flag
+    # exists not to be.
+    cut = sum(hidden.values())
     print(f"Awaiting you — {totals}"
-          f"  (notice {args.notice}d, stale {args.days}d)")
+          f"  (notice {args.notice}d, stale {args.days}d)"
+          + (f"  · --ready-only: {cut} row(s) not ready to decide are hidden"
+             if args.ready_only else ""))
     for name in wanted:
         items = groups[name]
         # The empty fourth group is silence, not a heading over nothing: it
@@ -3784,8 +4414,16 @@ def cmd_awaiting(args) -> int:
         for n, item in enumerate(items, 1):
             row, surface = item["row"], item["surface"]
             held = blockers.get(row["id"], ())
+            # t-1742 — the same three words the dashboard badges, on every
+            # row and not only the filtered view, so a reader can see WHY a
+            # row would or would not survive `--ready-only` without rerunning
+            # the command with it.
+            verdict = surface["readiness"]
+            why = surface["readiness_why"]
             head = (f"{row['id']:>8}  [{row['status']:<10}] {row['kind']:<12}"
                     + (f" ({row_get(row, 'stage')})" if row_get(row, "stage") else "")
+                    + f"  <{verdict}"
+                    + (f": {', '.join(why)}" if why else "") + ">"
                     + (f"  @{row['claimed_by']}" if row["claimed_by"] else "")
                     + (f"  ⛔ blocked by {', '.join(held)}" if held else ""))
             print()
@@ -4257,6 +4895,12 @@ def main(argv=None) -> int:
     p = proposal.add_parser("stage", help="record a review decision")
     p.add_argument("id"); p.add_argument("stage", choices=PROPOSAL_STAGES)
     p.add_argument("note", nargs="?", default=""); p.add_argument("--actor")
+    # t-1794. Required to APPROVE a proposal classified `decision`, refused on
+    # every other move and on every other classification. The record lands on
+    # the transition event, with the alternatives as they stood.
+    p.add_argument("--chosen", type=int, default=None, metavar="N",
+                   help="the 1-based position of the alternative that was "
+                        "picked. Required to approve a `decision`")
     p.set_defaults(func=cmd_proposal_stage)
     p = proposal.add_parser("classify", help="new | <stage> <task-id>")
     p.add_argument("--condition"); p.add_argument("--fingerprint")
@@ -4326,6 +4970,30 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true",
                    help="list every run, not just the ones needing a person")
     p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_runs)
+    # t-1794. The half `ready` cannot answer: `ready` says a row is claimable,
+    # these two say whether the decision that made it claimable was acted on.
+    p = sub.add_parser(
+        "decided-not-acted",
+        help="approved proposals, and whether anything picked the decision up")
+    p.add_argument("--within", type=float,
+                   default=estate_pickup.GRACE_MINUTES, metavar="MINUTES",
+                   help="how long after a decision a row is not yet owed "
+                        f"(default {estate_pickup.GRACE_MINUTES:g}m, one hub "
+                        "tick doubled)")
+    p.add_argument("--owed-only", dest="owed_only", action="store_true",
+                   help="print only the rows a sweep has to route")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_decided_not_acted)
+    p = sub.add_parser("pickup", help="record that something took a decision on")
+    p.add_argument("id")
+    p.add_argument("note", help="one line: what took this on, or why it is parked")
+    p.add_argument("--route", required=True, choices=estate_pickup.ROUTES,
+                   help="which executor has it. `parked` is not an executor: "
+                        "it is the owner or the hub deliberately leaving it")
+    p.add_argument("--ref", help="the queue key, dispatch title, loop name or "
+                                 "commit this route produced")
+    p.add_argument("--actor")
+    p.set_defaults(func=cmd_pickup)
     p = sub.add_parser("ready"); p.add_argument("--kind"); p.add_argument("--actor")
     p.add_argument("--auto-promoted", action="store_true",
                    help="only tasks the store promoted on unblock (t-163) and "
@@ -4369,6 +5037,60 @@ def main(argv=None) -> int:
                    help="the checkout that sha lives in, when it is not this "
                         "estate's own repo. Recorded as `landed_repo`")
     p.set_defaults(func=cmd_done)
+    # t-1063, the third exit from `needs-owner`. See THE VERIFIED EXIT for why
+    # the verb is not `done`, why the evidence is a required positional, and
+    # why no actor is privileged here.
+    p = sub.add_parser("verified",
+                       help="close a needs-owner row whose work turned out to "
+                            "be already finished, with the evidence for it")
+    p.add_argument("id")
+    p.add_argument("evidence",
+                   help="what an INDEPENDENT look saw that shows the parked "
+                        "question is already answered — the tracker issue "
+                        "that is Done, the PR that merged, the checks green "
+                        "today. "
+                        "Required, and a blank one is refused")
+    p.add_argument("--actor", required=True)
+    p.add_argument("--summary", help="what the work was, for the envelope")
+    p.add_argument("--refs", help="extra JSON refs merged into the envelope")
+    # The landing claim (LANDED_KEYS), on the same terms `done` offers it:
+    # recognized, never required, nothing derived from it here.
+    p.add_argument("--landed-branch",
+                   help="the branch the work was committed to, recorded as "
+                        "`landed_branch`")
+    p.add_argument("--landed-sha",
+                   help="the commit that carries the work, so "
+                        "bin/landed-reconciler can derive later whether it "
+                        "reached the default branch")
+    p.add_argument("--landed-repo",
+                   help="the checkout that sha lives in, when it is not this "
+                        "estate's own repo")
+    p.set_defaults(func=cmd_verified)
+    # t-1505, the correction path for a landing claim that turned out false.
+    # See THE RE-EVIDENCE VERB for the three gates and why it writes two events
+    # rather than editing a field.
+    p = sub.add_parser("re-land",
+                       help="correct the landing claim on a task already "
+                            "closed done, with the reason for the correction")
+    p.add_argument("id")
+    p.add_argument("--landed-sha", required=True,
+                   help="the commit that REALLY carries the work. Required: "
+                        "correcting a landing claim to no commit at all is a "
+                        "retraction, and this verb does not do that")
+    p.add_argument("--landed-branch",
+                   help="the branch that commit was landed on. Not carried "
+                        "forward from the claim being corrected — an old "
+                        "branch beside a new sha is a record nobody asserted")
+    p.add_argument("--landed-repo",
+                   help="the checkout that sha lives in, when it is not this "
+                        "estate's own repo")
+    p.add_argument("--reason", required=True,
+                   help="why the claim on file is wrong and what makes this "
+                        "commit the real landing. Required, and a blank one "
+                        "is refused: this is a correction to a completion "
+                        "claim, not an ordinary edit")
+    p.add_argument("--actor", required=True)
+    p.set_defaults(func=cmd_re_land)
     dep = sub.add_parser("dep").add_subparsers(dest="dep_cmd")
     p = dep.add_parser("add"); p.add_argument("from_task"); p.add_argument("to_task"); p.add_argument("--kind", choices=DEP_KINDS, required=True); p.add_argument("--actor"); p.set_defaults(func=cmd_dep_add)
     p = dep.add_parser("list"); p.add_argument("id"); p.set_defaults(func=cmd_dep_list)
@@ -4386,6 +5108,9 @@ def main(argv=None) -> int:
     # that separates due_soon from later — the same policy knob `due --within`
     # is, named for what it means here.
     p = sub.add_parser("attention", help="unresolved items waiting on a person")
+    p.add_argument("--no-collapse", action="store_true",
+                   help="render a proposal and its derived exit follow-up as "
+                        "two rows, as this command did before t-1061")
     p.add_argument("--notice", type=float, default=estate_attention.NOTICE_DEFAULT_DAYS)
     p.add_argument("--state", action="append",
                    help="only these due states (comma-separated, repeatable): "
@@ -4414,6 +5139,16 @@ def main(argv=None) -> int:
     p.add_argument("--full", action="store_true",
                    help="every line of every field; same as --lines 0")
     p.add_argument("--width", type=int, default=RENDER_WIDTH)
+    # t-1742. OPTIONAL, AND NEVER THE DEFAULT. The predicate judges the SHAPE
+    # of a record — a real recommendation, a situation sentence, a live row —
+    # and says nothing about whether the work matters. t-721 refused a hard cap
+    # on this same set because it would have hidden nearly all of it; a shape
+    # test promoted to the default view would hide them on a judgment
+    # it is not making. The header says how many it left out, always.
+    p.add_argument("--ready-only", action="store_true",
+                   help="only rows that are ready to decide as stored "
+                        f"(readiness `{estate_work.REACH}`); the count it "
+                        "hides is always printed")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_awaiting)
     # V-05. Fourth sibling: not "how much is waiting" but "how fast is it

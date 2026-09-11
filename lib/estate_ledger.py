@@ -197,6 +197,24 @@ INTAKE_PHASE = {"routed": INITIATION, "escalated": OUTCOME,
                 "unroutable": OUTCOME, "uninterpretable": OUTCOME}
 ROUTING_FAILURE_PHASE = FAILURE
 
+# The hub's own failures and corrections (t-392, `bin/hub-intake failure` and
+# the two cursor refusals it writes for itself). Everything above is the hub
+# acting on a MESSAGE; this is the hub reporting on ITSELF, and until t-392 it
+# had nowhere to do that except prose. Between P-06 landing and 2026-08-19 the
+# hub wrote 22 `error`/`correction` lines to state/ledger.jsonl and not one of
+# them reached this table, so `--subsystem hub --phase failure` returned only
+# backfilled history and looked populated while being closed.
+#
+# All three are FAILURE, including the ones whose JSONL `kind` is `correction`.
+# LEDGER_KIND_PHASE below maps a historical `correction` line to TRANSITION,
+# and that is a different judgement about a different thing: the migration is
+# guessing a phase for prose nobody typed one for, while a live writer here
+# KNOWS that something was attempted and did not work. A cursor write that was
+# refused is a failure of the write, whatever the narrative line calls it.
+HUB_FAILURE_PHASE = {"hub-failure": FAILURE,
+                     "cursor-regression-refused": FAILURE,
+                     "cursor-unrecorded-intake-refused": FAILURE}
+
 # The central JSONL ledger's `kind`, for the rows that HAVE a determinable
 # phase. `activity` is deliberately absent and that is the finding, not an
 # oversight: it is the generic bucket 829 of 991 historical lines sit in, it

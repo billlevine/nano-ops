@@ -192,6 +192,83 @@ class ProposalViewTest(_Store):
         self.assertIsNone(proposal["completion_check"])
 
 
+class StagedRegardlessOfKindTest(_Store):
+    """t-660 — the proposals panel's membership test is the STAGE column.
+
+    `estate proposal add --adopt-task` stages an existing task in place and
+    keeps its own kind, so a follow-up carrying a live approve/reject decision
+    is a first-class member of this set. t-193 was staged `approved-backlog`
+    and the owner could only find it through
+    `estate task list --kind followup`, and the diagnosis written up from that
+    was that the view filtered on kind. It never has. These tests are what
+    stops one being added.
+    """
+
+    def adopt(self, kind="followup", stage="approved-backlog",
+              title="extraction:2 — pick a baseline"):
+        task = self.estate("task", "add", title, "--kind", kind)
+        self.assertEqual(
+            self.estate("proposal", "add", title,
+                        "--adopt-task", task, "--stage", stage,
+                        "--condition", f"{title} — the record drifted",
+                        "--desired-outcome", "one baseline, chosen on purpose",
+                        "--completion-check", "the skills agree again"),
+            task)
+        return task
+
+    def test_a_staged_followup_is_in_the_proposals_set(self):
+        task = self.adopt()
+        view = self.build()
+        self.assertIn(task, view["proposals"])
+        self.assertEqual(view["proposal_counts"]["approved-backlog"], 1)
+
+    def test_adoption_leaves_the_kind_alone(self):
+        """The panel widens; the task is NOT reclassified."""
+        task = self.adopt()
+        row = self.tasks()[task]
+        self.assertEqual(row["kind"], "followup")
+        self.assertEqual(row["stage"], "approved-backlog")
+        self.assertIsNotNone(row["followup"],
+                             "it is still a follow-up to every other panel")
+
+    def test_every_stage_admits_every_kind(self):
+        for n, stage in enumerate(estate_work.PROPOSAL_STAGES):
+            with self.subTest(stage=stage):
+                task = self.estate("task", "add", f"adopted {n}",
+                                   "--kind", "inbox-message")
+                self.estate("proposal", "add", f"adopted {n}",
+                            "--adopt-task", task, "--stage", stage)
+                self.assertIn(task, self.build()["proposals"])
+
+    def test_an_unstaged_task_is_not_in_the_set_whatever_its_kind(self):
+        """The stage is the whole test, so it has to exclude as well as
+        include — a `proposal`-kind row with no stage is not under review."""
+        task = self.estate("task", "add", "never filed", "--kind", "proposal")
+        view = self.build()
+        self.assertNotIn(task, view["proposals"])
+        self.assertIsNone(self.tasks(view)[task]["proposal"])
+
+    def test_the_stats_grid_counts_exactly_the_rows_the_panel_renders(self):
+        """`proposal_counts` is the stage strip above the same list. Both are
+        computed from one set here so widening one cannot leave the other
+        behind — a count that disagrees with its list is a defect."""
+        self.adopt()
+        self.adopt(kind="proposal", stage="pending-review",
+                   title="the export fills the disk")
+        self.estate("task", "add", "unstaged", "--kind", "followup")
+        view = self.build()
+        counted = sum(view["proposal_counts"][s]
+                      for s in estate_work.PROPOSAL_STAGES)
+        self.assertEqual(counted, len(view["proposals"]))
+        self.assertEqual(len(view["proposals"]), 2)
+
+    def test_no_kind_constant_invites_the_narrowing_back(self):
+        """A `PROPOSAL_KIND = "proposal"` sat in this module read by nothing,
+        and t-660 was filed and dispatched on the belief that it was the
+        panel's filter. Naming a rule that does not exist is a defect."""
+        self.assertFalse(hasattr(estate_work, "PROPOSAL_KIND"))
+
+
 class DecisionSurfaceTest(_Store):
     """t-476 — which stored field is the question, and which is the
     recommendation. One rule; both renderers read it."""
@@ -835,6 +912,181 @@ class DegradedStoreTest(unittest.TestCase):
             INSERT INTO tasks VALUES (1,'t-1','needs-owner','generic','a','x');""")
         self.assertEqual(view["tasks"][0]["due_state"], "undated")
         self.assertEqual(view["attention"], ["t-1"])
+
+
+class ReadinessTest(unittest.TestCase):
+    """t-1742 — the pre-presentation readiness filter.
+
+    The 2026-08-16 proposal-body audit recommended one and nothing derived it.
+    The rule is SHAPE, not quality: a real recommendation, a situation sentence
+    on file, and a row neither the task nor its review stage has finished.
+    """
+
+    def row(self, refs=None, **over):
+        task = {"status": "ready", "stage": "pending-review", "intent": None,
+                "refs": json.dumps(refs) if refs is not None else None}
+        task.update(over)
+        return task
+
+    def decidable(self, **over):
+        refs = {"classification": "decision", "question": "which one?",
+                "recommendation": "take the graph arm",
+                "context": "both branches are unmerged"}
+        refs.update(over)
+        return self.row(refs)
+
+    def test_a_complete_record_on_a_live_row_reaches(self):
+        self.assertEqual(estate_work.readiness(self.decidable()),
+                         (estate_work.REACH, []))
+
+    def test_an_absent_recommendation_key_is_unclassified_and_not_a_verdict(self):
+        # docs/absence-contract.md, read back: a key nobody wrote says nothing
+        # about the work, so nothing is concluded about the work. Most open
+        # proposal/followup rows are in exactly this condition.
+        state, why = estate_work.readiness(self.row({"context": "a sentence"}))
+        self.assertEqual((state, why),
+                         (estate_work.UNCLASSIFIED,
+                          [estate_work.NO_RECOMMENDATION]))
+        # No refs at all is the same absence, not an error.
+        self.assertEqual(estate_work.readiness(self.row())[0],
+                         estate_work.UNCLASSIFIED)
+
+    def test_a_blank_recommendation_is_the_same_absence_wearing_a_key(self):
+        state, why = estate_work.readiness(self.decidable(recommendation="  "))
+        self.assertEqual((state, why),
+                         (estate_work.UNCLASSIFIED,
+                          [estate_work.EMPTY_RECOMMENDATION]))
+
+    def test_the_recorded_no_pick_sentinel_is_thinking_not_unclassified(self):
+        # The sentinel is a filer telling the reader something true, so it is
+        # RECORDED — and it is not a pick, so it is not decidable as stored.
+        # The audit judged t-27 and t-394 exactly this way.
+        state, why = estate_work.readiness(
+            self.decidable(recommendation="not recorded"))
+        self.assertEqual((state, why),
+                         (estate_work.THINKING,
+                          [estate_work.SENTINEL_RECOMMENDATION]))
+
+    def test_the_sentinel_with_its_reason_attached_is_still_the_sentinel(self):
+        # Filers write the sentinel and then say why. An equality test would
+        # report every one of those rows ready to decide, under a record whose
+        # first two words say nobody picked.
+        self.assertEqual(
+            estate_work.readiness(self.decidable(
+                recommendation="not recorded -- this is the owner's call"))[0],
+            estate_work.THINKING)
+        # …and the boundary that keeps that from over-reaching.
+        self.assertTrue(estate_work.is_not_recorded("Not Recorded"))
+        self.assertFalse(estate_work.is_not_recorded("not recordedness held"))
+
+    def test_a_record_that_says_nothing_about_its_situation_is_thinking(self):
+        state, why = estate_work.readiness(
+            self.row({"recommendation": "do the thing"}))
+        self.assertEqual((state, why),
+                         (estate_work.THINKING, [estate_work.NO_SITUATION]))
+
+    def test_the_situation_may_come_from_any_of_the_three_record_shapes(self):
+        # A follow-up writes `context`, a proposal writes `condition`, and
+        # `intent` is the task column a row carries instead of either. Reading
+        # only the display precedence (CONTEXT_FIELDS) would have called t-395
+        # unready, and the audit judged t-395 reach.
+        for field in ("context", "condition"):
+            self.assertEqual(
+                estate_work.readiness(
+                    self.row({"recommendation": "pick a", field: "why"}))[0],
+                estate_work.REACH, field)
+        self.assertEqual(
+            estate_work.readiness(
+                self.row({"recommendation": "pick a"}, intent="why"))[0],
+            estate_work.REACH)
+
+    def test_a_finished_row_is_a_record_and_not_a_request(self):
+        # t-460: a follow-up whose displayed question still asked how a
+        # change should publish, after the owner had authorised it and it
+        # merged. Both halves of its lifecycle say so, and both are named.
+        state, why = estate_work.readiness(
+            dict(self.decidable(), status="done", stage="resolved"))
+        self.assertEqual(state, estate_work.THINKING)
+        self.assertEqual(why, [estate_work.TASK_TERMINAL,
+                               estate_work.STAGE_TERMINAL])
+        # A live task under an ENDED review is the same staleness with only
+        # one half showing, and it exists: t-1092 is `ready` at `rejected`.
+        self.assertEqual(
+            estate_work.readiness(dict(self.decidable(), stage="rejected")),
+            (estate_work.THINKING, [estate_work.STAGE_TERMINAL]))
+
+    def test_a_live_stage_is_not_a_reason(self):
+        for stage in ("pending-review", "approved-backlog", None):
+            self.assertEqual(
+                estate_work.readiness(dict(self.decidable(), stage=stage)),
+                (estate_work.REACH, []), stage)
+
+    def test_every_failed_clause_is_named_not_just_the_first(self):
+        state, why = estate_work.readiness(
+            self.row({"recommendation": "not recorded"}, status="dropped"))
+        self.assertEqual(state, estate_work.THINKING)
+        self.assertEqual(why, [estate_work.SENTINEL_RECOMMENDATION,
+                               estate_work.NO_SITUATION,
+                               estate_work.TASK_TERMINAL])
+
+    def test_desired_outcome_is_not_a_recommendation_here(self):
+        """The display precedence falls back to it; readiness must not.
+
+        `RECOMMENDATION_FIELDS` reads `desired_outcome` because the review grid
+        has labelled that field "Recommendation" since proposals existed. It is
+        what the proposal wants to be true afterwards, which nearly every
+        proposal carries — reading it as a pick would report the whole review
+        queue ready on the strength of a field nobody filed as one.
+        """
+        task = self.row({"desired_outcome": "the panel is correct",
+                         "context": "a sentence"})
+        # The surface still shows it, under its own name…
+        surface = estate_work.decision_surface(task)
+        self.assertEqual(surface["recommendation"], "the panel is correct")
+        self.assertEqual(surface["recommendation_field"], "desired_outcome")
+        # …and readiness still says nobody recommended anything.
+        self.assertEqual(surface["readiness"], estate_work.UNCLASSIFIED)
+
+
+class ReadinessSnapshotTest(_Store):
+    """t-1742 — the verdict reaches BOTH lists /estate.html renders, and only
+    those. Built through the CLI, because the read model has to agree with the
+    writer and a hand-written INSERT lets the two drift."""
+
+    def rows(self):
+        # An attention row: parked at `needs-owner`, carrying a real pick.
+        self.estate("task", "add", "parked on a real pick", "--kind", "generic",
+                    "--ready",
+                    "--refs", json.dumps({"recommendation": "take arm A",
+                                          "context": "both arms are unmerged"}))
+        self.estate("claim", "t-1", "--actor", "hub")
+        self.estate("needs-owner", "t-1", "over to you", "--actor", "hub")
+        # A review-queue row: staged, carrying the recorded non-pick.
+        self.estate("task", "add", "staged with no pick", "--kind", "proposal",
+                    "--refs", json.dumps({"recommendation": "not recorded",
+                                          "context": "two arms, neither costed"}))
+        self.estate("proposal", "add", "staged with no pick",
+                    "--adopt-task", "t-2")
+        # On neither list.
+        self.estate("task", "add", "ordinary work", "--kind", "generic",
+                    "--ready")
+        return self.tasks()
+
+    def test_the_attention_set_and_the_review_queue_both_carry_it(self):
+        rows = self.rows()
+        self.assertEqual(rows["t-1"]["readiness"], estate_work.REACH)
+        self.assertEqual(rows["t-1"]["readiness_why"], [])
+        self.assertEqual(rows["t-2"]["readiness"], estate_work.THINKING)
+        self.assertEqual(rows["t-2"]["readiness_why"],
+                         [estate_work.SENTINEL_RECOMMENDATION])
+
+    def test_a_row_on_neither_list_carries_no_verdict_at_all(self):
+        """Absent, never a default. A row no surface presents to the owner was not
+        judged, and stamping it `unclassified` would report an absence
+        somebody looked for as one somebody found."""
+        row = self.rows()["t-3"]
+        self.assertNotIn("readiness", row)
+        self.assertNotIn("readiness_why", row)
 
 
 if __name__ == "__main__":

@@ -341,6 +341,13 @@ def unwarranted(readings) -> list:
 
 
 # ── the subsystems that record observations ──────────────────────────────────
+DAY_CAPTURE = register("day-capture", {
+    "read": OBSERVED,
+    "unreadable": FAILED, "parse_failed": FAILED, "store_locked": FAILED,
+    "no_tree": NOT_ATTEMPTED, "not_installed": NOT_ATTEMPTED,
+    "disabled": NOT_ATTEMPTED, "day_open": NOT_DUE,
+})
+
 # The spotter (P-03, docs/spotter-observation-contract.md). Six fetch outcomes
 # plus `unqueried`, which the engine produces per ITEM rather than per fetch:
 # no source in this run could have produced the entry, so nothing was owed a
@@ -454,16 +461,56 @@ DOORBELL = register("doorbell", {
 # `done` task whose evidence makes no landing claim was owed no look at all,
 # which is a boundary and not the hole `no_sha` describes (a claim that names
 # a branch and no commit is a caller to go and fix).
+#
+# THE SECOND OBSERVED WORD, and the three that guard it (t-1324). Ancestry
+# alone was blind in two directions, and both were measured on 2026-08-27: of
+# fifteen `not_landed` findings, eleven were branches GitHub had SQUASH- or
+# REBASE-merged (the merged commit is a different object, so the claimed sha is
+# genuinely not an ancestor and never will be) and one was a clone whose
+# `origin/main` had not been fetched in 54 days. Neither is a fact about the
+# estate; both read as one.
+#
+# So the negative path now has two more looks in front of it, and each can fail
+# in its own way:
+#
+#   `pr_merged`   is `observed` and is the ONLY new word that concludes
+#                 anything. GitHub's own record says the claim's branch was
+#                 merged in a pull request, which is a positive claim about a
+#                 remote's history rather than an absence, and it is reached
+#                 only with `landed=True`.
+#   `fetch_failed` is `failed`: the default branch could not be refreshed, so
+#                 "not an ancestor of this tip" is a statement about a tip that
+#                 may be two months old.
+#   `pr_error`    is `failed`: `gh` ran and would not answer, and "GitHub has
+#                 no merged PR for this branch" and "GitHub would not tell me"
+#                 are the same bytes — `sha_unknown`'s argument in a second
+#                 place.
+#   `no_pr_tool`  is `not_attempted`: `gh` is not on PATH, so the look never
+#                 happened at all.
+#   `offline`     is `not_attempted`: the operator passed `--offline`, so
+#                 neither network look was owed. A boundary the caller drew,
+#                 which is why it is not `failed`.
+#
+# An EMPTY PR list is deliberately not a member: `gh pr list --head` exiting 0
+# with `[]` is a successful look that found nothing, the ancestry answer still
+# stands on its own, and the row stays `ok`.
 LANDED = register("landed", {
     "ok": OBSERVED,
+    "pr_merged": OBSERVED,       # GitHub says the claim's branch was merged
     "git_error": FAILED,         # git ran and failed in a way we cannot read
     "sha_unknown": FAILED,       # the commit is in no history this run opened
     "unreadable": FAILED,        # the store errored, or refs would not parse
+    "fetch_failed": FAILED,      # the default branch could not be refreshed
+    "pr_error": FAILED,          # gh ran and would not answer about the branch
     "no_repo": NOT_ATTEMPTED,    # the checkout named is not there, or not git
     "no_tool": NOT_ATTEMPTED,    # git is not on PATH
-    "no_tip": NOT_ATTEMPTED,     # the default branch has no ref to compare to
+    "no_pr_tool": NOT_ATTEMPTED,  # gh is not on PATH
+    # the integration branch — the repo default, or a declared exempt target
+    # (t-1289) — has no ref in that checkout to compare against
+    "no_tip": NOT_ATTEMPTED,
     "no_sha": NOT_ATTEMPTED,     # a landing was claimed and named no commit
     "no_state": NOT_ATTEMPTED,   # there is no estate store to read
+    "offline": NOT_ATTEMPTED,    # --offline: neither network look was owed
     "no_claim": NOT_DUE,         # this task's evidence claims no landing
 })
 
@@ -497,6 +544,39 @@ CLOSURE = register("closure", {
     "no_state": NOT_ATTEMPTED,   # there is no estate store to read
 })
 
+# The credential expiry check (t-978, bin/credential-expiry). It asks one
+# question — how long until Claude Code's OAuth REFRESH token lapses — and the
+# answer it must never manufacture is the reassuring one. "Nothing is expiring"
+# is an absence claim about the next 24 hours, and a credentials file that is
+# missing, unopenable or shaped differently than it used to be produces exactly
+# the same "no warning to give" as a healthy one. Only one of those is a fact
+# about the estate. A lapsed refresh token takes the hub and every
+# autostart loop down at once, and leaves nothing running that could say so, so
+# a check that answers "fine" when it could not look would reproduce the very
+# outage it was built for.
+#
+# Five words, and the split inside each pair is the useful half. `no_credential`
+# versus `no_access` is the spotter's setup-versus-permission distinction: a
+# file that was never written is a machine that has never been logged in, and a
+# file we may not open is this process running as the wrong user. `unreadable`
+# versus `malformed` is weather versus contract: bytes that are not JSON mean
+# something truncated the write, and JSON with no `claudeAiOauth
+# .refreshTokenExpiresAt` in it means the credential format moved under us —
+# the second is the one that would otherwise pass silently as "no expiry to
+# report" forever.
+#
+# No `not_due` member, for the reason CLOSURE has none: every run reads the one
+# file, nothing narrows it, so a look is always owed and a boundary cannot
+# arise. And no `partial`: one field either parsed or it did not, and there is
+# no part of a timestamp that could have been read.
+CREDENTIAL = register("credential", {
+    "ok": OBSERVED,
+    "unreadable": FAILED,            # the file is there and is not JSON
+    "malformed": FAILED,             # JSON, with no expiry field we recognise
+    "no_credential": NOT_ATTEMPTED,  # no credentials file; nothing was asked
+    "no_access": NOT_ATTEMPTED,      # it is there and this process may not read it
+})
+
 # The pane sweep (`bin/doorbell panes`, t-1094). It asks whether a live
 # session's terminal has said anything since the last look, and the answer it
 # must never manufacture is `active`. Every other check here reads a STORE or a
@@ -515,10 +595,13 @@ CLOSURE = register("closure", {
 #
 # The two NOT_DUE words are boundaries and not holes. `not_running` is a session
 # agent-deck reports stopped or errored: it has no live pane to be stalled at,
-# and its liveness is `bin/ops health`'s question rather than this one. `exempt`
-# is a session whose configured idle threshold is zero, which is a declaration
-# that an idle prompt is its resting state — a long-lived session with no
-# cadence at all. Neither was owed a look.
+# and its liveness is `bin/ops health`'s question rather than this one — the
+# opposite classification to the same word in `skill-drift`, where the owed
+# restart stays a real unanswered question after the session dies. `exempt` is a
+# session whose configured idle threshold is zero, which is a declaration that
+# an idle prompt is its resting state — a long-lived session with no cadence
+# at all.
+# Neither was owed a look.
 #
 # `stale_sweep` and `no_state` belong to `panes --report`, which reads the last
 # sweep's file rather than looking itself. A report out of a sweeper that stopped
@@ -535,4 +618,116 @@ PANE_WATCH = register("pane-watch", {
     "no_state": NOT_ATTEMPTED,   # no sweep has ever been recorded
     "not_running": NOT_DUE,      # not alive; there is no live pane to watch
     "exempt": NOT_DUE,           # an idle prompt is this session's resting state
+})
+
+# The owed-restart check (t-1062, bin/skill-drift). It asks whether a running
+# loop is still wearing the policy files that are on `main`, and the answer it
+# must never manufacture is `fresh`. `fresh` is the ABSENCE claim here —
+# "nothing has landed since this session bound its skill" — which is the same
+# shape `not_landed` has in the `landed` vocabulary and obeys the same rule: a
+# session nobody could find, a tmux binding that is not live, and a git history
+# that would not open all produce exactly the same empty list of newer commits
+# as a loop that really is up to date. Only one of those is a fact about the
+# estate.
+#
+# The splits inside the NOT_ATTEMPTED words are the useful half, and each one
+# names a DIFFERENT remedy in `bin/ops health`'s vocabulary. `no_session` is a
+# loop that was never launched or was removed (health: needs-start → launch);
+# `not_running` is a registered session that is stopped or errored (health:
+# needs-start → start + kick); `no_binding` is a live agent-deck record whose
+# tmux session is gone underneath it, which is the one shape health does not
+# have a word for at all. `no_paths` is a registry entry pointing at a
+# directory that holds no policy file — nothing to be behind, and nothing was
+# looked at either.
+#
+# No `not_due` member, for the reason CLOSURE and CREDENTIAL have none: every
+# registered loop is owed a look on every run, nothing narrows the set, so no
+# boundary can arise. And no `partial`: a loop's binding either resolved or it
+# did not.
+SKILL_DRIFT = register("skill-drift", {
+    "ok": OBSERVED,
+    "deck_error": FAILED,          # agent-deck ran and would not answer
+    "tmux_error": FAILED,          # tmux ran and would not answer
+    "git_error": FAILED,           # git ran and failed on this history
+    "unreadable": FAILED,          # an answer came back and would not parse
+    "no_tool": NOT_ATTEMPTED,      # agent-deck, tmux or git is not on PATH
+    "no_session": NOT_ATTEMPTED,   # no agent-deck record under that title
+    "not_running": NOT_ATTEMPTED,  # registered, not alive; nothing is bound
+    "no_binding": NOT_ATTEMPTED,   # the record's tmux session is not live
+    "no_paths": NOT_ATTEMPTED,     # this loop dir holds no policy file to track
+})
+
+# The estate's own stop/start (t-1371, bin/estate-lifecycle + `bin/ops
+# down|up|restart`). Everything else registered above observes some OTHER
+# subsystem's state; this one observes the estate's own machinery on the way
+# past, and it has two absence claims to keep honest rather than one.
+#
+# `clear` is the first: a preflight that finds no in-flight dispatch, no dirty
+# worktree and no running ephemeral worker is claiming there is nothing to
+# lose, and `bin/ops down --force` is what a person types after reading it. A
+# dispatch store that is not there (a worktree checkout has an EMPTY state/
+# tree, and the store this tool reads is the one beside its own bin/) produces exactly the same empty list as an estate with nothing
+# running, so `no_state` is NOT_ATTEMPTED and the caller gets "unobservable"
+# instead of a green light.
+#
+# `rebound` is the second: "this session really did come back on new bytes"
+# is an assertion that a tmux session_created went UP, and a session nobody
+# could find, a record whose tmux session is gone underneath it, and a
+# baseline that was never written all produce the same missing comparison. So
+# every one of them is a word here, and none of them is `ok`.
+#
+# `not_running` is the one NOT_DUE member: a session that was already stopped
+# before the pass began is a boundary rather than a hole — nothing was owed a
+# rebinding, and nothing failed to provide one.
+LIFECYCLE = register("lifecycle", {
+    "ok": OBSERVED,
+    "deck_error": FAILED,        # agent-deck ran and would not answer
+    "tmux_error": FAILED,        # tmux ran and would not answer
+    "git_error": FAILED,         # git ran and failed on a worktree
+    "store_error": FAILED,       # bin/dispatches ran and would not answer
+    "flox_error": FAILED,        # flox ran and failed
+    "codex_error": FAILED,       # the shell-execution probe could not be judged
+    "unreadable": FAILED,        # an answer came back and would not parse
+    "no_tool": NOT_ATTEMPTED,    # agent-deck, tmux, git, flox or codex is absent
+    "no_state": NOT_ATTEMPTED,   # the store this would read has never been written
+    "no_session": NOT_ATTEMPTED,  # no agent-deck record under that title
+    "no_binding": NOT_ATTEMPTED,  # the record names no live tmux session
+    "no_baseline": NOT_ATTEMPTED,  # nothing recorded a "before" to compare against
+    "not_configured": NOT_ATTEMPTED,  # nothing declares where to look
+    "not_running": NOT_DUE,      # already stopped; no rebinding was owed
+})
+
+# The backlog reconciler (t-1759, bin/backlog-reconciler). It asks one question
+# of an open `needs-owner` or `followup` row — is this item already finished? —
+# and every answer rests on FACTS it gathered first: the row's own store
+# history, the commits its evidence names, the pull requests its text names.
+#
+# The absence claim here is a timestamp that is not there. A commit whose date
+# could not be read and a commit that does not exist produce the same empty
+# cell, and only one of them may be cited: a citation-verification gate that
+# treated an unreadable git call as "no such commit" would reject a true
+# finding and, worse, would let a claim about a commit nobody could open pass
+# as unverifiable-therefore-unchallenged. So every fact this tool puts in front
+# of the seat carries the reading that produced it, and a fact whose reading
+# cannot conclude an absence is never used to contradict a claim — only to
+# refuse to confirm one.
+#
+# `no_reference` is the boundary member and it is real here: most rows in the
+# attention set name no commit and no pull request at all, so no git or GitHub
+# look was ever owed for them. Recording that as `failed` would make the
+# ordinary row look broken; recording it as `observed` would let "this row
+# names no landed commit" read as "this row's commit is not in main".
+BACKLOG = register("backlog", {
+    "ok": OBSERVED,
+    "unreadable": FAILED,        # the store answered and would not parse
+    "store_error": FAILED,       # bin/estate ran and would not answer
+    "git_error": FAILED,         # git ran and failed in a way we cannot read
+    "sha_unknown": FAILED,       # the commit is in no history this run opened
+    "gh_error": FAILED,          # gh ran and would not answer about the PR
+    "no_repo": NOT_ATTEMPTED,    # the checkout the label names is not there
+    "no_tool": NOT_ATTEMPTED,    # git or gh is not on PATH
+    "no_state": NOT_ATTEMPTED,   # there is no estate store to read
+    "no_seat": NOT_ATTEMPTED,    # the seat definition is not installed
+    "offline": NOT_ATTEMPTED,    # --offline: the network look was not owed
+    "no_reference": NOT_DUE,     # the row names no commit and no pull request
 })

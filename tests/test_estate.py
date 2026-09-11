@@ -183,6 +183,12 @@ class TestLifecycle(EstateCase):
         self.assertEqual(refs, {"summary": "landed", "verification": "tests green",
             "dependencies": "none", "retry_notes": "rerun", "residual_risk": "low", "branch": "topic"})
 
+    def close_with_claim(self, sha, branch, key="1"):
+        """t-1 closed `done` carrying one landing claim, ready to be corrected."""
+        self.add(); self.ok("mark-ready", key); self.ok("claim", key, "--actor", "w")
+        self.ok("done", key, "--actor", "w", "--summary", "the original close",
+                "--landed-sha", sha, "--landed-branch", branch)
+
     def test_landing_keys_are_first_class_and_never_required(self):
         """t-712 panel P1's write side: structure, refusing nothing.
 
@@ -225,6 +231,144 @@ class TestLifecycle(EstateCase):
         refs = json.loads(self.events()[-1]["refs"])
         self.assertEqual(refs["landed_sha"], "9999999")
         self.assertEqual(refs["pr"], "o/r#1")
+
+    def test_re_land_refuses_a_task_that_is_not_done(self):
+        """t-1505's first gate. `re-land` corrects a COMPLETION claim, and a
+        task that has not claimed to be finished has no completion claim to
+        correct — letting one through would make this a way around `done` and
+        the status machine it moves. The refusal names the status, so the
+        reader knows which of the two exits they actually want."""
+        self.add()                                        # t-1, still `open`
+        result = self.cli("re-land", "1", "--landed-sha", "abc1234",
+                          "--reason", "the real landing", "--actor", "owner")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("t-1 is open, not done", result.stderr)
+        self.assertIn("estate verified", result.stderr)   # the other exit
+        self.assertEqual(self.events(), [self.events()[0]])   # nothing written
+
+        # And every other non-done status refuses the same way.
+        self.ok("mark-ready", "1"); self.ok("claim", "1", "--actor", "w")
+        self.ok("needs-owner", "1", "over to you", "--actor", "w")
+        result = self.cli("re-land", "1", "--landed-sha", "abc1234",
+                          "--reason", "the real landing", "--actor", "owner")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("t-1 is needs-owner, not done", result.stderr)
+        self.assertEqual([e["kind"] for e in self.events()].count("correction"),
+                         0)
+
+    def test_re_land_refuses_without_a_reason(self):
+        """The second gate. A correction to a completion claim is not an
+        ordinary edit: the reason is the whole of what makes it auditable
+        later, so a blank one is refused with nothing written — the bargain
+        `estate verified` and `dispatches resolve --verified` already strike
+        for their own evidence. argparse catches the missing flag; this catches
+        the empty and whitespace-only one it cannot."""
+        self.close_with_claim("abc1234", "old/branch")
+        missing = self.cli("re-land", "1", "--landed-sha", "def5678",
+                           "--actor", "owner")
+        self.assertNotEqual(missing.returncode, 0)        # argparse: required
+        for blank in ("", "   ", "\n"):
+            result = self.cli("re-land", "1", "--landed-sha", "def5678",
+                              "--reason", blank, "--actor", "owner")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--reason", result.stderr)
+            self.assertIn("t-1 is unchanged", result.stderr)
+        refs = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(refs["landed_sha"], "abc1234")   # still the old claim
+
+    def test_re_land_corrects_the_claim_and_leaves_a_trail(self):
+        """t-1330 and t-1416, reproduced: closed `done` citing a commit that
+        never merged, genuinely re-landed later by a different one.
+
+        Three things have to be true afterwards, and they are one decision:
+        the LIVE claim is the new commit (which is the last `evidence` row and
+        nothing else — that is what bin/landed-reconciler reads), the OLD claim
+        is still on file, and a `correction` event carries both plus the reason
+        so the correction itself is inspectable.
+        """
+        self.close_with_claim("aaaa111", "never/merged")
+        result = self.ok("re-land", "1", "--landed-sha", "474881f",
+                         "--landed-branch", "the/real-one",
+                         "--reason", "the cited branch never merged; 474881f "
+                                     "is what actually landed the work",
+                         "--actor", "owner")
+        self.assertIn("aaaa111", result.stdout)           # old and new, in the
+        self.assertIn("474881f", result.stdout)           # line a person sees
+
+        events = self.events()
+        # The live claim: the LAST evidence row, which is what the reconciler
+        # reads and the only thing that changes its verdict.
+        live = json.loads([e for e in events if e["kind"] == "evidence"][-1]["refs"])
+        self.assertEqual(live["landed_sha"], "474881f")
+        self.assertEqual(live["landed_branch"], "the/real-one")
+        self.assertEqual(live["summary"], "the original close")  # carried
+        # The original envelope is untouched where it always was.
+        first = json.loads([e for e in events if e["kind"] == "evidence"][0]["refs"])
+        self.assertEqual(first["landed_sha"], "aaaa111")
+        self.assertEqual(first["landed_branch"], "never/merged")
+        # And the correction, with both values and the reason in it.
+        corrections = [e for e in events if e["kind"] == "correction"]
+        self.assertEqual(len(corrections), 1)
+        record = json.loads(corrections[0]["refs"])["landed_correction"]
+        self.assertEqual(record["previous"],
+                         {"landed_sha": "aaaa111",
+                          "landed_branch": "never/merged"})
+        self.assertEqual(record["corrected"],
+                         {"landed_sha": "474881f",
+                          "landed_branch": "the/real-one"})
+        self.assertIn("never merged", record["reason"])
+        self.assertIn("aaaa111", corrections[0]["summary"])
+        self.assertIn("474881f", corrections[0]["summary"])
+        self.assertEqual(self.task()["status"], "done")   # nothing moved
+
+    def test_re_land_does_not_carry_a_stale_branch_forward(self):
+        """The corrected claim is what THIS call supplies. A new sha beside the
+        branch of a landing that never happened is a record nobody asserted,
+        and the old value is preserved in the correction event either way."""
+        self.close_with_claim("aaaa111", "never/merged")
+        self.ok("re-land", "1", "--landed-sha", "474881f",
+                "--reason", "re-landed from elsewhere", "--actor", "owner")
+        live = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(live["landed_sha"], "474881f")
+        self.assertNotIn("landed_branch", live)
+        record = json.loads([e for e in self.events()
+                             if e["kind"] == "correction"][0]["refs"])
+        self.assertEqual(record["landed_correction"]["previous"]["landed_branch"],
+                         "never/merged")
+
+    def test_re_land_refuses_a_correction_that_changes_nothing(self):
+        """Two events saying nothing, in the one history somebody reads to find
+        out what changed."""
+        self.close_with_claim("aaaa111", "never/merged")
+        result = self.cli("re-land", "1", "--landed-sha", "aaaa111",
+                          "--landed-branch", "never/merged",
+                          "--reason", "just checking", "--actor", "owner")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("nothing to correct", result.stderr)
+        self.assertEqual([e["kind"] for e in self.events()].count("correction"),
+                         0)
+
+    def test_re_land_records_a_legacy_claim_as_what_it_superseded(self):
+        """The claim being corrected is not always in the first-class keys.
+        t-704 wrote `commits`/`branch` and t-102 wrote an `artifacts` string;
+        the reconciler still parses both, so a correction has to say which of
+        them it superseded rather than silently leaving them as the record."""
+        self.add(); self.ok("mark-ready", "1"); self.ok("claim", "1", "--actor", "w")
+        self.ok("done", "1", "--actor", "w", "--summary", "the original close",
+                "--refs", '{"branch":"land-batch","commits":"ed35605..aaf7ccb"}')
+        self.ok("re-land", "1", "--landed-sha", "c9e04a3",
+                "--reason", "the range cited two commits, not the work",
+                "--actor", "owner")
+        record = json.loads([e for e in self.events()
+                             if e["kind"] == "correction"][0]["refs"])
+        self.assertEqual(record["landed_correction"]["previous"],
+                         {"branch": "land-batch",
+                          "commits": "ed35605..aaf7ccb"})
+        # The structured key now wins for every reader, and the legacy strings
+        # are left where they were rather than being rewritten.
+        live = json.loads(self.events()[-1]["refs"])
+        self.assertEqual(live["landed_sha"], "c9e04a3")
+        self.assertEqual(live["commits"], "ed35605..aaf7ccb")
 
     def test_a_transition_carries_its_evidence_in_the_same_transaction(self):
         """`done`'s bargain, on every other edge (t-296 follow-up).
@@ -351,6 +495,137 @@ class TestPrActionCompletionEvidence(EstateCase):
                 self.ok("claim", key, "--actor", "hub")
                 self.ok("done", key, "--actor", "hub", "--summary", "landed")
                 self.assertEqual(self.task(f"t-{key}")["status"], "done")
+
+
+class TestVerifiedExit(EstateCase):
+    """t-1063 — the third exit from `needs-owner`, gated on evidence.
+
+    A triage of the attention set finds parked rows whose work was verifiably
+    finished and which it cannot record: `drop` would file a false
+    "abandoned", and `reopen` would put finished items back in the pool.
+    This is the edge for them, and the evidence is what makes it an edge
+    rather than a hole.
+    """
+
+    def parked(self, key="1", kind="generic", actor="hub"):
+        self.ok("task", "add", f"a {kind} task", "--kind", kind, "--ready")
+        self.ok("claim", key, "--actor", actor)
+        self.ok("needs-owner", key, "over to the owner", "--actor", actor)
+        self.assertEqual(self.task(f"t-{key}")["status"], "needs-owner")
+
+    # ── the happy path ───────────────────────────────────────────────────────
+    def test_a_parked_row_closes_done_with_its_evidence_on_the_row(self):
+        self.parked()
+        out = self.ok("verified", "1",
+                      "tracker OPS-167 Done; acme/gizmo#2222 merged",
+                      "--actor", "night-shift").stdout
+        self.assertIn("t-1: needs-owner -> done", out)
+        row = self.task("t-1")
+        self.assertEqual(row["status"], "done")
+        self.assertTrue(row["closed_at"], "a terminal status must stamp closed_at")
+        evidence = [e for e in self.events() if e["kind"] == "evidence"]
+        self.assertEqual(len(evidence), 1, evidence)
+        refs = json.loads(evidence[0]["refs"])
+        self.assertEqual(refs["verification"],
+                         "tracker OPS-167 Done; acme/gizmo#2222 merged")
+        self.assertEqual(evidence[0]["actor"], "night-shift")
+
+    def test_the_transition_is_recorded_as_the_arc_outcome_coverage_matches(self):
+        # bin/outcome-coverage prefix-matches this exact summary. A reword
+        # here makes that tool report a silent zero forever, so it is pinned.
+        self.parked()
+        self.ok("verified", "1", "checks are green today", "--actor", "cli")
+        summaries = [e["summary"] for e in self.events()
+                     if e["kind"] == "transition"]
+        self.assertIn("needs-owner -> done", summaries)
+
+    def test_any_actor_may_take_it_and_the_owner_is_not_privileged(self):
+        # The actor on essentially every recorded `needs-owner -> ready` exit
+        # is `cli` or an automated session, practically never the owner. An
+        # edge only the owner could take would be a path nobody walks, beside
+        # two others they do not walk either.
+        for n, who in enumerate(("night-shift", "cli", "hub", "owner"),
+                                start=1):
+            with self.subTest(actor=who):
+                self.parked(str(n))
+                self.ok("verified", str(n), f"verified by {who}", "--actor", who)
+                self.assertEqual(self.task(f"t-{n}")["status"], "done")
+
+    def test_it_does_not_require_the_caller_to_hold_the_claim(self):
+        # `done` requires claimed_by == actor. This deliberately does not: a
+        # parked row's claimant is whoever escalated it, and the actor who
+        # later establishes the work is finished is routinely somebody else.
+        self.parked(actor="hub")
+        self.ok("verified", "1", "OPS-167 is Done", "--actor", "night-shift")
+        self.assertEqual(self.task("t-1")["status"], "done")
+
+    def test_the_landing_claim_rides_the_envelope_like_done(self):
+        self.parked()
+        self.ok("verified", "1", "acme/gizmo#2222 merged", "--actor", "cli",
+                "--landed-sha", "aaf7ccb", "--landed-repo", "acme/gizmo")
+        refs = json.loads([e for e in self.events()
+                           if e["kind"] == "evidence"][0]["refs"])
+        self.assertEqual(refs["landed_sha"], "aaf7ccb")
+        self.assertEqual(refs["landed_repo"], "acme/gizmo")
+
+    # ── the refusals ─────────────────────────────────────────────────────────
+    def test_blank_evidence_is_refused_and_nothing_is_written(self):
+        for blank in ("", "   ", "\t\n "):
+            with self.subTest(evidence=repr(blank)):
+                self.parked()
+                r = self.cli("verified", "1", blank, "--actor", "cli")
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn("evidence", r.stderr)
+                self.assertEqual(self.task("t-1")["status"], "needs-owner")
+                self.assertEqual(
+                    [e for e in self.events() if e["kind"] == "evidence"], [],
+                    "a refused close must write no evidence event")
+                self.tearDown(); self.setUp()
+
+    def test_omitting_the_evidence_entirely_cannot_reach_the_store(self):
+        self.parked()
+        r = self.cli("verified", "1", "--actor", "cli")
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertEqual(self.task("t-1")["status"], "needs-owner")
+
+    def test_done_still_refuses_a_parked_row(self):
+        # THE NAME IS THE GATE. `cmd_done` transitions on the verb `done`,
+        # which `TRANSITIONS['needs-owner']` still does not have, so the
+        # evidence cannot be routed around by calling the other command.
+        self.parked()
+        r = self.cli("done", "1", "--actor", "hub", "--summary", "landed")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("cannot done", r.stderr)
+        self.assertEqual(self.task("t-1")["status"], "needs-owner")
+
+    def test_the_edge_is_only_out_of_needs_owner(self):
+        for status, setup in (
+                ("ready", lambda: None),
+                ("claimed", lambda: self.ok("claim", "1", "--actor", "hub")),
+                ("blocked", lambda: (self.ok("claim", "1", "--actor", "hub"),
+                                     self.ok("block", "1", "stuck",
+                                             "--actor", "hub"))),
+        ):
+            with self.subTest(status=status):
+                self.add("work", True); setup()
+                r = self.cli("verified", "1", "real evidence", "--actor", "cli")
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn("cannot verified", r.stderr)
+                self.tearDown(); self.setUp()
+
+    # ── what did not change ──────────────────────────────────────────────────
+    def test_the_other_needs_owner_exits_are_untouched(self):
+        self.parked("1"); self.parked("2")
+        self.ok("reopen", "1", "--actor", "hub")
+        self.assertEqual(self.task("t-1")["status"], "ready")
+        self.ok("drop", "2", "not doing it", "--actor", "hub")
+        self.assertEqual(self.task("t-2")["status"], "dropped")
+
+    def test_the_refusal_message_still_enumerates_every_allowed_verb(self):
+        self.parked()
+        r = self.cli("done", "1", "--actor", "hub")
+        for verb in ("drop", "reopen", "verified"):
+            self.assertIn(verb, r.stderr)
 
 
 class TestOrphans(EstateCase):
@@ -1019,6 +1294,79 @@ class TestAwaiting(EstateCase):
         self.assertEqual(item["question_field"], "condition")
         self.assertEqual(item["recommendation"], "it stops")
         self.assertIn("#1 of 1", item["defer"])
+
+    # ── t-1742: the pre-presentation readiness filter ───────────────────────
+
+    def three_shapes(self):
+        """One row of each verdict, filed the way the store really files them.
+
+        The recommendation key rides `refs`; `proposal add` accepts the
+        classification keys without requiring them
+        (docs/decision-classification-contract.md), so these are three real
+        pending-review rows and not a fixture shape.
+        """
+        self.ok("task", "add", "decidable as stored", "--kind", "proposal",
+                "--refs", json.dumps({"condition": "the arms are unmerged",
+                                      "recommendation": "take arm A"}))
+        self.ok("proposal", "add", "decidable as stored", "--adopt-task", "t-1")
+        self.ok("task", "add", "nobody picked", "--kind", "proposal",
+                "--refs", json.dumps({"condition": "two arms, neither costed",
+                                      "recommendation": "not recorded"}))
+        self.ok("proposal", "add", "nobody picked", "--adopt-task", "t-2")
+        self.propose("no recommendation key at all",
+                     condition="the disk fills", desired_outcome="it stops")
+
+    def test_every_row_carries_its_verdict_whether_or_not_it_is_filtered(self):
+        """The badge is not a property of the filtered view. A reader has to
+        be able to see WHY a row would or would not survive `--ready-only`
+        without running the command a second time with it."""
+        self.three_shapes()
+        out = self.ok("awaiting", "--group", "decisions").stdout
+        self.assertIn("<reach>", out)
+        self.assertIn("<thinking: recommendation_not_recorded>", out)
+        self.assertIn("<unclassified: no_recommendation_key>", out)
+
+    def test_ready_only_keeps_the_reach_rows_and_says_what_it_hid(self):
+        self.three_shapes()
+        self.assertEqual(self.ids("decisions"), ["t-1", "t-2", "t-3"])
+        self.assertEqual(self.ids("decisions", "--ready-only"), ["t-1"])
+        out = self.ok("awaiting", "--ready-only").stdout
+        # Never silently: the count it removed rides the header, and the JSON
+        # carries it per group beside the items it kept.
+        self.assertIn("--ready-only: 2 row(s) not ready to decide are hidden",
+                      out)
+        self.assertEqual(
+            self.groups("--ready-only")["decisions"]["not_ready_hidden"], 2)
+
+    def test_the_filter_is_off_by_default_and_hides_nothing(self):
+        """t-721 refused a hard cap on this set because it would have hidden
+        nearly all of it. This predicate judges SHAPE, not quality, so the
+        default view must stay exactly as wide as it was."""
+        self.three_shapes()
+        groups = self.groups()
+        self.assertEqual(len(groups["decisions"]["items"]), 3)
+        self.assertEqual(groups["decisions"]["not_ready_hidden"], 0)
+        self.assertNotIn("--ready-only", self.ok("awaiting").stdout)
+
+    def test_the_recorded_no_pick_is_hidden_even_with_its_reason_attached(self):
+        """Eight rows on the live store write the sentinel and then say why
+        nobody picked. Reading only an exact match would present every one of
+        them as decidable as stored."""
+        self.ok("task", "add", "explained non-pick", "--kind", "proposal",
+                "--refs", json.dumps({
+                    "condition": "the risk is real",
+                    "recommendation": "not recorded -- this is the owner's "
+                                      "call"}))
+        self.ok("proposal", "add", "explained non-pick", "--adopt-task", "t-1")
+        self.assertEqual(self.ids("decisions", "--ready-only"), [])
+
+    def test_ready_only_writes_nothing_either(self):
+        self.three_shapes()
+        before, events = self.task(), len(self.events())
+        self.ok("awaiting", "--ready-only")
+        self.ok("awaiting", "--ready-only", "--json")
+        self.assertEqual(self.task(), before)
+        self.assertEqual(len(self.events()), events)
 
 
 class TestUnpooledKinds(EstateCase):

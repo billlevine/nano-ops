@@ -43,6 +43,10 @@ already exists somewhere else in the estate, by calling it:
   tier           lib/estate_attention.tier — which of the three kinds of
                  waiting one attention row is (t-721). Derived from the same
                  `status`/`kind`/`stage` the set itself is derived from.
+  derived_pairs  lib/estate_pairs — which proposal an attention row's exit
+                 follow-up derives from, and whether the pair collapsed into
+                 one row or stayed two (t-1061). Only on attention rows, and
+                 only where a link was recorded at filing time.
   idle_days      lib/estate_attention.idle_days, compared only against its own
                  tier's median. Age is neglect, not importance.
   decision_      whether a row DECLARED a classification and, for a decision,
@@ -83,6 +87,7 @@ import datetime as dt
 import json
 
 import estate_attention
+import estate_pairs
 import estate_decisions
 import estate_deps
 
@@ -98,7 +103,16 @@ TERMINAL = estate_attention.TERMINAL
 BLOCKS = "blocks"
 
 FOLLOWUP_KIND = "followup"
-PROPOSAL_KIND = "proposal"
+# There is deliberately no PROPOSAL_KIND here. The review lifecycle is keyed on
+# the `stage` COLUMN and never on `kind` — `estate proposal add --adopt-task`
+# stages an existing task "keeping its own kind and history", so a followup, an
+# inbox-message or anything else can be carrying a live review decision. A
+# constant named after the kind used to sit on this line, read by nothing, and
+# it was read BY A PERSON as though it were the panel's filter: t-660 was filed
+# and dispatched against a kind=proposal filter that has never existed anywhere
+# in this file. Adding one back would be the narrowing this comment exists to
+# prevent — `proposal_view()` below is where the rule lives, and it asks for a
+# stage.
 # t-296. One task per inbox message the hub mirrored, kind and refs written by
 # `bin/hub-intake message open`. Decoded here for the same reason the follow-up
 # envelope is: the identity of a tracked message is (channel, message_ts), and
@@ -138,7 +152,7 @@ CONTEXT_FIELDS = ("context", "intent")
 # runs again, so it is part of the identity even though the legacy tool never
 # printed it.
 FOLLOWUP_FIELDS = ("legacy_id", "source", "ref", "context", "resolution",
-                   "attention_key")
+                   "attention_key", estate_pairs.DERIVES_FROM)
 
 # The field each surface is ALREADY understood to mean, so a renderer knows
 # when to name its source and when to keep quiet. `desired_outcome` has been
@@ -205,7 +219,15 @@ def followup_view(task: dict) -> dict | None:
 
 
 def proposal_view(task: dict) -> dict | None:
-    """Normalized review record carried by a staged proposal task."""
+    """Normalized review record carried by a staged task, or None if unstaged.
+
+    THE STAGE IS THE MEMBERSHIP TEST, AND THE KIND IS NOT (t-660). A task
+    enters the review lifecycle by gaining a `stage`, which
+    `estate proposal add --adopt-task` grants in place without touching `kind`.
+    So `kind` is not consulted here and must not become a second condition: an
+    adopted follow-up carrying a real decision would drop off the proposals
+    panel the moment it did, which is the invisibility t-660 was filed about.
+    """
     stage = task.get("stage")
     if not stage:
         return None
@@ -375,6 +397,174 @@ def decision_state(refs: dict) -> tuple:
     return (INCOMPLETE, missing) if missing else (SKETCHED, [])
 
 
+# t-1742. IS THIS ROW READY TO PUT IN FRONT OF THE OWNER?
+#
+# A proposal-body audit sampled the unresolved rows in depth and found some
+# decidable exactly as stored and others that needed upstream work before a
+# decision could be asked for at all. Its recommendation was a
+# "pre-presentation readiness filter (real recommendation, current context,
+# nonterminal task)", and until now nothing derived it: `estate awaiting` had
+# no such flag and /estate.html had no such badge, so a row the owner could
+# decide in ten seconds and one nobody has finished thinking about sat in the
+# same list looking identical.
+#
+# The condition an installation will find, measured over its own open
+# `proposal`+`followup` rows: a minority carry a real recommendation, a larger
+# group carry the literal sentinel `not recorded`, and most have no
+# `recommendation` key at all.
+#
+# THIS JUDGES SHAPE, NOT QUALITY. It says whether the RECORD contains the
+# things a decision is made out of — it cannot say whether the recommendation
+# is any good, and it must never be read as saying so. That is the whole reason
+# `--ready-only` is a flag and the badge is a badge: t-721 refused a hard cap
+# on the attention set because it would have hidden nearly the whole set, and
+# a shape test silently promoted to the default view would hide rows on a
+# judgment it is not making.
+#
+#   reach         a real recommendation, a situation sentence on file, and
+#                 neither the task nor its review stage finished. Decidable as
+#                 stored.
+#   thinking      recorded, but not decidable yet — the recommendation is the
+#                 sentinel `not recorded`, or the record has been overtaken by
+#                 its own lifecycle.
+#   unclassified  no recommendation recorded at all. Not a judgment about the
+#                 work: nothing was filed to judge.
+REACH, THINKING, UNCLASSIFIED = "reach", "thinking", "unclassified"
+READINESS_STATES = (REACH, THINKING, UNCLASSIFIED)
+
+# WHICH KEY IS "THE RECOMMENDATION" HERE, AND WHY IT IS NOT THE DISPLAY
+# PRECEDENCE ABOVE
+#
+# `RECOMMENDATION_FIELDS` is a rendering rule: it falls back to
+# `desired_outcome` because the review grid has labelled that field
+# "Recommendation" since proposals existed, and a row showing one under that
+# heading is showing the reader something real. Readiness is a different
+# question — did a filer, having weighed the alternatives, record a pick — and
+# only `recommendation` answers it. `desired_outcome` is what the proposal
+# wants to be true afterwards, which nearly every proposal has; falling back
+# to it would move a large share of the open rows into `reach` on the strength
+# of a field nobody filed as a pick — several times the ready set, made of
+# records whose own recommendation key is
+# absent or says "not recorded". So this reads the contract's own key
+# (docs/decision-classification-contract.md) and nothing else.
+RECOMMENDATION_KEY = estate_decisions.RECOMMENDATION_KEY
+NOT_RECORDED = estate_decisions.NOT_RECORDED
+
+# THE SITUATION SENTENCE, and why this list is not `CONTEXT_FIELDS`
+#
+# `CONTEXT_FIELDS` is the display precedence for the one line printed under a
+# headline, and it deliberately stops at `context`/`intent`: a proposal's
+# `condition` is already surfaced as its QUESTION when no explicit `question`
+# was filed (see QUESTION_FIELDS), and listing it twice would print one
+# sentence under two labels. Readiness asks the record a different question —
+# does it say what it is about at all — and the two record shapes answer it
+# with different keys: a follow-up writes `context`, a proposal writes
+# `condition`, and `intent` is the task column a row carries instead of either.
+# Reading only the display list would have called t-395 unready, and the audit
+# judged t-395 reach.
+SITUATION_FIELDS = ("context", "condition", "intent")
+
+# A review that has ENDED. The record is then an answer on file, not a request:
+# t-460 is the audit's own case — a follow-up whose displayed question still
+# asked how a change should publish, months after the owner authorised it and
+# it merged. `pending-review` and `approved-backlog` are live and are not here.
+TERMINAL_STAGES = ("rejected", "resolved", "stopped")
+
+# The exact words each verdict is reached by, so a badge and a CLI line can say
+# WHICH clause failed rather than only that one did. Keys of the store, not
+# prose: a reader who sees `recommendation_not_recorded` knows which field to
+# open. Order of evaluation is the order below.
+NO_RECOMMENDATION = "no_recommendation_key"
+EMPTY_RECOMMENDATION = "recommendation_empty"
+SENTINEL_RECOMMENDATION = "recommendation_not_recorded"
+NO_SITUATION = "no_situation_recorded"
+TASK_TERMINAL = "task_terminal"
+STAGE_TERMINAL = "stage_terminal"
+
+
+def is_not_recorded(text: str) -> bool:
+    """Whether a stored recommendation is the "I did not pick" sentinel.
+
+    THE MATCH IS A PREFIX, AND THAT IS A READING OF THE STORE RATHER THAN OF
+    THE CONTRACT. `estate_decisions` normalizes an exact `not recorded` on
+    write and says nothing about anything longer, so an equality test is what
+    the writer guarantees. What filers actually write is the sentinel with the
+    reason attached — e.g. "not recorded -- the risk this named is real and
+    worth a second opinion before picking a shape". That is a better record
+    than the bare sentinel and it is emphatically not a pick, so reading it as
+    one would put those rows in front of the owner under a badge saying they
+    can be decided as stored, when the record's first two words say nobody
+    did.
+
+    The boundary keeps it honest: the sentinel must END there, so a
+    recommendation whose own first word merely begins with it is untouched.
+    The falsifier is a real recommendation that opens with the literal phrase
+    "not recorded" followed by punctuation — there is none on this store, and
+    one would be a filer contradicting themselves in the same field.
+    """
+    low = str(text or "").strip().lower()
+    if not low.startswith(NOT_RECORDED):
+        return False
+    return not low[len(NOT_RECORDED):].lstrip()[:1].isalnum()
+
+
+def readiness(task: dict) -> tuple:
+    """(one of the three words, the reasons it is not `reach`).
+
+    Pure, and it needs only the row: `refs`, `status`, `stage` and the `intent`
+    column. No connection, no second query, no dependency lookup — so the CLI's
+    grouped review and the dashboard snapshot run the one implementation rather
+    than two that drift, which is the same reason the t-721 clamps live here.
+
+    The reason list is empty for `reach` and names every failed clause
+    otherwise, so a row that is thinking for two reasons says both.
+
+    WHAT IT CANNOT SEE, said out loud because a filter that hides rows owes its
+    reader the boundary:
+
+      * whether a recommendation is any GOOD. It is text, and this counts it.
+      * whether the situation described is still TRUE. `t-401` carries
+        "CONFLICTS WITH t-135 ... Read them together" in its own body and
+        nothing in the store records that as a relation; a reader must still
+        read it. The lifecycle is the only currency signal the store actually
+        carries, and it is the only one used here.
+      * AGE. A row untouched for a month is a row nobody has looked at, which
+        is a fact about attention and not about the record's contents — t-721
+        already settled that age indicates neglect rather than importance, and
+        an age threshold here would demote correct rows for being old.
+    """
+    refs = decode_refs(task.get("refs"))
+    why: list[str] = []
+
+    if RECOMMENDATION_KEY not in refs:
+        # The absence rule, read back. An absent key says nothing at all, so
+        # nothing is concluded about the work — the row is unclassified and
+        # `estate proposal amend --classification` is the door that changes it.
+        return UNCLASSIFIED, [NO_RECOMMENDATION]
+    text = str(refs.get(RECOMMENDATION_KEY) or "").strip()
+    if not text:
+        # "A field present and blank is the same absence as a field that was
+        # never written" — `_first_present` above, and the contract's own
+        # "an empty value is an absence wearing a key". Same bucket, different
+        # word for it, because the two are worth telling apart when somebody
+        # goes to fix them.
+        return UNCLASSIFIED, [EMPTY_RECOMMENDATION]
+    if is_not_recorded(text):
+        why.append(SENTINEL_RECOMMENDATION)
+
+    situation, _ = _first_present(
+        dict({"intent": task.get("intent")}, **refs), SITUATION_FIELDS)
+    if not situation:
+        why.append(NO_SITUATION)
+
+    if (task.get("status") or "") in TERMINAL:
+        why.append(TASK_TERMINAL)
+    if (task.get("stage") or "") in TERMINAL_STAGES:
+        why.append(STAGE_TERMINAL)
+
+    return (REACH, []) if not why else (THINKING, why)
+
+
 def decision_surface(task: dict) -> dict:
     """What a COLLAPSED row must show: the question, the recommendation, the
     one-line context — each with the field it actually came from (t-476).
@@ -411,6 +601,7 @@ def decision_surface(task: dict) -> dict:
     context_line, context_clamped = one_line(context)
     headline, headline_clamped = clamp(task.get("title"), HEADLINE_MAX)
     state, missing = decision_state(refs)
+    ready, ready_why = readiness(task)
     return {
         "question": question, "question_field": question_field,
         "recommendation": recommendation, "recommendation_field": rec_field,
@@ -426,6 +617,11 @@ def decision_surface(task: dict) -> dict:
         "headline": headline, "headline_clamped": headline_clamped,
         "decision_state": state, "decision_missing": missing,
         "classification": refs.get(estate_decisions.CLASSIFICATION_KEY),
+        # t-1742. Whether this row is ready to be PRESENTED — a reading of the
+        # record's shape, never of its quality. It rides the surface rather
+        # than each caller's own call so `estate awaiting --ready-only` and
+        # /estate.html's badge cannot disagree about one row.
+        "readiness": ready, "readiness_why": ready_why,
     }
 
 
@@ -717,6 +913,15 @@ def build(conn, now: dt.datetime | None = None,
                 task.get("updated_at"), now)
             task["notice"] = (task["due_state"]
                               in estate_attention.NOTICE_STATES)
+        # t-1742. The readiness verdict rides every row a surface actually puts
+        # in front of the owner, which is two lists and not one: the attention
+        # set above, and the review queue — a row enters that by gaining a
+        # `stage`, never by its kind (see `proposal_view`). Both panels of /estate.html
+        # render this same key, so a proposal that is also an attention row
+        # cannot carry two answers. Two small fields on a bounded subset, not a
+        # field on every task in the store (t-1450).
+        if task["is_attention"] or task.get("stage"):
+            task["readiness"], task["readiness_why"] = readiness(task)
         by_id[task["id"]] = task
 
     # Titles resolved server-side (§ build scope step 7) so no consumer has to
@@ -748,11 +953,41 @@ def build(conn, now: dt.datetime | None = None,
     ordered = sorted((t for t in tasks if t["is_attention"]),
                      key=lambda t: estate_attention.sort_key(
                          t["due_state"], t["days_left"], t.get("seq")))
+
+    # t-1061 — a proposal and the exit follow-up derived from it are ONE
+    # question, so the set holds one row for them. The collapsed half is
+    # withheld from `attention`, from `attention_tiers` and from
+    # `attention_counts`, all three, because the whole claim is that the set
+    # the owner reads got smaller and a count that still included the hidden
+    # row would print "N of N shown" over N-1 rows — the exact failure
+    # `applyResolved` in the estate page already guards against.
+    #
+    # The withheld row STAYS IN `tasks`. Every id list in this payload indexes
+    # that array, the page's own task lookup reads it, and a collapsed row's
+    # detail is one click away on the row that absorbed it. Removing it from
+    # the store's snapshot would be hiding it, which is a different thing from
+    # collapsing it.
+    attention_pairs = estate_pairs.pair_view(
+        conn, [(t["id"], t) for t in ordered],
+        refs_of=lambda t: decode_refs(t.get("refs")),
+        present_ids={t["id"] for t in ordered})
+    collapsed = estate_pairs.collapsed_ids(attention_pairs)
+    absorbed = estate_pairs.by_proposal(attention_pairs)
+    for task in ordered:
+        # Both halves of a pair that is still two rows carry their own record;
+        # the surviving half of a collapsed pair carries the record of what it
+        # absorbed. A row with neither carries None, and None renders as no
+        # badge rather than as an empty one.
+        own = attention_pairs.get(task["id"])
+        task["derived_pairs"] = [own] if own else absorbed.get(task["id"], [])
+    ordered = [t for t in ordered if t["id"] not in collapsed]
+
     attention_counts = {state: 0 for state in estate_attention.ALL_STATES}
     for task in ordered:
         state = task["due_state"] or estate_attention.UNDATED
         attention_counts[state] = attention_counts.get(state, 0) + 1
     attention_counts["total"] = len(ordered)
+    attention_counts["collapsed"] = len(collapsed)
     attention = [t["id"] for t in ordered]
     attention_tiers = tiers(ordered)
 
@@ -767,6 +1002,10 @@ def build(conn, now: dt.datetime | None = None,
     followup_counts["total"] = len(followup_rows)
     followups = [t["id"] for t in followup_rows]
 
+    # EVERY staged task, whatever its kind (t-660). `proposal_view` returns a
+    # record for anything carrying a stage, so this list and `proposal_counts`
+    # below are computed from the one set and cannot disagree with each other:
+    # the panel's stats grid counts exactly the rows the panel renders.
     proposal_rows = [t for t in tasks if t["proposal"]]
     if proposal_rows:
         recurrences = {r["task_id"]: {"count": r["n"], "last": r["last_ts"]}
@@ -816,6 +1055,7 @@ def build(conn, now: dt.datetime | None = None,
         "attention": attention,
         "attention_counts": attention_counts,
         "attention_tiers": attention_tiers,
+        "attention_pairs": attention_pairs,
         "followups": followups,
         "followup_counts": followup_counts,
         "proposals": proposals,
