@@ -39,7 +39,10 @@ The sections answer four different questions and are ordered that way:
                 NON-TERMINAL status, which is what the old "Open" button
                 claimed and never was — it matched the literal string `open`
                 and so hid every `ready`, `claimed`, `blocked` and
-                `needs-owner` row in the estate.
+                `needs-owner` row in the estate. Searching an exact task id
+                (`t-152`, or `t152`) is a LOOKUP and not a filter: the row
+                shows whatever tab is selected (t-503). Every other query is
+                a filter and stays inside the tab.
   Projects      the operational groupings, each with counts rolled up from the
                 task rows, plus the synthetic "Unprojected work" bucket that
                 `project_id IS NULL` would otherwise render as nothing at all.
@@ -73,7 +76,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import estate_work  # noqa: E402  (path established above)
 
 CSS = r"""
-.estate-nav,.filter{color:var(--info);text-decoration:none;border:1px solid var(--edge);background:var(--surface-2);border-radius:7px;padding:7px 10px;font:inherit}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.filter.active{color:var(--accent);border-color:var(--accent)}.filter{cursor:pointer}.search{flex:1;min-width:180px;background:var(--surface-2);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:8px 10px}.estate-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.estate-stat,.subpanel{background:var(--surface-2);border:1px solid var(--hair);border-radius:9px;padding:13px}.estate-stat b,.subpanel .n{display:block;font-size:24px}.estate-stat span,.label{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.task,.row{border-bottom:1px solid var(--hair)}.task>summary,.row{display:grid;grid-template-columns:95px 110px 1fr auto;gap:12px;padding:11px 2px;font-size:12px}.task>summary{cursor:pointer;list-style:none}.task.open .status{color:var(--accent)}.task.done{opacity:.68}.details{padding:0 12px 14px 105px;color:var(--dim);font-size:11px;line-height:1.55}.id,.time{color:var(--faint);font-family:var(--mono)}.empty,.readiness{padding:25px;color:var(--faint);text-align:center}.readiness{text-align:left;line-height:1.6}.chips{display:flex;flex-wrap:wrap;gap:7px}.chipx{background:var(--surface-2);border:1px solid var(--hair);border-radius:99px;padding:5px 8px;font-size:11px}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-badge{color:var(--good);font-size:10px;text-transform:uppercase}@media(max-width:800px){.estate-grid,.split{grid-template-columns:1fr 1fr}.task>summary,.row{grid-template-columns:80px 1fr}.time{display:none}.details{padding-left:12px}}
+.estate-nav,.filter{color:var(--info);text-decoration:none;border:1px solid var(--edge);background:var(--surface-2);border-radius:7px;padding:7px 10px;font:inherit}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.filter.active{color:var(--accent);border-color:var(--accent)}.filter{cursor:pointer}.search{flex:1;min-width:180px;background:var(--surface-2);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:8px 10px}.estate-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.estate-stat,.subpanel{background:var(--surface-2);border:1px solid var(--hair);border-radius:9px;padding:13px}.estate-stat b,.subpanel .n{display:block;font-size:24px}.estate-stat span,.label{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.1em}.task,.row{border-bottom:1px solid var(--hair)}.task>summary,.row{display:grid;grid-template-columns:95px 110px 1fr auto;gap:12px;padding:11px 2px;font-size:12px}.task>summary{cursor:pointer;list-style:none}.task.open .status{color:var(--accent)}.task.done{opacity:.68}.details{padding:0 12px 14px 105px;color:var(--dim);font-size:11px;line-height:1.55}.id,.time{color:var(--faint);font-family:var(--mono)}.empty,.readiness{padding:25px;color:var(--faint);text-align:center}.readiness{text-align:left;line-height:1.6}.deep-link-state{display:none}.deep-link-state.not-found{display:block;margin:0 0 14px;padding:12px 14px;color:var(--crit,#f2594c);background:var(--surface-2);border:1px solid currentColor;border-radius:9px}.chips{display:flex;flex-wrap:wrap;gap:7px}.chipx{background:var(--surface-2);border:1px solid var(--hair);border-radius:99px;padding:5px 8px;font-size:11px}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-badge{color:var(--good);font-size:10px;text-transform:uppercase}@media(max-width:800px){.estate-grid,.split{grid-template-columns:1fr 1fr}.task>summary,.row{grid-template-columns:80px 1fr}.time{display:none}.details{padding-left:12px}}
 .memory-tabs{display:flex;gap:7px;flex-wrap:wrap;padding:12px 0}.memory-tab{font:inherit;color:var(--dim);background:var(--surface-2);border:1px solid var(--edge);border-radius:7px;padding:7px 10px;cursor:pointer}.memory-tab.active{color:var(--accent);border-color:var(--accent)}.memory-body{white-space:pre-wrap;font:12px/1.6 var(--mono);color:var(--dim);background:var(--surface-2);border:1px solid var(--hair);border-radius:9px;padding:14px;max-height:420px;overflow:auto}.event{border-bottom:1px solid var(--hair)}.event>summary{display:grid;grid-template-columns:95px 120px 1fr auto;gap:12px;padding:10px 2px;cursor:pointer;list-style:none;font-size:12px}.event-detail{padding:0 12px 14px 227px;color:var(--dim);font-size:11px;line-height:1.55}.event-detail pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .blocked{color:var(--warn,#d08a1e);font-family:var(--mono);font-size:10.5px;white-space:nowrap;border:1px solid currentColor;border-radius:99px;padding:1px 6px;margin-left:4px}.task.is-blocked .status{color:var(--warn,#d08a1e)}
 .stage{font-family:var(--mono);font-size:10.5px;white-space:nowrap;border:1px solid currentColor;border-radius:99px;padding:1px 6px;margin-left:4px;color:var(--dim)}.stage.approved-backlog{color:var(--good,#4fca6a)}.stage.pending-review{color:var(--warn,#d08a1e)}.stage.rejected,.stage.stopped{color:var(--crit,#f2594c)}.recur{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:4px}
@@ -85,8 +88,19 @@ CSS = r"""
 .hist{margin-top:9px;border-top:1px solid var(--hair);padding-top:7px}.hist>div{padding:5px 0}.history-entry{border-bottom:1px solid var(--hair)}.history-entry:last-child{border-bottom:0}.history-meta{line-height:1.5}.kv{display:grid;grid-template-columns:120px 1fr;gap:4px 12px;margin:6px 0}.kv .label{align-self:baseline}
 .md-note{font:12.5px/1.65 var(--sans);color:var(--dim);margin:8px 0;overflow-wrap:anywhere}.md-note a{color:var(--info)}.md-note h1,.md-note h2,.md-note h3,.md-note h4{color:var(--ink);line-height:1.3;margin:18px 0 8px}.md-note h1{font-size:20px}.md-note h2{font-size:17px;border-bottom:1px solid var(--hair);padding-bottom:5px}.md-note h3{font-size:14px}.md-note h4{font-size:12.5px}.md-note p{margin:8px 0}.md-note ul,.md-note ol{margin:8px 0;padding-left:24px}.md-note li{margin:4px 0}.md-note code{font-family:var(--mono);font-size:.92em;color:var(--info);background:var(--bg);border:1px solid var(--hair);border-radius:4px;padding:1px 4px}.md-note pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--hair);border-radius:7px;padding:10px;overflow:auto}.md-note pre code{border:0;padding:0;color:var(--dim)}.md-note blockquote{border-left:3px solid var(--edge);margin:10px 0;padding:2px 12px;color:var(--faint)}.md-table-wrap{overflow:auto;margin:11px 0}.md-note table{border-collapse:collapse;width:100%;font-size:11.5px}.md-note th,.md-note td{border:1px solid var(--edge);padding:7px 9px;text-align:left;vertical-align:top}.md-note th{color:var(--ink);background:var(--surface-2)}.md-note tr:nth-child(even) td{background:rgba(255,255,255,.015)}.note-preview{max-height:120px;overflow:hidden;position:relative}.note-preview::after{content:'';position:absolute;left:0;right:0;bottom:0;height:36px;background:linear-gradient(transparent,var(--surface))}.full-note-button{font:inherit;font-size:11px;color:var(--info);background:var(--surface-2);border:1px solid var(--edge);border-radius:7px;padding:6px 9px;cursor:pointer;margin:3px 0 7px}.full-note-button:hover{border-color:var(--info)}.note-dialog{width:min(1180px,calc(100vw - 80px));max-height:calc(100vh - 70px);padding:0;border:1px solid var(--edge);border-radius:12px;background:var(--surface);color:var(--ink);box-shadow:0 24px 80px rgba(0,0,0,.55)}.note-dialog::backdrop{background:rgba(0,0,0,.72)}.note-dialog-head{position:sticky;top:0;z-index:1;display:flex;gap:12px;align-items:center;padding:14px 18px;background:var(--surface-2);border-bottom:1px solid var(--edge)}.note-dialog-title{font-weight:600}.note-dialog-body{padding:12px 24px 28px}.note-close{margin-left:auto;font:inherit;color:var(--dim);background:var(--bg);border:1px solid var(--edge);border-radius:7px;padding:6px 9px;cursor:pointer}
 /* proposal-review:start */
-.proposal{border-bottom:1px solid var(--hair)}.proposal>summary{display:grid;grid-template-columns:82px 132px minmax(260px,1fr) minmax(280px,1.2fr) auto;gap:14px;padding:14px 2px;cursor:pointer;list-style:none;font-size:12px;align-items:start}.proposal-title{color:var(--ink);font-weight:600;line-height:1.45}.proposal-caption{display:block;color:var(--faint);font-size:10.5px;line-height:1.4;margin-bottom:5px}.proposal-question-text,.proposal-recommendation{color:var(--dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.proposal-question-text{color:var(--ink)}.proposal-question-text.missing,.proposal-recommendation.missing{color:var(--faint);font-style:italic}.proposal-body{padding:0 14px 18px 228px;color:var(--dim);font-size:12px}.review-grid{display:grid;grid-template-columns:1.15fr 1.15fr .8fr;gap:12px;margin:12px 0}.review-field{background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;padding:12px;white-space:pre-wrap;line-height:1.55}.review-field.recommendation{border-color:rgba(242,171,53,.35);color:var(--ink)}.review-field.missing{color:var(--faint);font-style:italic}.review-badge{font-family:var(--mono);font-size:10px;border:1px solid currentColor;border-radius:99px;padding:2px 6px;margin-left:5px;color:var(--faint);white-space:nowrap}.review-badge.incomplete{color:var(--warn)}.review-badge.recurring{color:var(--info)}.decision-box{margin-top:14px;padding:13px;border:1px solid var(--edge);border-radius:9px;background:var(--surface-2)}.decision-note{width:100%;box-sizing:border-box;min-height:62px;resize:vertical;background:var(--bg);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:9px 10px;font:12px/1.5 var(--sans);margin:7px 0 9px}.decision-actions{display:flex;gap:8px;flex-wrap:wrap}.decision{font:inherit;font-size:11px;border:1px solid var(--edge);border-radius:7px;padding:7px 10px;background:var(--bg);color:var(--ink);cursor:pointer}.decision:hover{border-color:var(--accent)}.decision.approved-backlog{color:var(--good)}.decision.rejected,.decision.stopped{color:var(--crit)}.decision.resolved{color:var(--info)}.decision[disabled]{opacity:.5;cursor:wait}.decision-status{font-size:11px;color:var(--faint);margin-left:auto;align-self:center}.decision-status.error{color:var(--crit)}.legacy-note{color:var(--warn);font-size:11px}@media(max-width:1000px){.proposal>summary{grid-template-columns:80px 125px 1fr auto}.proposal-question,.proposal-recommendation{grid-column:3}.proposal-body{padding-left:12px}}
-.sketch-note{margin:10px 0;color:var(--info);font-size:11px}.decision-sketch{margin:12px 0;border:1px solid var(--edge);border-radius:9px;padding:14px;background:var(--bg)}.decision-sketch-head{display:flex;gap:8px;align-items:center;margin-bottom:11px}.classification{font:10px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--accent);border:1px solid currentColor;border-radius:99px;padding:3px 7px}.decision-question{margin-bottom:10px;padding:2px 1px;line-height:1.55;color:var(--ink)}.decision-card-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.decision-options{display:grid;gap:10px;margin-top:10px}.decision-card{border:1px solid var(--hair);border-radius:8px;padding:11px;background:var(--surface-2);line-height:1.55;cursor:pointer;transition:border-color .14s ease,background .14s ease,transform .14s ease}.decision-card:hover,.decision-card:focus-visible{border-color:var(--accent);background:var(--surface);transform:translateY(-1px);outline:none}.decision-card.recommendation{border-top:2px solid var(--accent)}.decision-card.defer{border-top:2px solid var(--warn)}.decision-card.option-card{border-left:3px solid var(--info)}@media(max-width:700px){.decision-card-row{grid-template-columns:1fr}}
+.proposal{border-bottom:1px solid var(--hair)}.proposal>summary{display:grid;grid-template-columns:82px 132px minmax(260px,1fr) minmax(280px,1.2fr) auto;gap:14px;padding:14px 2px;cursor:pointer;list-style:none;font-size:12px;align-items:start}.proposal-title{color:var(--ink);font-weight:600;line-height:1.45}.proposal-caption{display:block;color:var(--faint);font-size:10.5px;line-height:1.4;margin-bottom:5px}.proposal-question-text,.proposal-recommendation{color:var(--dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.proposal-question-text{color:var(--ink)}.proposal-question-text.missing,.proposal-recommendation.missing{color:var(--faint);font-style:italic}.proposal-body{padding:0 14px 18px 228px;color:var(--dim);font-size:12px}.review-grid{display:grid;grid-template-columns:1.15fr 1.15fr .8fr;gap:12px;margin:12px 0}.review-field{background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;padding:12px;white-space:pre-wrap;line-height:1.55}.review-field.recommendation{border-color:rgba(242,171,53,.35);color:var(--ink)}.review-field.missing{color:var(--faint);font-style:italic}.review-badge{font-family:var(--mono);font-size:10px;border:1px solid currentColor;border-radius:99px;padding:2px 6px;margin-left:5px;color:var(--faint);white-space:nowrap}.review-badge.incomplete{color:var(--warn)}.review-badge.recurring{color:var(--info)}.review-badge.kind{color:var(--accent)}.decision-box{margin-top:14px;padding:13px;border:1px solid var(--edge);border-radius:9px;background:var(--surface-2)}.decision-note{width:100%;box-sizing:border-box;min-height:62px;resize:vertical;background:var(--bg);color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:9px 10px;font:12px/1.5 var(--sans);margin:7px 0 9px}.decision-actions{display:flex;gap:8px;flex-wrap:wrap}.decision{font:inherit;font-size:11px;border:1px solid var(--edge);border-radius:7px;padding:7px 10px;background:var(--bg);color:var(--ink);cursor:pointer}.decision:hover{border-color:var(--accent)}.decision.approved-backlog{color:var(--good)}.decision.rejected,.decision.stopped{color:var(--crit)}.decision.resolved{color:var(--info)}.decision[disabled]{opacity:.5;cursor:wait}.decision-status{font-size:11px;color:var(--faint);margin-left:auto;align-self:center}.decision-status.error{color:var(--crit)}.legacy-note{color:var(--warn);font-size:11px}@media(max-width:1000px){.proposal>summary{grid-template-columns:80px 125px 1fr auto}.proposal-question,.proposal-recommendation{grid-column:3}.proposal-body{padding-left:12px}}
+/* t-1742 — the readiness badge, on both surfaces that list rows awaiting
+   the owner. Inside the proposal-review span on purpose: lib/dashboard_primary
+   slices exactly this range for `/`'s proposal panel, and a badge whose
+   colours lived outside it would render unstyled on one of the two pages.
+   Self-contained for the same reason — `.pill`'s own declarations are not in
+   the slice. `reach` is the only one that reads as a green light, and it is a
+   claim about the record's SHAPE and not its worth. The other two are
+   deliberately not alarms: `thinking` is amber because somebody still owes
+   the record something, and `unclassified` stays muted because a row nobody
+   classified is a gap in the filing, not a fault in the work. */
+.readiness-badge{font-family:var(--mono);font-size:10.5px;white-space:nowrap;border:1px solid var(--hair);border-radius:99px;padding:1px 6px;margin-left:4px;color:var(--faint)}.readiness-badge.reach{color:var(--good,#4fca6a);border-color:currentColor}.readiness-badge.thinking{color:var(--warn,#d08a1e);border-color:currentColor}
+.sketch-note{margin:10px 0;color:var(--info);font-size:11px}.decision-sketch{margin:12px 0;border:1px solid var(--edge);border-radius:9px;padding:14px;background:var(--bg)}.decision-sketch-head{display:flex;gap:8px;align-items:center;margin-bottom:11px}.classification{font:10px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--accent);border:1px solid currentColor;border-radius:99px;padding:3px 7px}.decision-question{margin-bottom:10px;padding:2px 1px;line-height:1.55;color:var(--ink)}.decision-card-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.decision-options{display:grid;gap:10px;margin-top:10px}.decision-card{border:1px solid var(--hair);border-radius:8px;padding:11px;background:var(--surface-2);line-height:1.55;cursor:pointer;transition:border-color .14s ease,background .14s ease,transform .14s ease}.decision-card:hover,.decision-card:focus-visible{border-color:var(--accent);background:var(--surface);transform:translateY(-1px);outline:none}.decision-card.recommendation{border-top:2px solid var(--accent)}.decision-card.defer{border-top:2px solid var(--warn)}.decision-card.option-card{border-left:3px solid var(--info)}.decision-card.picked{border-color:var(--good);background:var(--surface);box-shadow:inset 3px 0 0 var(--good)}.decision-card.picked>.label{color:var(--good)}.choice-hint{font:10px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--warn);margin-left:auto}@media(max-width:700px){.decision-card-row{grid-template-columns:1fr}}
 /* proposal-review:end */
 /* t-721 — the attention row. The clamp that keeps these lines short is
    server-side (lib/estate_work.HEADLINE_MAX / CONTEXT_LINE_MAX): a CSS
@@ -98,6 +112,11 @@ CSS = r"""
 .attention-decision{display:block;margin-top:4px;color:var(--dim);font-size:11.5px;line-height:1.5}.attention-decision .label{margin-right:5px}
 .idle{font-family:var(--mono);font-size:10.5px;white-space:nowrap;border:1px solid var(--hair);border-radius:99px;padding:1px 6px;margin-left:4px;color:var(--faint)}.idle.above{color:var(--warn,#d08a1e);border-color:currentColor}
 .pill.decision-unstated{color:var(--warn,#d08a1e);border-color:currentColor}.pill.decision-incomplete{color:var(--info);border-color:currentColor}
+/* t-1061. `collapsed` is informational — this row absorbed another and the
+   set got smaller. `diverged` is a warning colour on purpose: two rows that
+   name each other and stayed apart is a thing a reader should look at, not a
+   thing the page should make comfortable. */
+.pill.collapsed{color:var(--info);border-color:currentColor}.pill.diverged{color:var(--warn,#d08a1e);border-color:currentColor}
 .tier{border-top:1px solid var(--edge);padding-top:4px;margin-top:12px}.tier:first-child{border-top:0;margin-top:0}
 .tier-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:9px 2px 5px}.tier-title{color:var(--ink);font-size:12px;font-weight:600}.tier-count{font-family:var(--mono);font-size:10.5px;color:var(--dim)}.tier-count.partial{color:var(--warn,#d08a1e)}.tier-note{font-size:10.5px;color:var(--faint)}
 """
@@ -108,7 +127,9 @@ PROPOSAL_CSS = CSS.split("/* proposal-review:start */", 1)[1].split(
     "/* proposal-review:end */", 1)[0]
 
 JS_HEAD = r"""(function(){
-var DATA={},FILTER='active',KIND_FILTER='',PROJECT_FILTER='',ATTN_FILTER='all',ATTN_HISTORY=false,DEP_FILTER='all',PROPOSAL_STAGE='pending-review',MEMORY_SCOPE='shared',MEMORY_SCROLL=0,OPEN_TASKS={},OPEN_EVENTS={},OPEN_PROJECTS={},OPEN_PROPOSALS={},DECISION_NOTES={},RESOLVE_NOTES={},INDEX={},EVENT_INDEX={};
+var DATA={},FILTER='active',KIND_FILTER='',PROJECT_FILTER='',ATTN_FILTER='all',ATTN_HISTORY=false,DEP_FILTER='all',PROPOSAL_STAGE='pending-review',MEMORY_SCOPE='shared',MEMORY_SCROLL=0,OPEN_TASKS={},OPEN_EVENTS={},OPEN_PROJECTS={},OPEN_PROPOSALS={},DECISION_NOTES={},DECISION_CHOICES={},RESOLVE_NOTES={},INDEX={},EVENT_INDEX={};
+function deepLinkQuery(){try{var p=new URLSearchParams(window.location.search),task=p.get('task'),project=p.get('project');if(task)return {kind:'task',requested:task.toLowerCase()};if(project)return {kind:'project',requested:project.toLowerCase()}}catch(_){}return null}
+var DEEP_LINK=deepLinkQuery(),DEEP_LINK_PENDING=!!DEEP_LINK;
 // The task lifecycle's two terminal statuses. Mirrors bin/estate's TERMINAL
 // and lib/estate_work's; "Active" on this page means NOT one of these, which
 // is the whole correction — the old button matched the literal string 'open'
@@ -125,11 +146,6 @@ function stamp(v){if(!v)return '—';var s=String(v),utc=/(\+00:00|Z)$/.test(s);
 function stats(c,names){return '<div class="estate-grid">'+names.map(function(k){return '<div class="estate-stat"><b>'+e((c||{})[k]||0)+'</b><span>'+e(k)+'</span></div>'}).join('')+'</div>'}
 function rows(a,fn,msg){return a&&a.length?'<div class="estate-list">'+a.map(fn).join('')+'</div>':'<div class="empty">'+msg+'</div>'}
 function terminal(t){return TERMINAL.indexOf(t&&t.status)>=0}
-// P-16: a task's drill-down is its COMPLETE history, served pre-grouped from
-// the events table by `estate events`' own query surface. The filter over
-// DATA.events is only a fallback for a snapshot written before task_events
-// existed — that path shows a tail, which is the bug this replaced.
-function taskEvents(id){var m=DATA.task_events;if(m&&m[id])return m[id];if(m)return [];return (DATA.events||[]).filter(function(v){return v.task_id===id})}
 function task(id){return INDEX[id]}
 function taskTitle(id){var t=INDEX[id];return t?t.title:''}
 function pretty(v){if(!v)return '';try{return JSON.stringify(typeof v==='string'?JSON.parse(v):v,null,2)}catch(_){return typeof v==='string'?v:JSON.stringify(v,null,2)}}
@@ -157,7 +173,12 @@ function stageBadge(t){return t.stage?'<span class="stage '+e(t.stage)+'" title=
 // second row for a fingerprint already on file — it records one of these on
 // the existing task instead, so the count IS how many times the condition
 // came back after it was first proposed.
-function recurBadge(t){if(!t.stage)return '';var n=taskEvents(t.id).filter(function(v){return v.summary==='condition observed again'}).length;return n?'<span class="recur" title="condition observed again since it was filed">↻ '+e(n)+'</span>':''}
+// The count is the SERVER's (lib/estate_work.build's `recurrences` subquery),
+// not a re-count of an embedded event list. It is the same number
+// `proposalRow` has always printed in its kv grid, so the badge and the body
+// can no longer disagree — and a collapsed badge must never depend on a
+// drill-down that is now fetched (t-1450).
+function recurBadge(t){if(!t.stage)return '';var n=((t.proposal||{}).recurrences)||0;return n?'<span class="recur" title="condition observed again since it was filed">↻ '+e(n)+'</span>':''}
 // P-07: `due_state` is DERIVED server-side against one instant under one
 // explicit notice interval, never stored — a deadline arriving changes no row.
 // A terminal task carries no state at all: its deadline is history, and
@@ -210,13 +231,26 @@ var ctxRow=(ctx&&ctx!==shownContext)?kv(shownContext?'decision context':'context
 var kvs=kv('question',r.question)+recRow+kv('if deferred',r.defer_consequence)+ctxRow;
 var alts=decisionAlternatives(r);
 return '<div class="decision-sketch"><div class="decision-sketch-head"><span class="label">classification</span><span class="classification">'+e(c)+'</span></div>'+(kvs?'<div class="kv">'+kvs+'</div>':'')+(alts.length?'<div class="decision-options">'+alts.map(alternativeCard).join('')+'</div>':'')+'</div>'}
-function taskDetails(t){var refs=pretty(t.refs),f=t.followup;
-return '<div class="details"><div class="kv">'+kv('kind',t.kind)+kv('status',t.status)+kv('project',t.project_id?(t.project_title||'')+' ('+t.project_id+')':'unprojected')+kv('lane',t.lane)+kv('review stage',t.stage)+kv('created by',t.created_by)+kv('created',stamp(t.created_at)+' · '+age(t.created_at))+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('closed',t.closed_at?stamp(t.closed_at):'')+kv('claimed by',t.claimed_by)+kv('lease expires',t.claim_expires_at)+kv('due',t.due_at?stamp(t.due_at)+' ('+(t.due_state||'terminal')+')':'')+kv('intent',t.intent)+'</div>'
+// t-1450 — ONE patch point. The body is re-rendered in place when
+// /estate-detail answers, so the wrapper carries the id and nothing else.
+function taskDetails(t){return '<div class="details" data-detail="'+e(t.id)+'">'+taskBody(t)+'</div>'}
+// The row the snapshot carries, MERGED with whatever the endpoint has
+// returned for it. Two things are deliberately withheld until it has: the raw
+// refs dump and the decision block derived from it, because both are absent
+// from the periodic payload now and rendering their absence would read as
+// "nothing was recorded" — the same silent-empty failure P-16 caught in the
+// history. A `summary_only` row (a terminal task nothing else in the snapshot
+// points at) carries only its collapsed fields, so its whole body waits
+// rather than showing a grid of blanks.
+function taskBody(t){var loaded=detailLoaded(t.id);
+if(t.summary_only&&!loaded)return '<div class="empty">'+e(detailNote(t.id))+'</div>';
+var m=detailRow(t),f=m.followup,refs=loaded?pretty(m.refs):'';
+return '<div class="kv">'+kv('kind',m.kind)+kv('status',m.status)+kv('project',m.project_id?(m.project_title||'')+' ('+m.project_id+')':'unprojected')+kv('lane',m.lane)+kv('review stage',m.stage)+kv('created by',m.created_by)+kv('created',stamp(m.created_at)+' · '+age(m.created_at))+kv('updated',stamp(m.updated_at)+' · '+age(m.updated_at))+kv('closed',m.closed_at?stamp(m.closed_at):'')+kv('claimed by',m.claimed_by)+kv('lease expires',m.claim_expires_at)+kv('due',m.due_at?stamp(m.due_at)+' ('+(m.due_state||'terminal')+')':'')+kv('intent',m.intent)+'</div>'
 +(f?'<div class="kv">'+kv('follow-up',f.legacy_id)+kv('state',f.state)+kv('source',f.source)+kv('ref',f.ref)+kv('context',f.context)+kv('resolution',f.resolution)+kv('attention key',f.attention_key)+kv('resolved at',f.resolved_at?stamp(f.resolved_at):'')+'</div>':'')
-+decisionBlock(t,f&&f.context?String(f.context).trim():'')
-+relatedLine('blocked by',blockedBy(t),t.blocked_by_titles)+relatedLine('blocks',t.blocks,t.blocks_titles)
-+(refs&&refs!=='{}'?'<div><span class="label">refs</span><pre>'+e(refs)+'</pre></div>':'')
-+history(taskEvents(t.id),'No events recorded for this task.')+'</div>'}
++(loaded?decisionBlock(m,f&&f.context?String(f.context).trim():''):'')
++relatedLine('blocked by',blockedBy(m),m.blocked_by_titles)+relatedLine('blocks',m.blocks,m.blocks_titles)
++(loaded&&refs&&refs!=='{}'?'<div><span class="label">refs</span><pre>'+e(refs)+'</pre></div>':'')
++historySlot(t.id,'No events recorded for this task.')}
 function taskRow(t){var b=blockedBy(t);return '<details data-task="'+e(t.id)+'" class="task '+e(t.status)+(b.length?' is-blocked':'')+'"'+(OPEN_TASKS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+'</span><span class="status">'+e(t.status)+'</span><span>'+e(t.title)+' '+legacyBadge(t)+blockedBadge(t)+stageBadge(t)+recurBadge(t)+dueBadge(t)+projectBadge(t)+'</span><span>'+e(age(t.updated_at))+'</span></summary>'+taskDetails(t)+'</details>'}
 function haystack(t){var f=t.followup||{};return (t.id+' '+t.title+' '+t.kind+' '+(t.stage||'')+' '+(t.lane||'')+' '+(t.intent||'')+' '+(t.claimed_by||'')+' '+(t.project_id||'')+' '+(t.project_title||'')+' '+(f.legacy_id||'')+' '+(f.source||'')+' '+(f.ref||'')+' '+(f.context||'')).toLowerCase()}
 // "Active" is every NON-TERMINAL status. `blocked` and `attention` are cuts
@@ -224,8 +258,107 @@ function haystack(t){var f=t.followup||{};return (t.id+' '+t.title+' '+t.kind+' 
 // fact about a task's neighbours and being attention is a fact about who is
 // waiting, and neither is stored on the row.
 function matchesFilter(t){if(FILTER==='all')return true;if(FILTER==='active')return !terminal(t);if(FILTER==='blocked')return blockedBy(t).length>0;if(FILTER==='attention')return !!t.is_attention;if(FILTER==='terminal')return terminal(t);return t.status===FILTER}
-function drawTasks(){var q=(document.getElementById('search').value||'').toLowerCase();var a=(DATA.tasks||[]).filter(function(t){return matchesFilter(t)&&(!KIND_FILTER||t.kind===KIND_FILTER)&&(!PROJECT_FILTER||(PROJECT_FILTER==='unprojected'?!t.project_id:t.project_id===PROJECT_FILTER))&&(!q||haystack(t).indexOf(q)>=0)});document.getElementById('task-count').textContent=a.length+' shown';document.getElementById('tasks').innerHTML=rows(a,taskRow,'No matching tasks.')}
+// t-503. A status tab is a filter over the POOL; an exact task id is a LOOKUP
+// of one row somebody already knows exists. Answering a lookup with "No
+// matching tasks." reads as "there is no such task" when it means "not in this
+// tab" — and the tab defaults to Active, which excludes done and dropped, so
+// the rows most often looked up by id are exactly the ones that answered
+// nothing. `t152` counts as the id `t-152`: the hyphen is punctuation, and
+// nobody typing an id into a box types it the same way twice.
+function idQuery(q){var m=/^\s*t-?(\d+)\s*$/.exec(q);return m?'t-'+m[1]:''}
+function drawTasks(){var q=(document.getElementById('search').value||'').toLowerCase();var id=idQuery(q);var a=(DATA.tasks||[]).filter(function(t){if(id&&t.id===id)return true;return matchesFilter(t)&&(!KIND_FILTER||t.kind===KIND_FILTER)&&(!PROJECT_FILTER||(PROJECT_FILTER==='unprojected'?!t.project_id:t.project_id===PROJECT_FILTER))&&(!q||haystack(t).indexOf(q)>=0)});document.getElementById('task-count').textContent=a.length+' shown';document.getElementById('tasks').innerHTML=rows(a,taskRow,'No matching tasks.')}
 """
+
+# ── the drill-down, fetched rather than embedded (t-1450) ────────────────────
+#
+# Shared with the primary page's proposal panel, which embeds this constant
+# byte-for-byte the way it already embeds JS_PROPOSALS — one implementation of
+# the fetch, the cache and the three-state rendering rather than two that
+# drift.
+#
+# WHY. dashboard.json embedded a full per-task event join over every task ever
+# created plus every row's raw `refs` — 7.8MB of a 10.3MB `estate_activity`,
+# rewritten every 45 seconds and refetched whole by every open tab every 30,
+# to be read by nobody unless somebody opened that exact row. The snapshot
+# now carries the COLLAPSED row; opening one asks `GET /estate-detail` for the
+# rest.
+#
+# AND WHY THIS IS NOT THE TRUNCATION P-16 CAUGHT. That earlier fix answered
+# "what happened to this task" out of the snapshot's 80-row recent-events
+# tail, and silently emptied the history of every task whose events had
+# scrolled off it. Nothing here answers that question from a smaller set: the
+# endpoint reads the authoritative events table through the same
+# `estate_events.select` query surface `bin/estate events` uses, and returns
+# the row's history WHOLE however old the task is. What is bounded is the
+# periodic payload; the answer is not.
+#
+# So the three states are kept apart on purpose (docs/absence-contract.md) —
+# rows in hand, a fetch pending or failed, and a store that cannot link events
+# to tasks at all — and only the first may ever render "No events recorded".
+JS_DETAIL = r"""
+var DETAIL={},DETAIL_PENDING={},PINDEX={};
+// The identity a cached drill-down is FOR. A row's `updated_at` moves on
+// every event written against it, so comparing it is how a cached history
+// stops being current the moment the task does — with no polling for it.
+function detailStamp(id){var t=INDEX[id]||PINDEX[id];if(!t)return '';return String(t.updated_at||(t.rollup&&t.rollup.last_activity)||'')}
+function detailRow(t){var d=DETAIL[t.id];return (d&&d.row)||t}
+function detailLoaded(id){var d=DETAIL[id];return !!(d&&d.rows)}
+// Rows when we have them, null when we do not. NEVER [] for "not fetched yet"
+// — telling those two apart is the whole point. The last two branches are the
+// legacy readers: a snapshot written before t-1450 embeds the map, and one
+// written before task_events existed at all has only the tail.
+function taskEvents(id){var m=DATA.task_events;if(m&&m[id])return m[id];var d=DETAIL[id];if(d&&d.rows)return d.rows;if(DATA.task_events_source)return null;if(m)return [];return (DATA.events||[]).filter(function(v){return v.task_id===id})}
+function detailNote(id){var d=DETAIL[id];if(d&&d.why)return d.why;if(DATA.task_events_source==='unavailable')return 'This estate store cannot link events to tasks, so there is no history to read.';return 'Loading…'}
+function pendingHistory(id,msg){return '<div class="hist" data-history="'+e(id)+'" data-history-empty="'+e(msg)+'"><span class="label">history</span><div>'+e(detailNote(id))+'</div></div>'}
+// Every drill-down history goes through this slot: rendered history once the
+// rows are in hand, a stated pending/failed line otherwise. `history()` stays
+// each page's own, so the estate page keeps its note dialog and the primary
+// page keeps its one-line entries.
+function historySlot(id,msg){var rows=taskEvents(id);return rows?history(rows,msg):pendingHistory(id,msg)}
+// EVENT_INDEX is rebuilt from the SNAPSHOT on every refresh, and a fetched
+// drill-down's rows are not in the snapshot — so they are folded back in here
+// after each rebuild. Without this the "Read full note" button in a row that
+// is still open goes dead 30 seconds after the row was fetched: the button
+// re-renders from the cache, and the index it looks its `seq` up in no longer
+// has it.
+function reindexDetailEvents(){Object.keys(DETAIL).forEach(function(id){(DETAIL[id].rows||[]).forEach(function(v){EVENT_INDEX[v.seq]=v})})}
+function ensureDetail(id){
+  if(!id||DETAIL_PENDING[id])return;
+  var want=detailStamp(id),d=DETAIL[id];
+  if(d&&d.stamp===want)return;
+  DETAIL_PENDING[id]=true;
+  var q=(id.charAt(0)==='p'?'project=':'task=')+encodeURIComponent(id);
+  fetch('estate-detail?'+q,{cache:'no-store'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json()}).then(function(x){
+    delete DETAIL_PENDING[id];
+    // `available:false` is the store saying it could not answer. Recorded as
+    // a reason to render, never as an empty history.
+    if(x&&x.available===false){DETAIL[id]={stamp:want,rows:null,row:null,why:x.why||'The estate store could not be read.'};patchDetail(id);return}
+    var rows=(x&&x.events)||[];
+    rows.forEach(function(v){EVENT_INDEX[v.seq]=v});
+    DETAIL[id]={stamp:want,rows:rows,row:(x&&x.task)||null};
+    patchDetail(id)}).catch(function(err){
+    delete DETAIL_PENDING[id];
+    DETAIL[id]={stamp:want,rows:null,row:null,why:'This row’s detail could not be loaded: '+err.message};
+    patchDetail(id)})}
+// Patched in PLACE, not by redrawing the list: the row is open because the
+// reader just opened it, and a redraw would shut it again.
+function patchDetail(id){
+  var t=INDEX[id];
+  if(t&&typeof taskBody==='function')Array.prototype.forEach.call(document.querySelectorAll('[data-detail="'+id+'"]'),function(node){node.innerHTML=taskBody(t)});
+  Array.prototype.forEach.call(document.querySelectorAll('[data-history="'+id+'"]'),function(node){
+    var rows=taskEvents(id),msg=node.getAttribute('data-history-empty')||'No events recorded.';
+    node.outerHTML=rows?history(rows,msg):pendingHistory(id,msg)})}
+// `toggle` does not bubble, so this listens in the capture phase — one
+// listener for the page rather than a handler re-bound to every row on every
+// 30-second redraw.
+function installDetailWiring(){document.addEventListener('toggle',function(ev){var el=ev.target;if(!el||!el.open||!el.getAttribute)return;var id=el.getAttribute('data-task')||el.getAttribute('data-proposal')||el.getAttribute('data-project');if(id)ensureDetail(id)},true)}
+// A redraw re-creates an already-open row with its `open` attribute set, and
+// parsing that fires no toggle event — so every row a snapshot rendered open
+// asks again. A cached, still-current drill-down makes that free.
+function openDetailSets(){var out=[];if(typeof OPEN_TASKS!=='undefined')out.push(OPEN_TASKS);if(typeof OPEN_PROPOSALS!=='undefined')out.push(OPEN_PROPOSALS);if(typeof OPEN_PROJECTS!=='undefined')out.push(OPEN_PROJECTS);return out}
+function ensureOpenDetails(){var m={};openDetailSets().forEach(function(s){Object.keys(s||{}).forEach(function(k){m[k]=true})});Object.keys(m).forEach(function(k){ensureDetail(k)})}
+"""
+
 
 JS_ATTENTION = r"""
 // §5.3 A — what is waiting on a PERSON. The set is a query the server already
@@ -338,7 +471,18 @@ t.status=result.status||'done';t.is_attention=false;t.due_state=null;t.closed_at
 if(t.followup){t.followup.state='resolved';t.followup.resolution=result.resolution;t.followup.resolved_at=result.resolved_at}
 var ids=DATA.attention||[],at=ids.indexOf(t.id);if(at>=0)ids.splice(at,1);
 (DATA.attention_tiers||[]).forEach(function(tier){var i=(tier.ids||[]).indexOf(t.id);if(i>=0){tier.ids.splice(i,1);tier.total=Math.max(0,(tier.total||0)-1)}})}
-function attentionRow(t,tier){var b=blockedBy(t);return '<details data-task="'+e(t.id)+'" class="task '+e(t.status)+(b.length?' is-blocked':'')+'"'+(OPEN_TASKS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+legacyBadge(t)+'</span><span class="status">'+e(t.status)+'</span><span>'+headline(t)+' '+dueBadge(t)+blockedBadge(t)+decisionBadge(t)+idleBadge(t,tier)+projectBadge(t)+sourceBadge(t)+attentionBody(t)+'</span><span>'+e(age(t.updated_at))+'</span></summary>'+taskDetails(t)+resolveBox(t)+'</details>'}
+// t-1061 — the pair badge. A `collapsed` record on a proposal names the
+// follow-up half this row absorbed, which is the honest version of a row that
+// silently got fewer neighbours; a `diverged` record on EITHER half says the
+// two are linked and still separate, and says why, so "these look like
+// duplicates" is answered on the page rather than in somebody's head. The
+// server decided all of it (lib/estate_pairs.py); nothing here classifies.
+function pairBadge(t){return (t.derived_pairs||[]).map(function(p){
+var cls=p.verdict==='collapsed'?'pill collapsed':'pill diverged';
+var text=p.verdict==='collapsed'?('+'+p.followup+' collapsed'):
+ (p.verdict==='diverged'?('⚯ '+p.proposal+'/'+p.followup+' diverged'):('⚯ '+p.proposal+' not in view'));
+return '<span class="'+cls+'" title="'+e(p.reason||'')+'">'+e(text)+'</span>'}).join('')}
+function attentionRow(t,tier){var b=blockedBy(t);return '<details data-task="'+e(t.id)+'" class="task '+e(t.status)+(b.length?' is-blocked':'')+'"'+(OPEN_TASKS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+legacyBadge(t)+'</span><span class="status">'+e(t.status)+'</span><span>'+headline(t)+' '+dueBadge(t)+blockedBadge(t)+decisionBadge(t)+readinessBadge(t)+pairBadge(t)+idleBadge(t,tier)+projectBadge(t)+sourceBadge(t)+attentionBody(t)+'</span><span>'+e(age(t.updated_at))+'</span></summary>'+taskDetails(t)+resolveBox(t)+'</details>'}
 // t-721, P4 resolved UNCAPPED. Typed lifecycle tiers, every row rendered,
 // and BOTH counts on every section head — what is on screen after the filter,
 // and what the tier actually holds. A hard budget of five to seven was the
@@ -397,9 +541,16 @@ function projectEvents(id){var m=DATA.project_events;return (m&&m[id])||[]}
 // no project" has no history of its own, and composing one would just re-print
 // most of the estate's ledger under a heading that claims otherwise. Each of
 // its tasks still carries its own.
-function projectHistory(p){if(p.unprojected)return null;var seen={},out=projectEvents(p.id).slice();out.forEach(function(v){seen[v.seq]=true});(p.rollup.task_ids||[]).forEach(function(id){taskEvents(id).forEach(function(v){if(!seen[v.seq]){seen[v.seq]=true;out.push(v)}})});out.sort(function(a,b){return (a.seq||0)-(b.seq||0)});return out}
+// t-1450: the tasks' half arrives from `GET /estate-detail?project=p-N`,
+// whose `project` filter returns every row naming the project — the project's
+// own AND its tasks' — in one indexed read. The snapshot's `project_events`
+// is still the project's own authoritative rows and still unions in first;
+// the seq dedup is doing exactly the job §4.10 gave it, now that the two
+// sides genuinely overlap. Null until the fetch lands, so a pending project
+// history is never rendered as an empty one.
+function projectHistory(p){if(p.unprojected)return null;var fetched=taskEvents(p.id);if(!fetched)return null;var seen={},out=projectEvents(p.id).slice();out.forEach(function(v){seen[v.seq]=true});fetched.forEach(function(v){if(!seen[v.seq]){seen[v.seq]=true;out.push(v)}});out.sort(function(a,b){return (a.seq||0)-(b.seq||0)});return out}
 function projectRow(p){var r=p.rollup||{},cls=p.unprojected?'grouping':(p.missing?'missing':'');
-return '<details data-project="'+e(p.id)+'" class="task"'+(OPEN_PROJECTS[p.id]?' open':'')+'><summary><span class="id">'+e(p.id)+'</span><span class="status">'+e(p.status)+'</span><span>'+e(p.title)+(cls?'<span class="pill '+e(cls)+'">'+e(p.unprojected?'grouping':'unknown project')+'</span>':'')+'<span class="pill">'+e(r.open||0)+' open</span><span class="pill">'+e(r.terminal||0)+' terminal</span>'+((r.blocked||0)?'<span class="blocked">⛔ '+e(r.blocked)+' blocked</span>':'')+((r.attention||0)?'<span class="due due_soon">'+e(r.attention)+' attention</span>':'')+((r.overdue||0)?'<span class="due overdue">'+e(r.overdue)+' overdue</span>':'')+'</span><span>'+e(age(r.last_activity))+'</span></summary><div class="details"><div class="kv">'+kv('kind',p.kind)+kv('external key',p.external_key)+kv('created by',p.created_by)+kv('created',p.created_at?stamp(p.created_at)+' · '+age(p.created_at):'')+kv('closed',p.closed_at?stamp(p.closed_at):'')+kv('tasks',r.tasks||0)+kv('last task activity',r.last_activity?stamp(r.last_activity)+' · '+age(r.last_activity):'')+'</div><div class="chips">'+chips(r.by_status)+'</div><div class="chips" style="padding-top:6px">'+chips(r.by_kind)+'</div><div style="padding-top:9px"><span class="label">tasks</span> '+((r.task_ids||[]).length?(r.task_ids||[]).map(function(i){var t=task(i);return e(i)+(t?' ('+e(t.status)+') '+e(t.title):'')}).join('<br>'):'none')+'</div>'+(projectHistory(p)?history(projectHistory(p),'No events recorded for this project.'):'<div class="hist"><span class="label">history</span><div>Work that belongs to no project has no history of its own — each task above carries its own.</div></div>')+'</div></details>'}
+return '<details data-project="'+e(p.id)+'" class="task"'+(OPEN_PROJECTS[p.id]?' open':'')+'><summary><span class="id">'+e(p.id)+'</span><span class="status">'+e(p.status)+'</span><span>'+e(p.title)+(cls?'<span class="pill '+e(cls)+'">'+e(p.unprojected?'grouping':'unknown project')+'</span>':'')+'<span class="pill">'+e(r.open||0)+' open</span><span class="pill">'+e(r.terminal||0)+' terminal</span>'+((r.blocked||0)?'<span class="blocked">⛔ '+e(r.blocked)+' blocked</span>':'')+((r.attention||0)?'<span class="due due_soon">'+e(r.attention)+' attention</span>':'')+((r.overdue||0)?'<span class="due overdue">'+e(r.overdue)+' overdue</span>':'')+'</span><span>'+e(age(r.last_activity))+'</span></summary><div class="details"><div class="kv">'+kv('kind',p.kind)+kv('external key',p.external_key)+kv('created by',p.created_by)+kv('created',p.created_at?stamp(p.created_at)+' · '+age(p.created_at):'')+kv('closed',p.closed_at?stamp(p.closed_at):'')+kv('tasks',r.tasks||0)+kv('last task activity',r.last_activity?stamp(r.last_activity)+' · '+age(r.last_activity):'')+'</div><div class="chips">'+chips(r.by_status)+'</div><div class="chips" style="padding-top:6px">'+chips(r.by_kind)+'</div><div style="padding-top:9px"><span class="label">tasks</span> '+((r.task_ids||[]).length?(r.task_ids||[]).map(function(i){var t=task(i);return e(i)+(t?' ('+e(t.status)+') '+e(t.title):'')}).join('<br>'):'none')+'</div>'+(p.unprojected?'<div class="hist"><span class="label">history</span><div>Work that belongs to no project has no history of its own — each task above carries its own.</div></div>':(projectHistory(p)?history(projectHistory(p),'No events recorded for this project.'):pendingHistory(p.id,'No events recorded for this project.')))+'</div></details>'}
 function drawProjects(){var list=DATA.projects||[];document.getElementById('project-stats').innerHTML='<div class="chips">'+(chips(DATA.project_counts)||'<span class="chipx">no projects on file</span>')+'</div>';document.getElementById('projects').innerHTML=rows(list,projectRow,'No projects and no unprojected work.')}
 """
 
@@ -422,6 +573,20 @@ document.getElementById('dep-stats').innerHTML='<div class="chips">'+(chips(DATA
 document.getElementById('deps').innerHTML=rows(list,edgeRow,'No matching relationships.')}
 """
 
+# t-476's table, resolved HERE — at the block that declares the variable, not
+# at each page that embeds the block. The substitution used to live on `JS`
+# alone, and `JS_PROPOSALS` is embedded byte-for-byte by lib/dashboard_primary
+# as well: from 2026-08-12 the `/` page shipped a literal
+# `var SURFACE_CANONICAL=__SURFACE_CANONICAL__;`, which is valid syntax and a
+# ReferenceError the moment the panel's IIFE runs. Everything after that line
+# — `install()`, the `ops-dashboard-data` listener, `drawProposals` — never
+# executed, so `/`'s Proposal review panel rendered NOTHING for six days and
+# said nothing about it. t-193 was staged the following day. A placeholder that
+# one of two embedders remembers to fill is the drift this file's own comments
+# keep warning about, so there is now one substitution and no way to forget it.
+_SURFACE_CANONICAL_JSON = json.dumps(estate_work.SURFACE_CANONICAL,
+                                     sort_keys=True)
+
 JS_PROPOSALS = r"""
 var PROPOSAL_TRANSITIONS={
  'pending-review':['approved-backlog','rejected','resolved','stopped'],
@@ -430,6 +595,36 @@ var PROPOSAL_TRANSITIONS={
  'stopped':['pending-review','approved-backlog']};
 function reviewField(label,value,cls){var missing=!String(value||'').trim();return '<div class="review-field '+(cls||'')+(missing?' missing':'')+'"><span class="label">'+e(label)+'</span><br>'+e(missing?'not recorded (legacy proposal)':value)+'</div>'}
 function reviewBadges(p){var out=[];if(p.legacy)out.push('<span class="review-badge incomplete">incomplete record</span>');if(p.recurrences)out.push('<span class="review-badge recurring">recurring ×'+e(p.recurrences)+'</span>');return out.join('')}
+// t-1742 — IS THIS ROW READY TO PUT IN FRONT OF THE OWNER?
+//
+// The server's answer (lib/estate_work.readiness), rendered and never
+// re-derived: `estate awaiting --ready-only` filters on the same key, so the
+// badge on this page and the rows that CLI keeps cannot disagree. It reads the
+// record's shape — a real recommendation, a situation sentence, a live row —
+// and says nothing at all about whether the work matters or the
+// recommendation is any good.
+//
+// A row the snapshot did not classify carries no badge rather than a default
+// one. Only two lists get the verdict (the attention set and the review
+// queue); the History toggle's resolved follow-ups are outside both, and
+// stamping them `unclassified` would report an absence somebody looked for as
+// one somebody found.
+var READINESS_BADGES={reach:['ready to decide','a real recommendation, a situation sentence, and neither the task nor its review stage finished — decidable as stored. Shape only: this says nothing about whether the recommendation is any good'],
+ thinking:['not ready','recorded, but not decidable as stored'],
+ unclassified:['no recommendation recorded','no recommendation key on file — nothing was filed to judge, and nothing here infers one']};
+var READINESS_WHY={recommendation_not_recorded:'the recommendation is the recorded "not recorded" — a filer who weighed the options and picked none',
+ recommendation_empty:'the recommendation key is present and blank',
+ no_recommendation_key:'no recommendation key at all',
+ no_situation_recorded:'no context, condition or intent recorded — nothing says what this is about',
+ task_terminal:'the task is finished; this is a record, not a request',
+ stage_terminal:'the review already ended at this stage'};
+function readinessBadge(t){var v=READINESS_BADGES[t.readiness];if(!v)return '';var why=(t.readiness_why||[]).map(function(w){return READINESS_WHY[w]||w});return '<span class="readiness-badge '+e(t.readiness)+'" title="'+e(v[1]+(why.length?' · '+why.join(' · '):''))+'">'+e(v[0])+'</span>'}
+// t-660 — this panel holds every task carrying a review stage, not only the
+// ones `estate proposal add` minted. A task adopted into the lifecycle keeps
+// its own kind, so the row says so rather than presenting a follow-up as a
+// proposal. Only for the kinds that are NOT `proposal`: a badge on every row
+// saying "proposal" is decoration, and the whole point is the exception.
+function kindBadge(t){var k=t.kind||'';return k&&k!=='proposal'?'<span class="review-badge kind">'+e(k)+'</span>':''}
 function decisionBox(t){var stages=PROPOSAL_TRANSITIONS[t.stage]||[];if(!stages.length)return '';var labels={'approved-backlog':'Approve to backlog','rejected':'Reject','resolved':'Mark resolved','stopped':'Stop','pending-review':'Return to review'};return '<div class="decision-box"><span class="label">Record stage decision</span><textarea class="decision-note" data-decision-note="'+e(t.id)+'" placeholder="Decision note (required)">'+e(DECISION_NOTES[t.id]||'')+'</textarea><div class="decision-actions">'+stages.map(function(s){return '<button type="button" class="decision '+e(s)+'" data-decision-id="'+e(t.id)+'" data-decision-stage="'+e(s)+'">'+e(labels[s]||s)+'</button>'}).join('')+'<span class="decision-status" data-decision-status="'+e(t.id)+'"></span></div></div>'}
 // t-476 — the collapsed row carries the DECISION, not the title and a clamp of
 // one field. Which stored key is "the question" and which is "the
@@ -451,17 +646,33 @@ function surfaceText(p,name){var v=p[name];if(v!=null&&String(v).trim())return S
 var SURFACE_CANONICAL=__SURFACE_CANONICAL__;
 function surfaceNote(p,name){var f=p[name+'_field'];return f&&f!==SURFACE_CANONICAL[name]?'<span class="review-badge">from '+e(f)+'</span>':''}
 function summaryField(label,text,note,cls){return '<span class="'+e(cls)+(text?'':' missing')+'"><span class="label">'+e(label)+'</span>'+(text?note:'')+'<br>'+e(text||('No '+label.toLowerCase()+' recorded'))+'</span>'}
-function altRows(p){return Array.isArray(p.alternatives)?p.alternatives.filter(function(v){return v&&v.option}):[]}
-function decisionCard(id,cls,label,body,note){return '<div class="decision-card '+cls+'" role="button" tabindex="0" data-decision-card="'+e(id)+'" data-decision-prefill="'+e(note)+'"><span class="label">'+e(label)+'</span><br>'+body+'</div>'}
-function decisionSketch(p,id){if(!p.classification)return '<div class="sketch-note">Decision cards unavailable: this legacy proposal predates decision classification.</div>';var opts=altRows(p),recommendation=p.recommendation||'No recommendation recorded',defer=p.defer_consequence||'No defer consequence recorded';return '<div class="decision-sketch"><div class="decision-sketch-head"><b>Decision</b><span class="classification">'+e(p.classification||'unclassified')+'</span></div><div class="decision-question"><span class="label">Question</span><br>'+e(p.question||'No question recorded')+'</div><div class="decision-card-row">'+decisionCard(id,'recommendation','Recommendation',e(recommendation),'Owner clicked: '+recommendation)+decisionCard(id,'defer','If deferred',e(defer),'Owner clicked: defer — '+defer)+'</div><div class="decision-options">'+opts.map(function(v){var consequence=v.consequence||'No consequence recorded';return decisionCard(id,'option-card','Option','<b>'+e(v.option)+'</b><br>'+e(consequence),'Owner clicked: '+v.option+' — '+consequence)}).join('')+'</div></div>'}
-function proposalRow(t){var p=t.proposal||{},question=surfaceText(p,'question'),recommendation=surfaceText(p,'recommendation');return '<details data-proposal="'+e(t.id)+'" class="proposal"'+(OPEN_PROPOSALS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+'</span><span class="stage '+e(t.stage)+'">'+e(t.stage)+'</span><span class="proposal-question"><span class="proposal-caption">'+e(t.title)+reviewBadges(p)+'</span>'+summaryField('Question',question,surfaceNote(p,'question'),'proposal-question-text')+'</span>'+summaryField('Recommendation',recommendation,surfaceNote(p,'recommendation'),'proposal-recommendation')+'<span>'+e(age(t.updated_at))+'</span></summary><div class="proposal-body">'+(p.legacy?'<div class="legacy-note">Review record incomplete: one or more evidence fields were never recorded.</div>':'')+decisionSketch(p,t.id)+'<div class="review-grid">'+reviewField('What was observed',p.condition)+reviewField('Recommendation',p.desired_outcome,'recommendation')+reviewField('Done when',p.completion_check)+'</div><div class="kv">'+kv('fingerprint',p.fingerprint||'not recorded')+kv('work status',t.status)+kv('created by',t.created_by)+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('recurrences',p.recurrences||0)+(p.last_recurrence_at?kv('last recurrence',stamp(p.last_recurrence_at)):'')+'</div>'+(t.intent?'<div class="review-field"><span class="label">intent</span><br>'+e(t.intent)+'</div>':'')+decisionBox(t)+history(taskEvents(t.id),'No events recorded for this proposal.')+'</div></details>'}
-function drawProposals(){var q=(document.getElementById('proposal-search').value||'').toLowerCase(),list=(DATA.proposals||[]).map(task).filter(Boolean);if(PROPOSAL_STAGE!=='all')list=list.filter(function(t){return t.stage===PROPOSAL_STAGE});if(q)list=list.filter(function(t){var p=t.proposal||{};return [t.id,t.title,t.intent,p.condition,p.desired_outcome,p.completion_check,p.fingerprint,p.classification,p.question,p.recommendation,p.defer_consequence,JSON.stringify(p.alternatives||[])].join(' ').toLowerCase().indexOf(q)>=0});document.getElementById('proposal-stats').innerHTML=stats(DATA.proposal_counts,['pending-review','approved-backlog','rejected','stopped','resolved']);document.getElementById('proposal-count').textContent=list.length+' shown';document.getElementById('proposals').innerHTML=rows(list,proposalRow,'No proposals in this stage.')}
-function prefillDecision(card){var id=card.dataset.decisionCard,note=document.querySelector('[data-decision-note="'+id+'"]');if(!note)return;note.value=card.dataset.decisionPrefill||'';DECISION_NOTES[id]=note.value;note.focus()}
+// t-1794 — the POSITION is the identity, so it is taken from the stored array
+// and carried, never re-derived from the rendered list. Filtering first and
+// numbering after would make a malformed entry shift every card below it and
+// send a `chosen` that names a different branch than the one clicked.
+function altRows(p){return Array.isArray(p.alternatives)?p.alternatives.map(function(v,i){return v&&v.option?{option:v.option,consequence:v.consequence,position:i+1}:null}).filter(Boolean):[]}
+function isDecision(p){return String(p.classification||'').toLowerCase()==='decision'}
+function chosenOf(id){var v=DECISION_CHOICES[id];return typeof v==='number'?v:null}
+function decisionCard(id,cls,label,body,note,position){var picked=position!=null&&chosenOf(id)===position;return '<div class="decision-card '+cls+(picked?' picked':'')+'" role="button" tabindex="0" aria-pressed="'+(picked?'true':'false')+'" data-decision-card="'+e(id)+'"'+(position!=null?' data-decision-position="'+e(position)+'"':'')+' data-decision-prefill="'+e(note)+'"><span class="label">'+e(label)+(picked?' · chosen':'')+'</span><br>'+body+'</div>'}
+// t-1794 — an OPTION card is now a selection, not only a note prefill. Only
+// the option cards carry a position: the recommendation and defer cards name
+// no alternative, and resolving "take my recommendation" to an option would be
+// a regex over free text, which is the third alternative this proposal
+// explicitly rejected (docs/landed-reconciliation-contract.md settled that
+// class). Clicking one of those clears the selection rather than guessing.
+function decisionSketch(p,id,stage){if(!p.classification)return '<div class="sketch-note">Decision cards unavailable: this legacy proposal predates decision classification.</div>';var opts=altRows(p),recommendation=p.recommendation||'No recommendation recorded',defer=p.defer_consequence||'No defer consequence recorded',need=isDecision(p)&&(PROPOSAL_TRANSITIONS[stage]||[]).indexOf('approved-backlog')>=0;return '<div class="decision-sketch"><div class="decision-sketch-head"><b>Decision</b><span class="classification">'+e(p.classification||'unclassified')+'</span>'+(need?'<span class="choice-hint" data-choice-hint="'+e(id)+'">'+(chosenOf(id)?'Chosen: option '+e(chosenOf(id)):'Click the option you are choosing before approving')+'</span>':'')+'</div><div class="decision-question"><span class="label">Question</span><br>'+e(p.question||'No question recorded')+'</div><div class="decision-card-row">'+decisionCard(id,'recommendation','Recommendation',e(recommendation),'Owner clicked: '+recommendation)+decisionCard(id,'defer','If deferred',e(defer),'Owner clicked: defer — '+defer)+'</div><div class="decision-options">'+opts.map(function(v){var consequence=v.consequence||'No consequence recorded';return decisionCard(id,'option-card','Option '+v.position,'<b>'+e(v.option)+'</b><br>'+e(consequence),'Owner clicked: '+v.option+' — '+consequence,v.position)}).join('')+'</div></div>'}
+function proposalRow(t){var p=t.proposal||{},question=surfaceText(p,'question'),recommendation=surfaceText(p,'recommendation');return '<details data-proposal="'+e(t.id)+'" class="proposal"'+(OPEN_PROPOSALS[t.id]?' open':'')+'><summary><span class="id">'+e(t.id)+'</span><span class="stage '+e(t.stage)+'">'+e(t.stage)+'</span><span class="proposal-question"><span class="proposal-caption">'+e(t.title)+kindBadge(t)+reviewBadges(p)+readinessBadge(t)+'</span>'+summaryField('Question',question,surfaceNote(p,'question'),'proposal-question-text')+'</span>'+summaryField('Recommendation',recommendation,surfaceNote(p,'recommendation'),'proposal-recommendation')+'<span>'+e(age(t.updated_at))+'</span></summary><div class="proposal-body">'+(p.legacy?'<div class="legacy-note">Review record incomplete: one or more evidence fields were never recorded.</div>':'')+decisionSketch(p,t.id,t.stage)+'<div class="review-grid">'+reviewField('What was observed',p.condition)+reviewField('Recommendation',p.desired_outcome,'recommendation')+reviewField('Done when',p.completion_check)+'</div><div class="kv">'+kv('fingerprint',p.fingerprint||'not recorded')+kv('work status',t.status)+kv('created by',t.created_by)+kv('updated',stamp(t.updated_at)+' · '+age(t.updated_at))+kv('recurrences',p.recurrences||0)+(p.last_recurrence_at?kv('last recurrence',stamp(p.last_recurrence_at)):'')+'</div>'+(t.intent?'<div class="review-field"><span class="label">intent</span><br>'+e(t.intent)+'</div>':'')+decisionBox(t)+historySlot(t.id,'No events recorded for this proposal.')+'</div></details>'}
+function drawProposals(){var q=(document.getElementById('proposal-search').value||'').toLowerCase(),list=(DATA.proposals||[]).map(task).filter(Boolean);if(PROPOSAL_STAGE!=='all')list=list.filter(function(t){return t.stage===PROPOSAL_STAGE});if(q)list=list.filter(function(t){var p=t.proposal||{};return [t.id,t.kind,t.title,t.intent,p.condition,p.desired_outcome,p.completion_check,p.fingerprint,p.classification,p.question,p.recommendation,p.defer_consequence,JSON.stringify(p.alternatives||[])].join(' ').toLowerCase().indexOf(q)>=0});document.getElementById('proposal-stats').innerHTML=stats(DATA.proposal_counts,['pending-review','approved-backlog','rejected','stopped','resolved']);document.getElementById('proposal-count').textContent=list.length+' shown';document.getElementById('proposals').innerHTML=rows(list,proposalRow,'No staged review items in this stage.')}
+function prefillDecision(card){var id=card.dataset.decisionCard,note=document.querySelector('[data-decision-note="'+id+'"]');if(!note)return;note.value=card.dataset.decisionPrefill||'';DECISION_NOTES[id]=note.value;var raw=card.dataset.decisionPosition;if(raw==null){delete DECISION_CHOICES[id]}else{DECISION_CHOICES[id]=Number(raw)}markChoice(id);note.focus()}
+// The class is toggled in place rather than by re-rendering the panel: a
+// redraw would discard the note the reader is halfway through typing, which is
+// the same reason render() harvests the textareas before it redraws.
+function markChoice(id){var picked=chosenOf(id);document.querySelectorAll('[data-decision-card="'+id+'"]').forEach(function(c){var mine=c.dataset.decisionPosition!=null&&Number(c.dataset.decisionPosition)===picked;c.classList.toggle('picked',mine);c.setAttribute('aria-pressed',mine?'true':'false')});var hint=document.querySelector('[data-choice-hint="'+id+'"]');if(hint)hint.textContent=picked?'Chosen: option '+picked:'Click the option you are choosing before approving'}
 var TOKEN_KEY='ops-dashboard-write-token';
 function decisionToken(){var t=null;try{t=localStorage.getItem(TOKEN_KEY)}catch(_){t=null}if(!t){try{t=window.prompt('Dashboard write token (required for proposal decisions):')||''}catch(_){t=''}if(t)try{localStorage.setItem(TOKEN_KEY,t)}catch(_){}}return t}
 function decisionStatus(id,text,error){var s=document.querySelector('[data-decision-status="'+id+'"]');if(s){s.textContent=text||'';s.classList.toggle('error',!!error)}}
-function decideProposal(button){var id=button.dataset.decisionId,target=button.dataset.decisionStage,t=task(id),note=document.querySelector('[data-decision-note="'+id+'"]');if(!t||!note)return;var text=note.value.trim();if(!text){decisionStatus(id,'A decision note is required.',true);note.focus();return}if(['rejected','resolved','stopped'].indexOf(target)>=0&&!window.confirm('Move '+id+' to '+target+'?'))return;var tok=decisionToken();if(!tok){decisionStatus(id,'Write token required.',true);return}var buttons=document.querySelectorAll('[data-decision-id="'+id+'"]');buttons.forEach(function(b){b.disabled=true});decisionStatus(id,'Recording…',false);fetch('proposal-stage',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Dashboard-Token':tok},body:JSON.stringify({id:id,expected_stage:t.stage,stage:target,note:text})}).then(function(r){return r.json().catch(function(){return {error:'Request failed'}}).then(function(body){if(!r.ok){var x=Error(body.error||('HTTP '+r.status));x.status=r.status;throw x}return body})}).then(function(result){var old=t.stage;t.stage=result.stage;t.status=result.task_status||t.status;delete DECISION_NOTES[id];if(DATA.proposal_counts){DATA.proposal_counts[old]=Math.max(0,(DATA.proposal_counts[old]||0)-1);DATA.proposal_counts[t.stage]=(DATA.proposal_counts[t.stage]||0)+1}OPEN_PROPOSALS[id]=false;drawProposals()}).catch(function(err){if(err.status===401)try{localStorage.removeItem(TOKEN_KEY)}catch(_){}decisionStatus(id,err.message+(err.status===401?' Token cleared; retry to enter it again.':''),true);buttons.forEach(function(b){b.disabled=false})})}
-"""
+function decideProposal(button){var id=button.dataset.decisionId,target=button.dataset.decisionStage,t=task(id),note=document.querySelector('[data-decision-note="'+id+'"]');if(!t||!note)return;var text=note.value.trim();if(!text){decisionStatus(id,'A decision note is required.',true);note.focus();return}var picked=chosenOf(id),approving=target==='approved-backlog',needChoice=approving&&isDecision(t.proposal||{});if(needChoice&&!picked){decisionStatus(id,'Click the option you are choosing first — approving a decision records which alternative it was.',true);return}if(['rejected','resolved','stopped'].indexOf(target)>=0&&!window.confirm('Move '+id+' to '+target+'?'))return;var tok=decisionToken();if(!tok){decisionStatus(id,'Write token required.',true);return}var body={id:id,expected_stage:t.stage,stage:target,note:text};/* t-1794: the position rides ONLY on an approval. Rejecting, resolving or stopping picks none of the alternatives, and the server refuses a `chosen` on any of them rather than storing a choice nobody made. */ if(approving&&picked)body.chosen=picked;var buttons=document.querySelectorAll('[data-decision-id="'+id+'"]');buttons.forEach(function(b){b.disabled=true});decisionStatus(id,'Recording…',false);fetch('proposal-stage',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','X-Dashboard-Token':tok},body:JSON.stringify(body)}).then(function(r){return r.json().catch(function(){return {error:'Request failed'}}).then(function(body){if(!r.ok){var x=Error(body.error||('HTTP '+r.status));x.status=r.status;throw x}return body})}).then(function(result){var old=t.stage;t.stage=result.stage;t.status=result.task_status||t.status;delete DECISION_NOTES[id];delete DECISION_CHOICES[id];if(DATA.proposal_counts){DATA.proposal_counts[old]=Math.max(0,(DATA.proposal_counts[old]||0)-1);DATA.proposal_counts[t.stage]=(DATA.proposal_counts[t.stage]||0)+1}OPEN_PROPOSALS[id]=false;drawProposals()}).catch(function(err){if(err.status===401)try{localStorage.removeItem(TOKEN_KEY)}catch(_){}decisionStatus(id,err.message+(err.status===401?' Token cleared; retry to enter it again.':''),true);buttons.forEach(function(b){b.disabled=false})})}
+""".replace("__SURFACE_CANONICAL__", _SURFACE_CANONICAL_JSON)
 
 JS_BODY = r"""
 function options(sel,items,current,label){var el=document.getElementById(sel);if(!el)return;el.innerHTML='<option value="">'+label+'</option>'+items.map(function(v){return '<option value="'+e(v.value)+'"'+(v.value===current?' selected':'')+'>'+e(v.text)+'</option>'}).join('')}
@@ -469,9 +680,14 @@ function refreshSelectors(){var kinds={},projects=[];(DATA.tasks||[]).forEach(fu
 options('kind-filter',Object.keys(kinds).sort().map(function(k){return {value:k,text:k+' ('+kinds[k]+')'}}),KIND_FILTER,'any kind');
 (DATA.projects||[]).forEach(function(p){projects.push({value:p.unprojected?'unprojected':p.id,text:p.title+' ('+((p.rollup||{}).tasks||0)+')'})});
 options('project-filter',projects,PROJECT_FILTER,'any project')}
+function setActiveFilter(attr,value){document.querySelectorAll('['+attr+']').forEach(function(b){b.classList.toggle('active',b.getAttribute(attr)===value)})}
+function applyDeepLink(){if(!DEEP_LINK_PENDING)return;var requested=DEEP_LINK.requested,id=requested,found=null;if(DEEP_LINK.kind==='project')found=PINDEX[id];else{found=INDEX[id];if(!found&&requested.indexOf('followup:')===0){(DATA.tasks||[]).some(function(t){var f=t.followup||{},legacy=String(f.legacy_id||'').toLowerCase();if(legacy===requested||'followup:'+legacy===requested){found=t;id=t.id;return true}return false})}}var state=document.getElementById('deep-link-state');if(!found){state.className='deep-link-state not-found';state.textContent=(DEEP_LINK.kind==='project'?'Project ':'Task or follow-up ')+requested+' was not found in the current snapshot.';return}state.className='deep-link-state';state.textContent='';if(DEEP_LINK.kind==='project'){OPEN_PROJECTS[id]=true}else{FILTER='all';KIND_FILTER='';PROJECT_FILTER='';PROPOSAL_STAGE='all';OPEN_TASKS[id]=true;OPEN_PROPOSALS[id]=true;var search=document.getElementById('search'),proposalSearch=document.getElementById('proposal-search');if(search)search.value='';if(proposalSearch)proposalSearch.value='';setActiveFilter('data-filter','all');setActiveFilter('data-proposal-stage','all')}DEEP_LINK.requested=id;DEEP_LINK_PENDING=false}
+function revealDeepLink(){if(!DEEP_LINK||DEEP_LINK_PENDING)return;var attr=DEEP_LINK.kind==='project'?'data-project':'data-task',node=document.querySelector('['+attr+'="'+DEEP_LINK.requested+'"]');if(!node&&DEEP_LINK.kind==='task')node=document.querySelector('[data-proposal="'+DEEP_LINK.requested+'"]');if(node){node.open=true;node.scrollIntoView({block:'center'})}}
 function render(d){var box=document.getElementById('memory-body');if(box)MEMORY_SCROLL=box.scrollTop;document.querySelectorAll('[data-decision-note]').forEach(function(v){DECISION_NOTES[v.dataset.decisionNote]=v.value});document.querySelectorAll('[data-resolve-note]').forEach(function(v){RESOLVE_NOTES[v.dataset.resolveNote]=v.value});OPEN_TASKS={};OPEN_EVENTS={};OPEN_PROJECTS={};OPEN_PROPOSALS={};document.querySelectorAll('[data-task][open]').forEach(function(v){OPEN_TASKS[v.dataset.task]=true});document.querySelectorAll('[data-event][open]').forEach(function(v){OPEN_EVENTS[v.dataset.event]=true});document.querySelectorAll('[data-project][open]').forEach(function(v){OPEN_PROJECTS[v.dataset.project]=true});document.querySelectorAll('[data-proposal][open]').forEach(function(v){OPEN_PROPOSALS[v.dataset.proposal]=true});var x=d.estate_activity||{},ex=x.extractions||{},lh=x.ledger_health||{},m=x.memories||{};DATA=x;
 INDEX={};(x.tasks||[]).forEach(function(t){INDEX[t.id]=t});
-EVENT_INDEX={};Object.keys(x.task_events||{}).forEach(function(id){(x.task_events[id]||[]).forEach(function(v){EVENT_INDEX[v.seq]=v})});(x.events||[]).forEach(function(v){EVENT_INDEX[v.seq]=v});
+PINDEX={};(x.projects||[]).forEach(function(p){PINDEX[p.id]=p});
+EVENT_INDEX={};Object.keys(x.task_events||{}).forEach(function(id){(x.task_events[id]||[]).forEach(function(v){EVENT_INDEX[v.seq]=v})});(x.events||[]).forEach(function(v){EVENT_INDEX[v.seq]=v});reindexDetailEvents();
+applyDeepLink();
 document.getElementById('estate-title').textContent=(d.estate||'estate')+' / '+(d.operator||'hub');
 var gen=document.getElementById('generated-at');if(gen)gen.textContent=d.generated_at?'snapshot '+age(d.generated_at):'snapshot age unknown';
 refreshSelectors();
@@ -485,6 +701,11 @@ document.getElementById('extractions').innerHTML=rows(ex.items,function(i){retur
 document.getElementById('ledger-summary').innerHTML='<div class="split"><div class="subpanel"><span class="label">central ledger</span><div class="n">'+e(lh.count||0)+'</div><span class="source-badge">'+(lh.available?'live JSONL':'not available')+'</span></div><div class="subpanel"><span class="label">activity by actor</span><div class="chips">'+chips(lh.by_actor)+'</div></div></div>';
 document.getElementById('ledger').innerHTML=rows((lh.recent||[]).slice(0,30),function(v){return '<div class="row"><span class="time">'+e(age(v.ts))+'</span><span>'+e(v.kind||'activity')+'</span><span>'+e(v.summary)+'</span><span>'+who(v)+'</span></div>'},'No central-ledger entries yet.');
 drawMemories(m);
+// t-1450 — last, once every list is on the page: a row this snapshot
+// re-rendered OPEN fires no toggle event, so it asks for its drill-down here.
+// Cached and still current is a no-op; a row whose task has moved refetches.
+ensureOpenDetails();
+revealDeepLink();
 }
 """
 JS_TAIL = r"""
@@ -508,17 +729,18 @@ document.getElementById('proposals').onclick=function(ev){var b=ev.target.closes
 document.getElementById('proposals').onkeydown=function(ev){var card=ev.target.closest('[data-decision-card]');if(card&&(ev.key==='Enter'||ev.key===' ')){ev.preventDefault();prefillDecision(card)}};
 document.addEventListener('click',function(ev){var b=ev.target.closest('[data-full-note]');if(!b)return;var v=EVENT_INDEX[b.dataset.fullNote],dialog=document.getElementById('note-dialog');if(!v||!dialog)return;document.getElementById('note-dialog-title').textContent=(v.task_id?v.task_id+' · ':'')+v.summary;document.getElementById('note-dialog-body').innerHTML=markdown(v.detail||'');dialog.showModal()});
 document.getElementById('note-close').onclick=function(){document.getElementById('note-dialog').close()};
+installDetailWiring();
 function refresh(){fetch('dashboard.json?t='+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw Error('fetch failed');return r.json()}).then(render).catch(function(){document.getElementById('tasks').innerHTML='<div class="empty">Dashboard data could not be loaded.</div>'})}
 refresh();setInterval(refresh,30000);
 })();
 """
-JS = (JS_HEAD + JS_ATTENTION + JS_INBOX + JS_PROJECTS + JS_DEPS + JS_PROPOSALS
-      + JS_BODY + JS_TAIL).replace(
-    # t-476. The server's table, not a second copy of it. A renderer that
-    # hard-coded "desired_outcome is the recommendation" would be the second
-    # implementation lib/estate_work exists to prevent.
-    "__SURFACE_CANONICAL__", json.dumps(estate_work.SURFACE_CANONICAL,
-                                        sort_keys=True))
+# t-476. The server's table, not a second copy of it — a renderer that
+# hard-coded "desired_outcome is the recommendation" would be the second
+# implementation lib/estate_work exists to prevent. The substitution itself has
+# already happened, once, on JS_PROPOSALS: this page and `/` both read
+# SURFACE_CANONICAL and only one of them composes `JS`.
+JS = (JS_HEAD + JS_DETAIL + JS_ATTENTION + JS_INBOX + JS_PROJECTS + JS_DEPS
+      + JS_PROPOSALS + JS_BODY + JS_TAIL)
 
 # The page states its own deliberately narrow write contract. Proposal review
 # decisions and follow-up resolutions are the only estate mutations; every
@@ -603,7 +825,7 @@ def render(dashboard, snapshot: dict) -> str:
                '<span class="source-badge">review here · audited by estate</span></div>'
                '<div class="pbody" id="proposal-stats"></div>'
                f'<div class="pbody"><div class="toolbar">{PROPOSAL_BUTTONS}'
-               '<input class="search" id="proposal-search" placeholder="Filter proposals…"></div></div>'
+               '<input class="search" id="proposal-search" placeholder="Filter by id, kind or text…"></div></div>'
                '<div class="pbody tight" id="proposals"></div></section>')
     body=(f'<div class="wrap"><header class="masthead"><div class="brand">'
           f'<div class="eyebrow">Estate operations</div>'
@@ -611,7 +833,7 @@ def render(dashboard, snapshot: dict) -> str:
           f'<div class="subline">attention · tasks · projects · dependencies · ledgers · memory</div></div>'
           f'<span class="spacer"></span><a class="estate-nav" href="/">Daily dashboard</a>'
           f'<button class="themebtn" id="themebtn">☾ Night shift</button></header>'
-          f'{BANNER}<div class="grid">{attention}{inbox}{proposals}{tasks}{projects}{deps}'
+          f'{BANNER}<div id="deep-link-state" class="deep-link-state" role="status"></div><div class="grid">{attention}{inbox}{proposals}{tasks}{projects}{deps}'
           f'{panel("Recent task events","events")}'
           f'{panel("Central ledger","ledger-summary")}'
           f'{panel("Recent central-ledger activity","ledger")}'
