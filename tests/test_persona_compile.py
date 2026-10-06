@@ -684,5 +684,143 @@ class TestRealPack(unittest.TestCase):
                     self.assertEqual(record["crew"], crew)
                     self.assertIn(f"crews/{crew}.md@", record["sources"])
 
+class TestWearing(unittest.TestCase):
+    """gap audit P-01 — what a RUNNING role reads, not what is on disk.
+
+    The join is bin/skill-drift's `bound_at` (the tmux session's own start
+    time) against this branch's newest commit touching that role's installed
+    sidecar. Everything here drives `wearing_rows` with a canned skill-drift
+    payload, so no test starts a session or shells out to agent-deck.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.personas = build_pack(
+            self.tmp, config=CONFIG + '\n[targets]\nhub = "hub/CLAUDE.md"\n')
+        self.target = os.path.join(self.tmp, "hub", "CLAUDE.md")
+        os.makedirs(os.path.dirname(self.target))
+        write(self.target, "# hub\n\n" + pc.BEGIN + " -->\n" + pc.END + "\n")
+        self.out = os.path.join(self.tmp, "compiled")
+        run("--repo", self.tmp, "--personas-dir", self.personas,
+            "--out", self.out)
+        run("--repo", self.tmp, "--personas-dir", self.personas,
+            "--out", self.out, "--install")
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "t")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "install the hub persona")
+        self.installed_at = self.commit_time()
+        self.cfg = pc.load_config(os.path.join(self.personas, "config.toml"))
+        self.recs = [pc.compile_role("hub", self.personas, self.cfg)]
+        self.targets = self.cfg["targets"]
+
+    def git(self, *argv):
+        import subprocess
+        return subprocess.run(["git", "-C", self.tmp, *argv],
+                              capture_output=True, text=True, check=False)
+
+    def commit_time(self):
+        import datetime as dt
+        out = self.git("log", "-1", "--format=%ct").stdout.strip()
+        return dt.datetime.fromtimestamp(float(out), dt.timezone.utc)
+
+    def payload(self, bound_at, **over):
+        row = {"dir": "hub", "title": "ops (hub)", "verdict": "stale",
+               "bound_at": bound_at.isoformat() if bound_at else None,
+               "restart_command": "agent-deck ... restart",
+               "reading": {"outcome": "not_running",
+                           "why": "the session is `stopped`"}}
+        row.update(over)
+        return {"rows": [row]}
+
+    def rows(self, payload, why="", stale=frozenset()):
+        return pc.wearing_rows(self.recs, self.targets, self.tmp, "main",
+                               payload, why, set(stale))
+
+    def test_a_session_bound_before_the_install_is_superseded(self):
+        import datetime as dt
+        before = self.installed_at - dt.timedelta(hours=9)
+        row = self.rows(self.payload(before))[0]
+        self.assertEqual(row["verdict"], pc.SUPERSEDED)
+        self.assertEqual(row["latest"]["subject"], "install the hub persona")
+        self.assertEqual(row["restart"], "agent-deck ... restart")
+
+    def test_a_session_bound_after_the_install_is_current(self):
+        import datetime as dt
+        after = self.installed_at + dt.timedelta(minutes=1)
+        row = self.rows(self.payload(after))[0]
+        self.assertEqual(row["verdict"], pc.CURRENT)
+
+    def test_an_unobservable_session_is_unknown_never_current(self):
+        """The absence claim is `current`, so it may not be reached from a
+        reading that never saw a session (docs/absence-contract.md)."""
+        row = self.rows(self.payload(None, verdict="unobservable"))[0]
+        self.assertEqual(row["verdict"], pc.UNKNOWN)
+        self.assertIn("stopped", row["why"])
+
+    def test_a_role_with_no_skill_drift_row_is_unknown(self):
+        row = self.rows({"rows": []})[0]
+        self.assertEqual(row["verdict"], pc.UNKNOWN)
+        self.assertIn("no session", row["why"])
+
+    def test_an_unreadable_skill_drift_is_unknown_and_says_why(self):
+        row = self.rows(None, why="an installation skill-drift adapter did not return (OSError)")[0]
+        self.assertEqual(row["verdict"], pc.UNKNOWN)
+        self.assertEqual(row["why"], "an installation skill-drift adapter did not return (OSError)")
+
+    def test_a_role_with_no_target_is_unknown_and_named_not_installed(self):
+        recs = self.recs + [pc.compile_role("tracker", self.personas, self.cfg)]
+        rows = pc.wearing_rows(recs, self.targets, self.tmp, "main",
+                               self.payload(self.installed_at), "", set())
+        tracker = [r for r in rows if r["role"] == "tracker"][0]
+        self.assertEqual(tracker["verdict"], pc.UNKNOWN)
+        self.assertEqual(tracker["installed"], "not installed")
+
+    def test_a_stale_file_on_disk_is_reported_beside_the_worn_voice(self):
+        """Two different sentences: the session is behind, AND restarting it
+        would not help until --install runs."""
+        import datetime as dt
+        before = self.installed_at - dt.timedelta(hours=9)
+        rows = self.rows(self.payload(before), stale={"hub"})
+        self.assertEqual(rows[0]["installed"], "stale")
+        text = pc.render_wearing(rows, "main", "")
+        self.assertIn("the file on disk is itself out of date", text)
+
+    def test_exit_status_is_3_superseded_2_unknown_0_current(self):
+        import datetime as dt
+        fixture = os.path.join(self.tmp, "drift.json")
+        before = self.installed_at - dt.timedelta(hours=9)
+        write(fixture, __import__("json").dumps(self.payload(before)))
+        rc, _ = run("--repo", self.tmp, "--personas-dir", self.personas,
+                    "--out", self.out, "--role", "hub", "--wearing",
+                    "--skill-drift-json", fixture)
+        self.assertEqual(rc, 3)
+        write(fixture, __import__("json").dumps(
+            self.payload(self.installed_at + dt.timedelta(minutes=1))))
+        rc, _ = run("--repo", self.tmp, "--personas-dir", self.personas,
+                    "--out", self.out, "--role", "hub", "--wearing",
+                    "--skill-drift-json", fixture)
+        self.assertEqual(rc, 0)
+        write(fixture, __import__("json").dumps({"rows": []}))
+        rc, _ = run("--repo", self.tmp, "--personas-dir", self.personas,
+                    "--out", self.out, "--role", "hub", "--wearing",
+                    "--skill-drift-json", fixture)
+        self.assertEqual(rc, 2)
+
+    def test_wearing_writes_nothing(self):
+        import datetime as dt
+        fixture = os.path.join(self.tmp, "drift.json")
+        write(fixture, __import__("json").dumps(
+            self.payload(self.installed_at)))
+        before = tree_bytes(os.path.join(self.tmp, "hub"))
+        compiled = tree_bytes(self.out)
+        run("--repo", self.tmp, "--personas-dir", self.personas,
+            "--out", self.out, "--role", "hub", "--wearing",
+            "--skill-drift-json", fixture)
+        self.assertEqual(before, tree_bytes(os.path.join(self.tmp, "hub")))
+        self.assertEqual(compiled, tree_bytes(self.out))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
