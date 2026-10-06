@@ -1028,6 +1028,16 @@ class TheSpotterIsJudgedOnItsTickLog(HealthHarness):
         self.assertNotIn("tick-missed", out)
 
     def test_the_tick_log_verdict_is_the_same_under_both_reads(self):
+        # Both reads must judge the same instant. Wall time can cross a second
+        # between subprocesses and change age text without changing the verdict.
+        import shlex
+        clock = int(time.time())
+        fixed_date = os.path.join(self.tmp, "stub", "date")
+        with open(fixed_date, "w") as fh:
+            fh.write("#!/bin/sh\nif [ \"$1\" = +%s ]; then echo " + str(clock)
+                     + "; else exec " + shlex.quote(shutil.which("date"))
+                     + " \"$@\"; fi\n")
+        os.chmod(fixed_date, 0o755)
         self.alive(self.WORKER, self.WATCHER)
         self.heartbeat("worker", 60)
         self.ticklog("watcher", self.SILENT)
