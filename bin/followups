@@ -1,120 +1,431 @@
 #!/usr/bin/env python3
-"""followups — durable standing-action-item list.
+"""followups — durable standing-action-item list backed by bin/estate.
 
 The estate-wide exit destination for work items that reach a terminal
-state (done/needs-you) with no external object — a PR, an issue, a ticket
-— to hang a note on: internal work like "provision the OIDC role" or
-"raise the org spend cap." A loop's own queue is transient (items exit it,
-they don't live on there) and a tracker's state is keyed to the object it
-tracks; this is the durable home for everything else, standing until a
-human resolves it. Loops are the producers: a loop that retires an item
-with nowhere to put it files a follow-up here, tagged with --source.
+state with no external object — a PR, an issue, a ticket — to hang a note
+on. A loop's own queue is transient and a tracker's state is keyed to the
+object it tracks; this is the durable home for everything else, standing
+until a human resolves it. Loops are the producers, tagged with --source.
 
-DATA (state/followups/, override with $FOLLOWUPS_STATE_DIR — tests use
-this to run against a tempdir instead of real state)
--------------------------------------------------------------------------
-  followups.json   source of truth: one entry per follow-up, open|resolved
-  ledger.jsonl      append-only audit trail (added/resolved events)
+Follow-ups remain available through their legacy ``followup:N`` identifiers and
+command-line interface.  SQLite is now the source of truth; the old
+followups.json and ledger.jsonl files are frozen and are never written here.
 
-SUBCOMMANDS
------------
-  followups add "<description>" --source SRC [--ref REF] [--context "..."]
-                                  file a new standing item, keyed followup:N;
-                                  prints the created item as JSON
-  followups resolve <id> ["note"]
-                                  mark resolved (kept, not deleted)
-  followups list                  open items only, compact one-line-each
-  followups show                  every item, open then resolved, with context
+A follow-up's id here is its ``legacy_id`` when it has one and its real task id
+(``t-N``) otherwise — a row filed through ``estate task add --kind followup``
+never had a compatibility envelope, and ``t-N`` is the id every other surface
+speaks anyway.  ``resolve`` accepts both the contract.
+
+P-07 adds two things on top of P-31's optional ``--due``:
+
+  ``followups due``        the five-state reading of those dates — undated,
+                           later, due_soon, due_today, overdue — scoped to
+                           follow-ups. The vocabulary is lib/estate_attention.
+  ``followups attention``  file-or-link, keyed. Background attention that
+                           arrives twice must land as ONE standing item, and
+                           the caller (a hub sweep collecting a dispatch, a
+                           loop's queue exit) usually cannot remember whether it
+                           already filed one.  The key rides back out on every
+                           read of the row (``attention_key``), so a sweep can
+                           find what it filed and resolve it when the condition
+                           ends the contract.
+
+Neither writes to state/followups/*.json*. Those files were frozen when this
+store moved into bin/estate and they stay frozen: never written, never deleted.
+
+the contract adds the filing-time classification. ``add`` and ``attention`` now
+REQUIRE ``--classification decision|action|clarification``, and a ``decision``
+must also carry the question, at least two alternatives with one consequence
+each, a recommendation (which may be the exact words "not recorded"), and what
+happens if the owner defers. The rule lives once, in ``lib/estate_decisions.py``;
+this file and ``mechanic.py propose`` are the two writers that enforce it,
+because they are the two that file at volume. The keys ride in the same refs
+envelope as ``source``/``ref``/``context`` — no new column, no second store —
+and ``followups show`` prints them.
+
+That is a deliberate divergence from the frozen legacy implementation, which
+had no such concept. It is the same kind of divergence ``--due`` already is,
+and ``tests/test_followups.py`` keeps the parity oracle honest about it.
+
+the contract makes resolution a FUNCTION rather than a command body.
+``apply_followup_resolve`` is the one mutation path, called by ``resolve`` here
+and by the dashboard's ``POST /followup-resolve`` in-process — the same shape
+``bin/estate.apply_proposal_stage`` established for the proposal route, and for
+the same reason: the browser must not get a second implementation of what a
+resolution IS. The CLI's own behavior is byte-for-byte what it was; the
+optimistic-concurrency argument the browser needs is optional and the CLI does
+not pass it.
 """
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import os
 import re
 import sys
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("FOLLOWUPS_STATE_DIR") or os.path.join(REPO_ROOT, "state", "followups")
-STORE_FILE = os.path.join(DATA_DIR, "followups.json")
-LEDGER_FILE = os.path.join(DATA_DIR, "ledger.jsonl")
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
 
-NOW = dt.datetime.now(dt.timezone.utc)
+import estate_attention  # noqa: E402  (lib path is established above)
+import estate_decisions  # noqa: E402
+import estate_pairs  # noqa: E402
+
+# realpath and not abspath: `bin/` is always directly under the root, but only
+# for the REAL file. Invoked through a symlink on $PATH, abspath keeps the
+# symlink's own path and the root resolves to that directory's parent — where
+# `lib/` and the sibling `estate` are not. bin/dashboard and bin/usage-fetch
+# already use Path.resolve() for this reason.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# Only an override the caller actually set. This shim used to fall back to
+# `<its own repo root>/state` and export that as $ESTATE_STATE_DIR, which read to
+# bin/estate as "a human named this store" and re-opened the very hole the contract
+# closes: run from a worktree, it would have named — and created — a shadow store
+# there. With nothing set, bin/estate resolves the canonical one itself.
+OVERRIDE = (os.environ.get("ESTATE_STATE_DIR") or
+            os.environ.get("FOLLOWUPS_STATE_DIR"))
 
 
-# --------------------------------------------------------------------------- #
-# store I/O
-# --------------------------------------------------------------------------- #
-def load_store() -> dict:
+def load_estate(state_dir):
+    if state_dir:
+        os.environ["ESTATE_STATE_DIR"] = state_dir
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "estate")
+    spec = importlib.util.spec_from_file_location(
+        "estate", path, loader=SourceFileLoader("estate", path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+estate = load_estate(OVERRIDE)
+STATE_DIR = estate.STATE_DIR
+LEGACY_RE = re.compile(r"^followup:(\d+)$")
+# The refs key `attention --key` files under. Up here rather than in the P-07
+# section below because `item_from_row` reads it back out too the contract.
+ATTENTION_KEY = "attention_key"
+# the contract. The refs key that says which proposal this follow-up was derived
+# from, written by the one caller that knows it at filing time. The name lives
+# in lib/estate_pairs (which owns the rule that reads it) rather than being
+# spelled again here, because a writer and a reader with two spellings of one
+# key is a link that exists in the store and is invisible on the page.
+DERIVES_FROM = estate_pairs.DERIVES_FROM
+
+
+def decode_refs(row) -> dict:
     try:
-        with open(STORE_FILE) as f:
-            s = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        s = {}
-    s.setdefault("items", {})
-    return s
+        value = json.loads(row["refs"] or "{}")
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
-def save_store(s: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    s["updated_at"] = NOW.isoformat()
-    tmp = STORE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(s, f, indent=2, sort_keys=True)
-    os.replace(tmp, STORE_FILE)
+def item_from_row(row) -> dict:
+    refs = decode_refs(row)
+    # `due_at` appears ONLY when there is one. The legacy tool had no concept of
+    # a deadline, so an always-present key would break output parity with the
+    # frozen oracle for every item the old tool could have produced — and an
+    # item with no due date is better described by the field's absence than by
+    # a null. A real column either way, never a phrase inside `description`.
+    due = estate.row_get(row, "due_at")
+    # `legacy_id` is present on the pre-migration backfill and on everything
+    # this shim files itself — but NOT on a follow-up filed straight through
+    # `estate task add --kind followup`, which is an ordinary task row with an
+    # ordinary `t-N` id and no compatibility envelope at all. Reading the key
+    # unconditionally took the whole store down with a KeyError the moment one
+    # such row existed the contract. The task id is the right fallback rather than a
+    # placeholder: it is the id every other surface already speaks. The legacy
+    # name still wins where there is one, because `followup:N` is what old
+    # ledger lines, memory notes and skill files name these rows by.
+    return {
+        "id": refs.get("legacy_id") or row["id"],
+        "description": row["title"],
+        "source": refs.get("source", ""),
+        "ref": refs.get("ref") or None,
+        "context": refs.get("context", ""),
+        "status": "open" if row["status"] == "open" else "resolved",
+        "created_at": row["created_at"],
+        "resolved_at": row["closed_at"],
+        "resolution": refs.get("resolution"),
+        **({"due_at": due} if due else {}),
+        # Present ONLY on a row `attention --key` filed, for the same parity
+        # reason as `due_at`: the legacy oracle never had one, so an
+        # always-present key would differ from the old tool's output on every
+        # item the old tool could have produced. A sweep that files by key has
+        # to be able to find its own rows again to resolve them — `attention`
+        # already returns the key on the call that files it, but a later sweep
+        # is a different process reading the list back the contract.
+        **({ATTENTION_KEY: refs[ATTENTION_KEY]} if refs.get(ATTENTION_KEY)
+           else {}),
+        # the contract, present ONLY where a filer recorded one — the same parity
+        # rule `due_at` and `attention_key` follow. An always-present key
+        # holding None would tell every reader that somebody looked for a
+        # proposal and found none, on every row the legacy tool could have
+        # produced.
+        **({DERIVES_FROM: refs[DERIVES_FROM]} if estate_pairs.link_of(refs)
+           else {}),
+    }
 
 
-def append_ledger(event: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    event.setdefault("ts", NOW.isoformat())
-    with open(LEDGER_FILE, "a") as f:
-        f.write(json.dumps(event, sort_keys=True) + "\n")
+def followup_rows(conn):
+    return conn.execute("SELECT * FROM tasks WHERE kind='followup' ORDER BY seq").fetchall()
 
 
-# --------------------------------------------------------------------------- #
-# subcommands
-# --------------------------------------------------------------------------- #
+def insert(conn, desc: str, source: str, ref, context: str, due,
+           extra: dict | None = None):
+    """File one follow-up and return its freshly-read row.
+
+    Extracted from cmd_add so `attention` files through EXACTLY this path —
+    same `followup:N` numbering, same refs envelope, same ledger event. A
+    second insert written alongside it is a second thing to keep in step, and
+    the numbering is the half nobody would notice had drifted.
+    """
+    numbers = []
+    for row in followup_rows(conn):
+        match = LEGACY_RE.match(str(decode_refs(row).get("legacy_id", "")))
+        if match:
+            numbers.append(int(match.group(1)))
+    key = f"followup:{1 + max(numbers, default=0)}"
+    refs = {"legacy_id": key, "source": source, "ref": ref,
+            "context": context, "resolution": None}
+    refs.update(extra or {})
+    now = estate.NOW.isoformat()
+    cur = conn.execute("""INSERT INTO tasks
+      (id, project_id, kind, title, intent, status, stage, lane, created_by,
+       claimed_by, claim_expires_at, created_at, updated_at, closed_at, refs,
+       due_at)
+      VALUES ('pending-'||lower(hex(randomblob(8))),NULL,'followup',?,NULL,
+              'open',NULL,NULL,?,NULL,NULL,?,?,NULL,?,?)""",
+                       (desc, source or "followups", now, now,
+                        json.dumps(refs, sort_keys=True), due))
+    task_id = f"t-{cur.lastrowid}"
+    conn.execute("UPDATE tasks SET id=? WHERE seq=?", (task_id, cur.lastrowid))
+    event_refs = {"legacy_id": key, "source": source, "ref": ref,
+                  "description": desc, "due_at": due}
+    event_refs.update(extra or {})
+    estate.event(conn, source or "followups", "activity", "added",
+                 task_id=task_id, refs=json.dumps(event_refs, sort_keys=True),
+                 detail=f"due {due}" if due else None)
+    return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+
+def derives_from_fields(args):
+    """({derives_from: t-N}, error) — the the contract link, checked before any write.
+
+    Checked and not merely copied, for the reason the key exists: `refs.ref`
+    already held a proposal's identity in the shape "task:4", the night shift's
+    transient queue key, which is reused every night and resolves to nothing.
+    A `--derives-from` that accepted the same string would be that defect
+    filed under a more convincing name, so the shape is the gate and a bad one
+    is refused rather than stored.
+
+    Absent is absent: no flag means no key in the envelope, never a null. A
+    stored null would read to `link_of` as "somebody looked and there is no
+    proposal", and nobody looked.
+    """
+    value = (getattr(args, "derives_from", "") or "").strip()
+    if not value:
+        return {}, None
+    if not estate_pairs.TASK_ID_RE.match(value):
+        return None, (f"--derives-from must name a task as t-N, not {value!r}. "
+                      "The night shift's queue key (task:4) is reused every "
+                      "night and is exactly what this key replaces.")
+    return {DERIVES_FROM: value}, None
+
+
+def parse_due_arg(args):
+    """(due, error). The shim needs --due as much as `estate task add` does:
+    this is the path the hub files through, so without it the schema could
+    hold a deadline and the hub would still have nowhere to put one."""
+    if not getattr(args, "due", None):
+        return None, None
+    try:
+        return estate.parse_due(args.due), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def classification_fields(args):
+    """(fields, error). The the contract gate, run before anything is written.
+
+    One validator, shared with `estate proposal add` and — through
+    `estate decision check` — with `mechanic.py propose`. The refusal names
+    the exact key at fault: a filing that quietly became an `action` because
+    nobody said otherwise is the defect, not the fix.
+    """
+    try:
+        return estate_decisions.validate(
+            estate_decisions.fields_from_args(args)), None
+    except estate_decisions.DecisionFilingRefused as exc:
+        return None, str(exc)
+
+
 def cmd_add(args) -> int:
     desc = (args.description or "").strip()
     if not desc:
         print("[error] description must be non-empty", file=sys.stderr)
         return 2
-    s = load_store()
-    n = 1 + max((int(m.group(1)) for k in s["items"]
-                 if (m := re.match(r"^followup:(\d+)$", k))), default=0)
-    key = f"followup:{n}"
-    item = {
-        "id": key,
-        "description": desc,
-        "source": (args.source or "").strip(),
-        "ref": (args.ref or "").strip() or None,
-        "context": (args.context or "").strip(),
-        "status": "open",
-        "created_at": NOW.isoformat(),
-        "resolved_at": None,
-        "resolution": None,
-    }
-    s["items"][key] = item
-    save_store(s)
-    append_ledger({"id": key, "event": "added", "source": item["source"],
-                   "ref": item["ref"], "description": desc})
-    print(json.dumps(item, indent=2, sort_keys=True))
+    fields, error = classification_fields(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    due, error = parse_due_arg(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    link, error = derives_from_fields(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    estate.init_db()
+    with estate.connect() as conn:
+        estate.begin(conn)
+        row = insert(conn, desc, (args.source or "").strip(),
+                     (args.ref or "").strip() or None,
+                     (args.context or "").strip(), due, dict(fields, **link))
+        conn.commit()
+    print(json.dumps(item_from_row(row), indent=2, sort_keys=True))
     return 0
 
 
+def find_row(conn, ident):
+    """The follow-up an id names — the real task id first, `followup:N` second.
+
+    `t-N` is the id the rest of the estate speaks (`estate task show`,
+    `estate stale`, `followups due --json`'s `task_id`), so it is the one a
+    caller holding a row in front of them will type; before the contract it silently
+    matched nothing and the only working id was a `followup:N` string you had
+    to read the source to discover. The legacy name keeps resolving because it
+    is written into old ledger lines, memory notes and skill files, and those
+    references do not expire. The two vocabularies cannot collide.
+    """
+    ident = (ident or "").strip()
+    legacy_hit = None
+    for row in followup_rows(conn):
+        if row["id"] == ident:
+            return row
+        if legacy_hit is None and decode_refs(row).get("legacy_id") == ident:
+            legacy_hit = row
+    return legacy_hit
+
+
+class FollowupResolveError(ValueError):
+    """A refused follow-up resolution; safe to show to a CLI or HTTP caller."""
+
+
+class FollowupResolveConflict(FollowupResolveError):
+    """The resolver acted on a status that changed after their snapshot."""
+
+
+def apply_followup_resolve(key: str, note: str, who=None, *,
+                           expected_status: str | None = None) -> dict:
+    """Resolve one follow-up and return its resulting shape.
+
+    The one mutation path shared by ``followups resolve`` and the dashboard's
+    narrow ``POST /followup-resolve`` endpoint, on exactly the terms
+    ``bin/estate``'s ``apply_proposal_stage`` established for the proposal
+    route: one function, two callers, no second implementation.
+
+    IT LIVES HERE AND NOT IN ``bin/estate`` ON PURPOSE. A follow-up is not
+    resolved by a lifecycle verb — ``TRANSITIONS['open']`` offers ``ready`` and
+    ``drop`` and nothing else, so ``estate transition <id> done`` refuses this
+    row. Resolution is the follow-up envelope's own operation: it writes the
+    resolution note into ``refs``, then closes the task through
+    ``apply_status`` the contract so the terminal event reads ``open -> done`` —
+    the same transition every other estate close writes, tagged for P-06 and
+    carrying the auto-promote hook, rather than a bare ``open -> resolved``
+    event invisible to both.
+
+    ``expected_status`` is the optimistic lock for a browser acting on a
+    periodically refreshed snapshot, and it compares against the RAW ``status``
+    column rather than the legacy envelope's two-valued ``open``/``resolved``
+    (which reads a row escalated to ``needs-owner`` as "resolved"). The CLI
+    deliberately omits it and retains its historical behavior, re-resolution
+    included.
+
+    ``who`` is the actor on the event. ``None`` means the row's own creator,
+    which is what the CLI has always recorded; the dashboard passes its
+    configured decision actor, because a click on that page is the owner and
+    nobody else.
+    """
+    note = note or ""
+    estate.init_db()
+    with estate.connect() as conn:
+        estate.begin(conn)
+        row = find_row(conn, key)
+        if not row:
+            conn.rollback()
+            raise FollowupResolveError(
+                f"no follow-up matches '{key}'. Run `followups list` to see ids.")
+        was = row["status"]
+        if expected_status is not None:
+            if was != expected_status:
+                conn.rollback()
+                raise FollowupResolveConflict(
+                    f"{row['id']} changed from '{expected_status}' to '{was}'; "
+                    f"refresh before resolving")
+            # Only reachable when the caller itself named a terminal status.
+            # Every other stale-snapshot case is already the conflict above,
+            # which is why there is no unconditional terminality guard here:
+            # adding one would change what the CLI has always done.
+            if was in estate.TERMINAL:
+                conn.rollback()
+                raise FollowupResolveError(
+                    f"{row['id']} is already '{was}'; a follow-up that has "
+                    f"finished is not resolved a second time")
+        refs = decode_refs(row)
+        refs["resolution"] = note
+        now = estate.NOW.isoformat()
+        # The resolution note is this shim's own column and no state machine
+        # knows about it, so it is written here. The STATUS is not: see below.
+        conn.execute("UPDATE tasks SET refs=?, updated_at=? WHERE id=?",
+                     (json.dumps(refs, sort_keys=True), now, row["id"]))
+        # the contract. This used to be a hand-rolled `UPDATE tasks SET status='done'`
+        # plus a bare `open -> resolved` event, and that was the last live code
+        # path that closed a task without going through bin/estate's own
+        # closing write. Two things were wrong with it. The terminal transition
+        # carried no subsystem and no phase, so P-06's taxonomy could not see
+        # the estate's most common way of finishing something. And once the contract
+        # landed, a follow-up used as a `blocks` blocker would resolve without
+        # ever promoting the dependent waiting on it — the feature would have
+        # silently skipped the very case it was written for.
+        #
+        # `apply_status` rather than `transition`: there is deliberately no
+        # `open -> done` edge in TRANSITIONS (open goes to `ready` or
+        # `dropped`), and inventing one to suit this caller would widen the
+        # verb machine for everybody. `apply_status` is transition()'s second
+        # half and is already the documented seam for a legitimate close that
+        # is not a verb — the P-02 proposal lifecycle drives the same write
+        # through it. It carries the P-06 tagging, the fingerprint and the
+        # auto-promote hook, which is the whole of what was missing.
+        #
+        # The row is re-read because the refs UPDATE above has landed since
+        # find_row(), and apply_status reports the `old` status off what it is
+        # handed. An already-terminal follow-up is left alone: resolving one
+        # twice is idempotent here and always has been, and re-closing it would
+        # publish a `done -> done` outcome and fire the promotion a second time.
+        fresh = conn.execute("SELECT * FROM tasks WHERE id=?",
+                             (row["id"],)).fetchone()
+        if fresh["status"] not in estate.TERMINAL:
+            estate.apply_status(conn, fresh, "done", who or row["created_by"],
+                                note)
+        conn.commit()
+    # Both ids, because the two vocabularies are both real: `id` is what the
+    # CLI prints and what old ledger lines name these rows by, `task_id` is
+    # what every other estate surface speaks the contract. `item_from_row` decides
+    # which is which, so the caller is not a third place that rule lives.
+    return {"id": item_from_row(row)["id"], "task_id": row["id"],
+            "from_status": was, "status": "done", "state": "resolved",
+            "resolved_at": now, "resolution": note}
+
+
 def cmd_resolve(args) -> int:
-    s = load_store()
-    item = s["items"].get(args.id)
-    if not item:
-        print(f"[error] no follow-up matches '{args.id}'. "
-              f"Run `followups list` to see ids.", file=sys.stderr)
+    try:
+        apply_followup_resolve(args.id, args.note or "")
+    except FollowupResolveError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
         return 2
-    item["status"] = "resolved"
-    item["resolved_at"] = NOW.isoformat()
-    item["resolution"] = args.note or ""
-    save_store(s)
-    append_ledger({"id": args.id, "event": "resolved", "note": args.note or ""})
     print(f"resolved: {args.id}")
     return 0
 
@@ -125,62 +436,234 @@ def _line(item: dict) -> str:
     return f"{item['id']:>12}{ref}{src}  {item.get('description', '')[:70]}"
 
 
-def cmd_list(args) -> int:
-    s = load_store()
-    open_items = [it for it in s["items"].values() if it.get("status") == "open"]
-    if not open_items:
+def all_items():
+    estate.init_db()
+    with estate.connect() as conn:
+        return [item_from_row(row) for row in followup_rows(conn)]
+
+
+def cmd_list(_args) -> int:
+    items = [item for item in all_items() if item["status"] == "open"]
+    if not items:
         print("no open follow-ups")
         return 0
-    open_items.sort(key=lambda it: it.get("created_at") or "")
-    for it in open_items:
-        print(_line(it))
+    items.sort(key=lambda item: item.get("created_at") or "")
+    for item in items:
+        print(_line(item))
     return 0
 
 
-def cmd_show(args) -> int:
-    s = load_store()
-    items = list(s["items"].values())
-    if not items:
+def cmd_show(_args) -> int:
+    estate.init_db()
+    with estate.connect() as conn:
+        rows = followup_rows(conn)
+    if not rows:
         print("no follow-ups on file")
         return 0
-    items.sort(key=lambda it: (it.get("status") != "open", it.get("created_at") or ""))
-    for it in items:
-        tag = "open" if it.get("status") == "open" else "resolved"
-        print(f"[{tag}] {_line(it)}")
-        if it.get("context"):
-            print(f"             {it['context'][:120]}")
+    rows = sorted(rows, key=lambda row: (row["status"] != "open",
+                                         row["created_at"] or ""))
+    for row in rows:
+        item = item_from_row(row)
+        tag = "open" if item.get("status") == "open" else "resolved"
+        print(f"[{tag}] {_line(item)}")
+        if item.get("context"):
+            print(f"             {item['context'][:120]}")
+        # the contract. What this filing IS, and — for a decision — the choice
+        # itself. `json` and `add` still print exactly what they always did,
+        # so the legacy parity surfaces are untouched; this is the human view
+        # and it is the one that was hiding the question.
+        for line in estate_decisions.followup_lines(decode_refs(row)):
+            print(line)
+    return 0
+
+
+def cmd_json(_args) -> int:
+    items = all_items()
+    print(json.dumps({"items": {item["id"]: item for item in items}},
+                     indent=2, sort_keys=True))
     return 0
 
 
 # --------------------------------------------------------------------------- #
-# main
+# P-07 — the five due states, and file-or-link
 # --------------------------------------------------------------------------- #
+# ATTENTION_KEY is defined at the top: `item_from_row` reads it back out, so a
+# sweep can find the rows it filed the contract.
+
+
+def open_rows(conn):
+    return [row for row in followup_rows(conn) if row["status"] == "open"]
+
+
+def cmd_due(args) -> int:
+    """Open follow-ups by due state. `estate attention --kind followup` reads
+    the same rows; this renders them in the shim's own `followup:N` vocabulary,
+    which is what the hub and every skill file already speak."""
+    try:
+        states = estate_attention.parse_states(args.state or [])
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 2
+    now = estate.NOW
+    # Once for the whole read, not per row (see estate_attention.local_zone()).
+    zone = estate_attention.local_zone()
+    estate.init_db()
+    with estate.connect() as conn:
+        found = []
+        for row in open_rows(conn):
+            due = estate.row_get(row, "due_at")
+            state = estate_attention.classify(due, now, args.notice, zone)
+            if states and state not in states:
+                continue
+            found.append((row, state, estate_attention.days_left(due, now)))
+    found.sort(key=lambda triple: estate_attention.sort_key(
+        triple[1], triple[2], triple[0]["seq"]))
+    if args.json:
+        print(json.dumps(
+            [dict(item_from_row(row), task_id=row["id"], due_state=state,
+                  days_left=left) for row, state, left in found],
+            indent=2, sort_keys=True))
+        return 0
+    if not found:
+        print("no open follow-ups" if not states
+              else "no open follow-ups in " + ", ".join(states))
+        return 0
+    for row, state, left in found:
+        when = "" if left is None else f" {left}d"
+        print(f"[{state}{when}] {_line(item_from_row(row))}")
+    return 0
+
+
+def cmd_attention(args) -> int:
+    """File a standing attention item, or name the one already on file.
+
+    Idempotent on `--key`, and that is the whole point. Background attention
+    (a dispatch that came back needing the owner, a queue item that exited
+    `needs-you`) is discovered by a SWEEP, and a sweep runs again — on the next
+    tick, and after a crash, and after the hub session compacts and forgets
+    what it filed last time. Without a key, "relay it every tick until they
+    answer" and "file it once" are the same instruction, and the store fills
+    with one row per tick.
+
+    A resolved item with the same key does NOT suppress a new one. The
+    condition genuinely recurred: the same PR can need the owner twice, and the
+    second time is not a replay of the first.
+    """
+    desc = (args.description or "").strip()
+    if not desc:
+        print("[error] description must be non-empty", file=sys.stderr)
+        return 2
+    key = (args.key or "").strip()
+    if not key:
+        print("[error] --key must be non-empty: it is what makes a re-sweep "
+              "link instead of duplicate", file=sys.stderr)
+        return 2
+    # Before the `--key` lookup on purpose. A malformed filing must be refused
+    # whether or not this sweep happens to be the second one — an item that
+    # links today and would have been refused yesterday teaches nobody
+    # anything, and the refusal is the point.
+    fields, error = classification_fields(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    due, error = parse_due_arg(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    link, error = derives_from_fields(args)
+    if error:
+        print(f"[error] {error}", file=sys.stderr)
+        return 2
+    estate.init_db()
+    with estate.connect() as conn:
+        estate.begin(conn)
+        existing = next((row for row in open_rows(conn)
+                         if decode_refs(row).get(ATTENTION_KEY) == key), None)
+        if existing is not None:
+            conn.rollback()
+            item = dict(item_from_row(existing), task_id=existing["id"],
+                        attention_key=key, linked=True)
+            print(json.dumps(item, indent=2, sort_keys=True))
+            return 0
+        row = insert(conn, desc, (args.source or "").strip(),
+                     (args.ref or "").strip() or None,
+                     (args.context or "").strip(), due,
+                     dict(fields, **link, **{ATTENTION_KEY: key}))
+        conn.commit()
+    print(json.dumps(dict(item_from_row(row), task_id=row["id"],
+                          attention_key=key, linked=False),
+                     indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="followups — durable standing action items")
     sub = ap.add_subparsers(dest="cmd")
-
     p = sub.add_parser("add")
     p.add_argument("description")
     p.add_argument("--source", default="", help="who filed this (e.g. pr-reviewer)")
     p.add_argument("--ref", default="", help="originating key, e.g. task:7 or a PR ref")
     p.add_argument("--context", default="", help="extra detail — findings, links, etc.")
-
+    p.add_argument("--due", default="",
+                   help="deadline: YYYY-MM-DD (end of that day, UTC) or full ISO8601. "
+                        "Put the date here, not in the description.")
+    p.add_argument("--derives-from", default="",
+                   help="t-N of the proposal this follow-up derives from "
+                        "(t-1061). Recorded durably so `estate attention` can "
+                        "render the pair as ONE row instead of two.")
+    estate_decisions.add_arguments(p, required=True)
     p = sub.add_parser("resolve")
     p.add_argument("id")
     p.add_argument("note", nargs="?", default="")
-
     sub.add_parser("list")
     sub.add_parser("show")
-
+    sub.add_parser("json")
+    p = sub.add_parser("due", help="open follow-ups by due state (P-07)")
+    p.add_argument("--notice", type=float,
+                   default=estate_attention.NOTICE_DEFAULT_DAYS,
+                   help="advance-notice interval in days: how far ahead "
+                        "due_soon reaches before an item is merely `later`")
+    p.add_argument("--state", action="append",
+                   help="only these states (comma-separated, repeatable): "
+                        + ", ".join(estate_attention.ALL_STATES))
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("attention",
+                       help="file a standing attention item, or link the one "
+                            "already on file for this --key")
+    p.add_argument("description")
+    p.add_argument("--key", required=True,
+                   help="the stable identity of the CONDITION, e.g. a PR key "
+                        "or a dispatch session title. A re-sweep with the same "
+                        "key links instead of filing a duplicate.")
+    p.add_argument("--source", default="")
+    p.add_argument("--ref", default="")
+    p.add_argument("--context", default="")
+    p.add_argument("--due", default="")
+    p.add_argument("--derives-from", default="",
+                   help="t-N of the proposal this attention item derives from "
+                        "(t-1061)")
+    estate_decisions.add_arguments(p, required=True)
     args = ap.parse_args(argv)
-    if args.cmd == "add":
-        return cmd_add(args)
-    if args.cmd == "resolve":
-        return cmd_resolve(args)
-    if args.cmd == "list":
-        return cmd_list(args)
-    if args.cmd == "show":
-        return cmd_show(args)
+    commands = {"add": cmd_add, "resolve": cmd_resolve, "list": cmd_list,
+                "show": cmd_show, "json": cmd_json, "due": cmd_due,
+                "attention": cmd_attention}
+    if args.cmd in commands:
+        try:
+            code = commands[args.cmd](args)
+        except estate.estate_store.StoreMissing as exc:
+            # Same refusal, same exit code as bin/estate itself: this shim reads
+            # and writes that store, so it cannot be the one place that mints it.
+            print(str(exc), file=sys.stderr)
+            return 3
+        # the contract. `resolve` closes through estate.apply_status now, so this
+        # process can promote a dependent — and `estate` accumulates promotions
+        # rather than printing them inline, on purpose, because a line printed
+        # before a commit that never lands is a lie. bin/estate's own main()
+        # drains them afterwards; this main() is the other entry point that can
+        # fill the list, so it drains it the same way. Without this the store
+        # starts work and tells nobody.
+        estate.report_auto_promotions()
+        return code
     ap.print_help()
     return 0
 

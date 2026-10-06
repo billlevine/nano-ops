@@ -47,7 +47,7 @@ operator's requests directly through this agent-deck session (`attach` or
   directory rewrites the ground under a still-running sibling, which then keeps
   going against the wrong tree and reports success anyway. Every dispatch that
   puts a worker in an external repo gets its own `git worktree add --detach`
-  first, and `agent-deck launch <dir>` points at that worktree —
+  first, and `agent-deck -p <deck_profile> launch <dir>` points at that worktree —
   unconditionally, not only when something else looks like it is running. Same
   for the hub's own commits in a repo a dispatch might be using. Details and the
   cleanup step: the hub skill's **Worktree isolation** section.

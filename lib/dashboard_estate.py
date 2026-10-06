@@ -4,7 +4,7 @@ Two deliberately narrow write surfaces, each token-authenticated and each
 invoking the same operation its CLI does — a proposal decision through
 ``bin/estate proposal stage``'s ``apply_proposal_stage``, and a follow-up
 resolution through ``bin/followups resolve``'s ``apply_followup_resolve``
-(t-721). Nothing else on this page mutates estate state; task, project and
+the contract. Nothing else on this page mutates estate state; task, project and
 dependency controls remain display-only. The banner states that boundary
 explicitly.
 
@@ -24,7 +24,7 @@ The sections answer four different questions and are ordered that way:
                 tasks, with the follow-up envelope decoded and the due state
                 derived. Resolved follow-ups sit behind a History toggle; a
                 section that mixes them teaches its reader to skip it.
-                Split into three lifecycle tiers (t-721) — decisions,
+                Split into three lifecycle tiers the contract — decisions,
                 escalations, follow-ups — each rendered COMPLETE, with the
                 count on screen and the count it holds both on its head. The
                 row carries the stored question and recommendation where they
@@ -40,8 +40,8 @@ The sections answer four different questions and are ordered that way:
                 claimed and never was — it matched the literal string `open`
                 and so hid every `ready`, `claimed`, `blocked` and
                 `needs-owner` row in the estate. Searching an exact task id
-                (`t-152`, or `t152`) is a LOOKUP and not a filter: the row
-                shows whatever tab is selected (t-503). Every other query is
+                (`the contract`, or `t152`) is a LOOKUP and not a filter: the row
+                shows whatever tab is selected the contract. Every other query is
                 a filter and stays inside the tab.
   Projects      the operational groupings, each with counts rolled up from the
                 task rows, plus the synthetic "Unprojected work" bucket that
@@ -269,7 +269,7 @@ function idQuery(q){var m=/^\s*t-?(\d+)\s*$/.exec(q);return m?'t-'+m[1]:''}
 function drawTasks(){var q=(document.getElementById('search').value||'').toLowerCase();var id=idQuery(q);var a=(DATA.tasks||[]).filter(function(t){if(id&&t.id===id)return true;return matchesFilter(t)&&(!KIND_FILTER||t.kind===KIND_FILTER)&&(!PROJECT_FILTER||(PROJECT_FILTER==='unprojected'?!t.project_id:t.project_id===PROJECT_FILTER))&&(!q||haystack(t).indexOf(q)>=0)});document.getElementById('task-count').textContent=a.length+' shown';document.getElementById('tasks').innerHTML=rows(a,taskRow,'No matching tasks.')}
 """
 
-# ── the drill-down, fetched rather than embedded (t-1450) ────────────────────
+# ── the drill-down, fetched rather than embedded the contract ────────────────────
 #
 # Shared with the primary page's proposal panel, which embeds this constant
 # byte-for-byte the way it already embeds JS_PROPOSALS — one implementation of
@@ -573,7 +573,7 @@ document.getElementById('dep-stats').innerHTML='<div class="chips">'+(chips(DATA
 document.getElementById('deps').innerHTML=rows(list,edgeRow,'No matching relationships.')}
 """
 
-# t-476's table, resolved HERE — at the block that declares the variable, not
+# the contract's table, resolved HERE — at the block that declares the variable, not
 # at each page that embeds the block. The substitution used to live on `JS`
 # alone, and `JS_PROPOSALS` is embedded byte-for-byte by lib/dashboard_primary
 # as well: from 2026-08-12 the `/` page shipped a literal
@@ -581,7 +581,7 @@ document.getElementById('deps').innerHTML=rows(list,edgeRow,'No matching relatio
 # ReferenceError the moment the panel's IIFE runs. Everything after that line
 # — `install()`, the `ops-dashboard-data` listener, `drawProposals` — never
 # executed, so `/`'s Proposal review panel rendered NOTHING for six days and
-# said nothing about it. t-193 was staged the following day. A placeholder that
+# said nothing about it. the contract was staged the following day. A placeholder that
 # one of two embedders remembers to fill is the drift this file's own comments
 # keep warning about, so there is now one substitution and no way to forget it.
 _SURFACE_CANONICAL_JSON = json.dumps(estate_work.SURFACE_CANONICAL,
@@ -734,7 +734,7 @@ function refresh(){fetch('dashboard.json?t='+Date.now(),{cache:'no-store'}).then
 refresh();setInterval(refresh,30000);
 })();
 """
-# t-476. The server's table, not a second copy of it — a renderer that
+# the contract. The server's table, not a second copy of it — a renderer that
 # hard-coded "desired_outcome is the recommendation" would be the second
 # implementation lib/estate_work exists to prevent. The substitution itself has
 # already happened, once, on JS_PROPOSALS: this page and `/` both read
@@ -785,6 +785,7 @@ PROPOSAL_BUTTONS = ''.join(
                        ("rejected", "Rejected"), ("stopped", "Stopped"),
                        ("resolved", "Resolved"), ("all", "All")))
 
+import dashboard_nav
 def render(dashboard, snapshot: dict) -> str:
     e=html.escape; name=f'{snapshot["estate"]} / {snapshot["operator"]}'
     def panel(title, ident):
@@ -827,12 +828,11 @@ def render(dashboard, snapshot: dict) -> str:
                f'<div class="pbody"><div class="toolbar">{PROPOSAL_BUTTONS}'
                '<input class="search" id="proposal-search" placeholder="Filter by id, kind or text…"></div></div>'
                '<div class="pbody tight" id="proposals"></div></section>')
-    body=(f'<div class="wrap"><header class="masthead"><div class="brand">'
+    body=(f'<div class="wrap">{dashboard_nav.render("estate")}<header class="masthead"><div class="brand">'
           f'<div class="eyebrow">Estate operations</div>'
           f'<div class="title" id="estate-title">{e(name)}</div>'
           f'<div class="subline">attention · tasks · projects · dependencies · ledgers · memory</div></div>'
-          f'<span class="spacer"></span><a class="estate-nav" href="/">Daily dashboard</a>'
-          f'<button class="themebtn" id="themebtn">☾ Night shift</button></header>'
+          f'</header>'
           f'{BANNER}<div id="deep-link-state" class="deep-link-state" role="status"></div><div class="grid">{attention}{inbox}{proposals}{tasks}{projects}{deps}'
           f'{panel("Recent task events","events")}'
           f'{panel("Central ledger","ledger-summary")}'

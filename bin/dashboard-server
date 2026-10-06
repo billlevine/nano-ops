@@ -6,12 +6,26 @@ Tier-1. Serves the primary live shell, its polled dashboard data, and per-PR
 — no directory listing, no traversal, and no access to ledger, secrets, or
 per-loop state. GET/HEAD are read-only.
 
-Two narrow, validated write endpoints. POST /ack records that the operator
+One read endpoint beyond the allowlist: GET /estate-detail?task=t-N (or
+?project=p-N) returns one row's drill-down — its full event history off the
+authoritative table, and for a task the derived row `dashboard.json` no longer
+carries in full . Read-only, `mode=ro`, one short validated id per
+request.
+
+Three narrow, validated write endpoints. POST /ack records that the operator
 has seen a PR row's current activity signature — touches exactly one file,
 state/dashboard-acks.json, and can only ever store {id: {sig, at}} string
 pairs, bounded in count and length. POST /proposal-stage records one token-
 authenticated proposal review decision through the exact lifecycle operation
-the CLI uses. It cannot run arbitrary commands and does not invoke a shell.
+the CLI uses — including, WHICH alternative the click picked,
+carried as a bare 1-based position and validated against the proposal's own
+alternatives by `estate_pickup`, never as more prose in the note.
+POST /followup-resolve resolves one open follow-up through
+`bin/followups`' own `apply_followup_resolve`, which is that store's
+resolution operation and not a lifecycle verb — `estate transition <id> done`
+refuses a follow-up, so the entry point is the follow-up shim's and reaching
+for `apply_status` here would be reaching for the wrong one. Neither can run
+arbitrary commands and neither invokes a shell.
 
 Host/port come from loops.toml [dashboard] (default 127.0.0.1:8422). THE BIND
 ADDRESS IS THAT CONFIG'S CALL, NOT THIS FILE'S — read the [dashboard] comment
@@ -19,8 +33,9 @@ there for what the configured host actually exposes and why. This process has
 no identity layer of its own, so any host beyond loopback must be one whose
 reachability is already gated (a tailnet interface) or must have an
 authenticating reverse proxy in front. POST /ack inherits that posture; the
-more consequential POST /proposal-stage additionally requires the configured
-write token and is disabled without one. Both require application/json (so a
+more consequential POST /proposal-stage and POST /followup-resolve — the two
+that write the estate — additionally require the configured write token and
+are disabled without one. All three require application/json (so a
 cross-origin form POST cannot reach them without a preflight this server never
 answers) and emit no CORS headers. The
 shell fetches dashboard.json with a *relative* URL, so nothing in the page
@@ -39,10 +54,11 @@ import sys
 import tempfile
 import threading
 import tomllib
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 STATE = os.path.join(REPO, "state")
 ACKS = os.path.join(STATE, "dashboard-acks.json")
 ESTATE_DB = os.path.join(STATE, "estate.db")
@@ -98,8 +114,10 @@ def _allow() -> dict[str, tuple[str, str]]:
         "/index.html": (os.path.join(STATE, "index.html"), "text/html; charset=utf-8"),
         "/dashboard.json": (os.path.join(STATE, "dashboard.json"), "application/json; charset=utf-8"),
         "/acks.json": (ACKS, "application/json; charset=utf-8"),
+        "/stewards.html": (os.path.join(STATE, "stewards.html"), "text/html; charset=utf-8"),
+        "/stewards.json": (os.path.join(STATE, "stewards.json"), "application/json; charset=utf-8"),
         "/estate.html": (os.path.join(STATE, "estate.html"), "text/html; charset=utf-8"),
-        # t-414 — the v2 surface, additive and read-only. Bare path and .html
+        # the contract — the v2 surface, additive and read-only. Bare path and .html
         # both resolve, the way / and /index.html already do, so "swap between
         # the two" is one URL edit either direction.
         "/dashboard-v2": (os.path.join(STATE, "dashboard-v2.html"), "text/html; charset=utf-8"),
@@ -110,12 +128,35 @@ MAX_BODY = 64 * 1024      # an ack post is a few hundred bytes; this is slack
 MAX_IDS = 200             # more rows than the board can ever show
 MAX_FIELD = 200           # entry ids and 12-char signatures are far shorter
 ACK_TTL_DAYS = 120        # forget marks for PRs long gone from the board
+# A sanity bound on the chosen-alternative position, nothing more: the
+# authoritative check is against the proposal's OWN alternatives, and it
+# lives in estate_pickup where the CLI reaches it too. This one only keeps
+# an absurd number out of the write lock.
+MAX_ALTERNATIVES = 64
 
 # The server is threaded, and an ack is a read-modify-write of one small file.
 # Serialize them so two clicks landing together cannot lose one.
 ACK_LOCK = threading.Lock()
-PROPOSAL_LOCK = threading.Lock()
+# ONE lock for every estate write, not one per route. Both estate endpoints
+# mutate the same `tasks` table through the same in-process CLI module, and
+# both refresh that module's process-local `NOW` on the way in (see
+# apply_proposal_decision). A second lock would let one request restamp the
+# clock another request's open transaction is already writing with, which is
+# the exact hazard a per-route lock looks like it is preventing.
+ESTATE_WRITE_LOCK = threading.Lock()
 _ESTATE_MODULE = None
+_FOLLOWUPS_MODULE = None
+
+
+def _one(params: dict, name: str) -> str | None:
+    """One value for `name`, or None. A repeated parameter is a caller error
+    rather than a silent first-wins."""
+    values = params.get(name)
+    if not values:
+        return None
+    if len(values) > 1:
+        raise ValueError(f"{name} given more than once")
+    return values[0]
 
 
 def dashboard_config() -> dict:
@@ -238,49 +279,253 @@ def _load_estate():
     the server does not reimplement transitions and does not invoke a shell.
     """
     global _ESTATE_MODULE
-    if _ESTATE_MODULE is not None:
-        _ESTATE_MODULE.STATE_DIR = os.path.dirname(ESTATE_DB)
-        _ESTATE_MODULE.DB_PATH = ESTATE_DB
-        return _ESTATE_MODULE
-    source = os.path.join(REPO, "bin", "estate")
-    name = "_dashboard_estate_write"
-    loader = SourceFileLoader(name, source)
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    module.STATE_DIR = os.path.dirname(ESTATE_DB)
+    if _ESTATE_MODULE is None:
+        source = os.path.join(REPO, "bin", "estate")
+        name = "_dashboard_estate_write"
+        loader = SourceFileLoader(name, source)
+        spec = importlib.util.spec_from_loader(name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _ESTATE_MODULE = module
+    _point_estate(_ESTATE_MODULE)
+    return _ESTATE_MODULE
+
+
+def _point_estate(module) -> None:
+    """Aim the loaded CLI module at THIS server's store, all of it.
+
+    The module opens `DB_PATH`, but it decides whether it may open anything by
+    asking `STORE` (lib/estate_store.py). Repointing the path alone leaves
+    that gate asking about the store the module resolved for itself — so a
+    server aimed anywhere else was refused whenever that other store did not
+    exist, and let through whenever it did, whatever was at `DB_PATH`. When
+    the two differ, the server has named its store explicitly, which is what
+    the resolver's override means, so the gate is re-resolved on it.
+    """
+    state_dir = os.path.dirname(ESTATE_DB)
+    module.STATE_DIR = state_dir
     module.DB_PATH = ESTATE_DB
-    _ESTATE_MODULE = module
-    return module
+    store_lib = getattr(module, "estate_store", None)
+    store = getattr(module, "STORE", None)
+    if store_lib is None or store is None:
+        return
+    if os.path.normpath(store.db_path) != os.path.normpath(ESTATE_DB):
+        module.STORE = store_lib.resolve(
+            os.path.join(REPO, "bin", "estate"),
+            env={store_lib.OVERRIDE_ENV: state_dir})
 
 
 def apply_proposal_decision(payload: object) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("expected a JSON object")
-    allowed = {"id", "expected_stage", "stage", "note"}
+    # Widened by exactly one field. `chosen` is the 1-based position
+    # of the alternative the click selected — a number, never text, and never
+    # folded into `note`: the free-text note is what destroyed the identity in
+    # the first place ("the operator clicked: ..."), and a second prose field would
+    # reproduce the defect with a new name.
+    allowed = {"id", "expected_stage", "stage", "note", "chosen"}
     if set(payload) - allowed:
         raise ValueError("unexpected proposal decision field")
     key = payload.get("id")
     expected = payload.get("expected_stage")
     target = payload.get("stage")
     note = payload.get("note")
+    chosen = payload.get("chosen")
     if not all(isinstance(v, str) for v in (key, expected, target, note)):
         raise ValueError("id, expected_stage, stage and note must be strings")
     if not key or len(key) > 32 or not note.strip() or len(note) > 2000:
         raise ValueError("id or decision note out of range")
+    # A bool is an int in Python and would index alternative 1 from `true`.
+    if chosen is not None and (isinstance(chosen, bool)
+                               or not isinstance(chosen, int)):
+        raise ValueError("chosen must be the 1-based position of an alternative")
+    if isinstance(chosen, int) and not 1 <= chosen <= MAX_ALTERNATIVES:
+        raise ValueError("chosen is out of range")
     # The CLI module's NOW is process-local because a CLI invocation is short.
     # Serialize this tiny write surface and refresh that clock per request so a
     # long-lived server preserves the same semantics without a second clock.
-    with PROPOSAL_LOCK:
+    with ESTATE_WRITE_LOCK:
         estate = _load_estate()
         estate.NOW = datetime.now(timezone.utc)
         try:
             return estate.apply_proposal_stage(
-                key, target, note, decision_actor(), expected_stage=expected)
+                key, target, note, decision_actor(), expected_stage=expected,
+                chosen=chosen)
         except estate.ProposalStageConflict as exc:
             raise RuntimeError(str(exc)) from exc
         except estate.ProposalStageError as exc:
             raise ValueError(str(exc)) from exc
+
+
+def _load_followups():
+    """Load the follow-up shim, sharing this process's ONE estate module.
+
+    `bin/followups` resolves its own `estate` at import time, which would give
+    this process a second CLI module with a second `NOW` to keep in step. It is
+    replaced here rather than re-pointed: the shim reaches everything through
+    the `estate.` attribute, so one assignment leaves exactly one clock, one
+    resolved store and one place a test repoints.
+    """
+    global _FOLLOWUPS_MODULE
+    if _FOLLOWUPS_MODULE is None:
+        source = os.path.join(REPO, "bin", "followups")
+        name = "_dashboard_followups_write"
+        loader = SourceFileLoader(name, source)
+        spec = importlib.util.spec_from_loader(name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _FOLLOWUPS_MODULE = module
+    _FOLLOWUPS_MODULE.estate = _load_estate()
+    _FOLLOWUPS_MODULE.STATE_DIR = _FOLLOWUPS_MODULE.estate.STATE_DIR
+    return _FOLLOWUPS_MODULE
+
+
+def apply_followup_resolution(payload: object) -> dict:
+    """the attention set's one write verb, validated the same way.
+
+    WHY THIS VERB, and only this one. The attention set has three exit arcs.
+    `needs-owner -> dropped` is the one an owner rarely walks, so a `drop`
+    button would be a control for a path nobody takes. `needs-owner -> ready`
+    is usually walked by the machine (`cli`, `hub`) rather than the owner, so
+    a hand-back button may only be handing work to the machine that hands it
+    straight back. Follow-up resolution is the arc the owner actually walks,
+    against the largest of the three lifecycle tiers, and it had no control on
+    any surface at all.
+
+    It needs the estate-backed `bin/followups` (the one exposing
+    `apply_followup_resolve`). Against a follow-up store that predates it the
+    route answers 501 and says so, rather than reaching for a lifecycle verb
+    that store would refuse.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("expected a JSON object")
+    allowed = {"id", "expected_status", "note"}
+    if set(payload) - allowed:
+        raise ValueError("unexpected follow-up resolution field")
+    key = payload.get("id")
+    expected = payload.get("expected_status")
+    note = payload.get("note")
+    if not all(isinstance(v, str) for v in (key, expected, note)):
+        raise ValueError("id, expected_status and note must be strings")
+    if not key or len(key) > 32 or not note.strip() or len(note) > 2000:
+        raise ValueError("id or resolution note out of range")
+    with ESTATE_WRITE_LOCK:
+        followups = _load_followups()
+        if not hasattr(followups, "apply_followup_resolve"):
+            raise NotImplementedError(
+                "bin/followups here predates the estate-backed follow-up "
+                "store; it has no resolution operation to call")
+        followups.estate.NOW = datetime.now(timezone.utc)
+        try:
+            return followups.apply_followup_resolve(
+                key, note, decision_actor(), expected_status=expected)
+        except followups.FollowupResolveConflict as exc:
+            raise RuntimeError(str(exc)) from exc
+        except followups.FollowupResolveError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+# ── GET /estate-detail — the drill-down the snapshot stopped carrying ─
+#
+# dashboard.json used to embed a full per-task event join over EVERY task ever
+# created plus each row's raw `refs` — most of `estate_activity` —
+# refetched whole by every open tab every 30 seconds to be read by nobody. It
+# now carries the collapsed row; this is where the body comes from.
+#
+# THIS IS THE OPPOSITE OF THE TRUNCATION P-16 CAUGHT. That fix answered "what
+# happened to this task" out of the snapshot's 80-row recent-events tail, and
+# silently emptied the history of every task whose events had scrolled off it.
+# This answers it from the authoritative `events` table through
+# `estate_events.select` — the same query surface `bin/estate events` uses, so
+# the CLI, the page and this endpoint cannot answer differently — and returns
+# a task's history WHOLE, however old. Nothing is capped and nothing is
+# tailed; what changed is only WHEN it is read.
+#
+# The task row is derived by `estate_work.build`, the same composed read the
+# snapshot itself uses, rather than by a second single-task derivation that
+# could drift from it. That reads the whole task table (tens of milliseconds
+# on a store with thousands of tasks), which is the right trade for a request a person
+# causes by clicking one disclosure and never for the 45-second regen.
+#
+# READ-ONLY, and unauthenticated exactly as GET /dashboard.json is: it returns
+# what that file already returned yesterday, for one row at a time. The
+# connection is opened `mode=ro`, no write path is reachable from here, and
+# both parameters are validated to a short id before any query runs.
+
+_ESTATE_LIB_READY = False
+ID_RE = None
+
+
+def _estate_lib():
+    """`actors`, `estate_events` and `estate_work` from lib/, imported lazily.
+
+    Lazily so a serve of the static shells still works on a checkout whose
+    lib/ is unavailable — the drill-down degrades to a stated failure, and the
+    board does not.
+    """
+    global _ESTATE_LIB_READY, ID_RE
+    lib = os.path.join(REPO, "lib")
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    import re
+
+    import actors
+    import estate_events
+    import estate_work
+    if not _ESTATE_LIB_READY:
+        ID_RE = re.compile(r"^[a-z]-\d{1,9}$")
+        _ESTATE_LIB_READY = True
+    return actors, estate_events, estate_work
+
+
+def loop_names() -> list[str]:
+    """The registry's loop names, for `actors.normalize_row` — the same
+    argument `build_estate_activity` passes, so an actor is folded into the
+    taxonomy identically here and in the snapshot."""
+    try:
+        with open(os.path.join(REPO, "loops.toml"), "rb") as f:
+            return sorted(tomllib.load(f).get("loops", {}))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+
+
+def estate_detail(task: str | None, project: str | None) -> dict:
+    """One task's (or one project's) drill-down, whole.
+
+    A project's history is its own rows AND its tasks' — `estate_events`'
+    `project` filter already returns both, so the composition the page used to
+    do client-side over the embedded map happens in one indexed read here.
+    """
+    actors, estate_events, estate_work = _estate_lib()
+    key = task or project
+    if not key or not ID_RE.match(key):
+        raise ValueError("expected task=t-N or project=p-N")
+    if task and project:
+        raise ValueError("ask for one task or one project, not both")
+    names = loop_names()
+    conn = sqlite3.connect(f"file:{ESTATE_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        conn.row_factory = sqlite3.Row
+        out: dict = {"id": key, "events": [], "task": None, "available": True}
+        try:
+            rows = estate_events.select(
+                conn, {"task": key} if task else {"project": key})
+        except estate_events.MissingColumn as exc:
+            # A store too old to link events to a task cannot answer, and
+            # saying so is not the same as saying there are none
+            # (docs/absence-contract.md).
+            return {"id": key, "events": [], "task": None,
+                    "available": False, "why": str(exc)}
+        out["events"] = [actors.normalize_row(dict(r), names) for r in rows]
+        if task:
+            work = estate_work.build(conn)
+            for row in work["tasks"]:
+                if row["id"] == key:
+                    out["task"] = row
+                    break
+        return out
+    finally:
+        conn.close()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -301,8 +546,97 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj).encode("utf-8"),
                    "application/json; charset=utf-8")
 
+    def _accepts_gzip(self) -> bool:
+        for item in (self.headers.get("Accept-Encoding") or "").split(","):
+            coding, *params = item.strip().lower().split(";")
+            if coding not in ("gzip", "*"):
+                continue
+            quality = 1.0
+            for param in params:
+                name, _, value = param.strip().partition("=")
+                if name == "q":
+                    try:
+                        quality = float(value)
+                    except ValueError:
+                        quality = 0.0
+            if quality > 0:
+                return True
+        return False
+
+    def _dashboard_representation(self) -> tuple[str, str | None, bool]:
+        """Return filename, current ETag, and whether it is gzip encoded."""
+        identity = os.path.join(STATE, "dashboard.json")
+        metadata_path = identity + ".validators.json"
+        metadata = None
+        try:
+            with open(metadata_path, encoding="utf-8") as f:
+                metadata = json.load(f)
+        except (OSError, ValueError, TypeError):
+            pass
+
+        def current(filename: str, key: str) -> str | None:
+            if not isinstance(metadata, dict):
+                return None
+            record = metadata.get(key)
+            if not isinstance(record, dict):
+                return None
+            try:
+                stat = os.stat(filename)
+                if (stat.st_size != record["size"] or
+                        stat.st_mtime_ns != record["mtime_ns"]):
+                    return None
+                etag = record["etag"]
+                return etag if isinstance(etag, str) else None
+            except (OSError, KeyError, TypeError):
+                return None
+
+        identity_etag = current(identity, "identity")
+        gzip_path = identity + ".gz"
+        gzip_etag = current(gzip_path, "gzip")
+        if self._accepts_gzip() and identity_etag and gzip_etag:
+            return gzip_path, gzip_etag, True
+        return identity, identity_etag, False
+
+    def _send_dashboard(self) -> None:
+        try:
+            filename, etag, encoded = self._dashboard_representation()
+            source = open(filename, "rb")
+            size = os.fstat(source.fileno()).st_size
+        except OSError:
+            self._send(503, b"dashboard not generated yet - run bin/dashboard\n")
+            return
+        not_modified = etag is not None and any(
+            candidate.strip() in (etag, "*")
+            for candidate in (self.headers.get("If-None-Match") or "").split(","))
+        self.send_response(304 if not_modified else 200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if not not_modified:
+            self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Vary", "Accept-Encoding")
+        if encoded:
+            self.send_header("Content-Encoding", "gzip")
+        if etag:
+            self.send_header("ETag", etag)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not_modified or self.command == "HEAD":
+            source.close()
+            return
+        with source:
+            self.wfile.write(source.read())
+
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
+        if path == "/artifacts" or path.startswith("/artifacts/"):
+            self._send_artifact(path)
+            return
+        if path == "/estate-detail":
+            self._handle_estate_detail(query)
+            return
+        if path == "/dashboard.json":
+            self._send_dashboard()
+            return
         entry = _allow().get(path)
         if entry is None:
             self._send(404, b"not found\n")
@@ -322,12 +656,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def _send_artifact(self, path: str) -> None:
+        """A steward artifact, or its listing. Read-only; every refusal is 404."""
+        lib = os.path.join(REPO, "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        import steward_artifacts as art
+        try:
+            if path in ("/artifacts", "/artifacts/"):
+                self._send_sandboxed(200, art.index_html(STATE).encode("utf-8"),
+                                     "text/html; charset=utf-8", art)
+                return
+            rest = path[len(art.URL_PREFIX):]
+            if rest.endswith("/") and art.SLUG_RE.fullmatch(rest[:-1]):
+                self._send_sandboxed(200, art.index_html(STATE, rest[:-1]).encode(
+                    "utf-8"), "text/html; charset=utf-8", art)
+                return
+            source, ctype = art.open_artifact(STATE, path)
+            with source:
+                body = source.read(art.MAX_FILE_BYTES + 1)
+                if len(body) > art.MAX_FILE_BYTES:
+                    raise art.ArtifactError("artifact grew too large")
+        except (art.ArtifactError, OSError):
+            self._send(404, b"not found\n")
+            return
+        self._send_sandboxed(200, body, ctype, art)
+
+    def _send_sandboxed(self, code: int, body: bytes, ctype: str, art) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", art.SANDBOX_CSP)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _handle_estate_detail(self, query: str) -> None:
+        """One row's drill-down. Read-only, and it never guesses: a store it
+        could not open answers `available: false` with the reason, so the page
+        can say the history could not be read instead of that there is none."""
+        params = urllib.parse.parse_qs(query, keep_blank_values=True)
+        try:
+            detail = estate_detail(_one(params, "task"), _one(params, "project"))
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)}); return
+        except (OSError, sqlite3.Error) as exc:
+            self._json(503, {"available": False,
+                             "why": f"the estate store could not be read: {exc}"})
+            return
+        except ImportError as exc:
+            self._json(503, {"available": False,
+                             "why": f"the estate reader is unavailable: {exc}"})
+            return
+        self._json(200, detail)
+
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/ack":
             self._handle_ack()
         elif path == "/proposal-stage":
             self._handle_proposal_stage()
+        elif path == "/followup-resolve":
+            self._handle_followup_resolve()
         else:
             self._send(404, b"not found\n")
 
@@ -346,9 +739,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("malformed json") from exc
 
-    def _handle_proposal_stage(self) -> None:
+    def _handle_estate_write(self, apply, what: str) -> None:
+        """The fail-closed gate every estate write goes through.
+
+        One body for both routes rather than two that drift: the half worth
+        keeping identical is the order — a missing token is refused before the
+        request body is read, and a wrong one before anything is applied.
+        """
         if write_token() is None:
-            self._json(503, {"error": "proposal decisions are not configured; "
+            self._json(503, {"error": f"{what} are not configured; "
                              "set state/secrets/dashboard-write-token"})
             return
         if not proposal_write_authorized(self.headers):
@@ -363,14 +762,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(400, {"error": str(exc)}); return
         try:
-            result = apply_proposal_decision(payload)
+            result = apply(payload)
+        except NotImplementedError as exc:
+            self._json(501, {"error": str(exc)}); return
         except RuntimeError as exc:
             self._json(409, {"error": str(exc)}); return
         except ValueError as exc:
             self._json(400, {"error": str(exc)}); return
         except (OSError, sqlite3.Error) as exc:
-            self._json(500, {"error": f"cannot persist proposal decision: {exc}"}); return
+            self._json(500, {"error": f"cannot persist {what[:-1]}: {exc}"}); return
         self._json(200, result)
+
+    def _handle_proposal_stage(self) -> None:
+        self._handle_estate_write(apply_proposal_decision, "proposal decisions")
+
+    def _handle_followup_resolve(self) -> None:
+        self._handle_estate_write(apply_followup_resolution,
+                                  "follow-up resolutions")
 
     def _handle_ack(self) -> None:
         # Write-protection gate: reject a missing/wrong token before anything is
@@ -424,6 +832,7 @@ def main() -> int:
     except OSError as exc:
         sys.exit(f"dashboard-server: cannot bind {host}:{port}: {exc}")
     return 0
+
 
 
 if __name__ == "__main__":

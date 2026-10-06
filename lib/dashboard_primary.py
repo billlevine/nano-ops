@@ -11,8 +11,14 @@ import brief_manifest
 import dashboard_estate
 
 PRIMARY_CSS = r"""
-.estate-ops-link{font-size:11px;color:var(--info);text-decoration:none;border:1px solid var(--edge);border-radius:7px;padding:6px 9px}
 /* Primary-page additions, scoped to their owning components. */
+/* Keep the summary shortcuts without a second rack of large count cards. */
+#vitals{gap:6px 16px;align-items:center}
+#vitals .vital{display:flex;align-items:baseline;gap:5px;padding:2px 0;
+  min-width:0;background:none;border:0;border-radius:0;box-shadow:none}
+#vitals .vital .n{font-size:14px}
+#vitals .vital .l{font-size:10px;letter-spacing:.04em;margin-top:0}
+#vitals .vital.jumpable:hover{transform:none;text-decoration:underline}
 .digest-tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:10px;
   margin-bottom:12px;border-bottom:1px solid var(--hair);scrollbar-width:thin}
 .digest-tab{font:inherit;font-size:10.5px;color:var(--faint);white-space:nowrap;
@@ -112,14 +118,13 @@ PRIMARY_CSS += dashboard_estate.PROPOSAL_CSS + r"""
 
 PRIMARY_JS = r"""
 (function(){
-  var mast=document.querySelector('.masthead'),theme=document.getElementById('themebtn');
-  if(mast&&!document.querySelector('.estate-ops-link')){var link=document.createElement('a');link.className='estate-ops-link';link.href='estate.html';link.textContent='Estate operations';mast.insertBefore(link,theme);}
   /* Recompose the shared panels for the primary information hierarchy.
      Moving the existing nodes preserves IDs, listeners, scroll state, and
      the shared live updater. */
   var grid=document.querySelector('.grid');
   if(grid){
     [
+      ['sec-today','col-12'],
       ['sec-focus','col-12'],
       ['sec-pr','col-12'],
       ['sec-brief','col-12'],
@@ -197,14 +202,11 @@ PRIMARY_JS = r"""
     toggle.addEventListener('click',function(){setCollapsed(!collapsed);});
   }
 
-  // `https://` only, and deliberately no allowlist of hosts: the tracker a
-  // project lives in is an installation's choice, and the guard here is about
-  // refusing to linkify something that is not an absolute external URL.
   function linkProjects(){
     var focus=document.getElementById('sec-focus');if(!focus)return;
     Array.prototype.forEach.call(focus.querySelectorAll('span'),function(title){
       var url=projectUrls[title.textContent.trim()];
-      if(!url||url.indexOf('https://')!==0||title.parentElement.closest('.focus-project-link'))return;
+      if(!url||url.indexOf('https://linear.app/')!==0||title.parentElement.closest('.focus-project-link'))return;
       var link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noopener';
       link.className='focus-project-link';title.parentNode.insertBefore(link,title);link.appendChild(title);
     });
@@ -253,15 +255,7 @@ PRIMARY_JS = r"""
     });
     return {intro:intro,sections:sections};
   }
-  // Digest sections that render expanded, because they are the ones a reader
-  // has to act on rather than skim. Which headings those are is a property of
-  // the brief an installation writes, not of this renderer, so the list is an
-  // override point: set window.DIGEST_PRIORITY_SECTIONS to your own lowercase
-  // substrings before this script runs. The default matches the estate's own
-  // attention vocabulary and nothing else.
-  var PRIORITY_SECTIONS=window.DIGEST_PRIORITY_SECTIONS||['needs you','attention','blocked'];
-  function isPriority(title){var t=String(title||'').toLowerCase();
-    return PRIORITY_SECTIONS.some(function(p){return t.indexOf(p)>=0;});}
+  function isPriority(title){return (window.OPS_DIGEST_PRIORITY_HEADINGS||[]).some(function(h){return String(title).toLowerCase().includes(String(h).toLowerCase());});}
   function activityHtml(sec){
     var lines=[];sec.blocks.forEach(function(b){
       if(b.type==='text')lines=lines.concat(b.text.split('\n'));
@@ -451,7 +445,7 @@ document.addEventListener('ops-dashboard-data',function(ev){
 """.replace('__BUTTONS__', buttons)
     # Rows, badges, decision transitions and the authenticated write request
     # are owned by dashboard_estate and embedded byte-for-byte here — and
-    # since t-1450 so is the drill-down fetch (JS_DETAIL), because a proposal's
+    # since the contract so is the drill-down fetch (JS_DETAIL), because a proposal's
     # history is no longer in the snapshot and one implementation of asking for
     # it is the point.
     return (adapter_head + dashboard_estate.JS_DETAIL
@@ -463,7 +457,7 @@ def render(dashboard, snapshot: dict) -> str:
     return dashboard.render_shell(
         snapshot,
         extra_css=PRIMARY_CSS,
-        extra_js=source_config() + PRIMARY_JS + proposal_review_js(),
+        extra_js=("window.OPS_DIGEST_PRIORITY_HEADINGS=" + json.dumps(snapshot.get("priority_headings", [])) + ";\n" + source_config()) + PRIMARY_JS + proposal_review_js(),
         unmanaged_sections=("brief", "mechanic"),
         brief_tick="recent briefs · locally checkable",
     )

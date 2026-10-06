@@ -71,13 +71,13 @@ bin/dashboard          estate dashboard renderer (pure reader; --json regen path
 bin/dashboard-refresh  keeps state/dashboard.json fresh via `dashboard --json`
 bin/dashboard-server   loopback-only static server for the dashboard (allowlist)
 bin/usage-fetch        writes state/usage/budget.json from Anthropic's usage API
-bin/followups          durable standing-action-item store
+bin/followups          durable standing-action-item store (a shim over bin/estate)
 bin/persona-compile    compiles personas/ into one body per role; --install
                        wires it into each target via a persona.md sidecar
 personas/              the voice layer: WORLDVIEW.md + HOUSE_STYLE.md + roles/
                        + crews/, plus config.example.toml (copy → config.toml)
 tests/                 test_dashboard.py, test_doorbell.py, test_followups.py,
-                       test_hub_skill.py, test_mechanic.py,
+                       test_hub_skill.py, test_mechanic.py, test_ops_health.py,
                        test_persona_compile.py, test-interactive-hub
 .flox/env/manifest.toml  toolchain + [services], each under the supervisor wrapper
 loops.example.toml     committed sample registry (copy → loops.toml)
@@ -112,7 +112,9 @@ data are not — is what keeps it that way.
 
 `tests/test_dashboard.py`, `tests/test_doorbell.py` and
 `tests/test_followups.py` are self-contained `unittest` suites over the
-dashboard renderer, the inbox poller and the followups store. Each runs against
+dashboard renderer, the inbox poller and the followups shim — the last one
+also as output parity against its frozen JSON-store original under
+`tests/_fixtures/`. Each runs against
 a fresh tempdir and never touches real `state/`, real Slack, or a real
 `loops.toml` — `test_doorbell.py` covers the pane sweep too, with agent-deck
 and tmux injected rather than run. `tests/test_hub_skill.py` covers the hub tick's channel-less
@@ -130,6 +132,7 @@ python3 tests/test_dashboard.py
 python3 tests/test_doorbell.py
 python3 tests/test_followups.py
 python3 tests/test_hub_skill.py
+python3 tests/test_ops_health.py
 python3 tests/test_persona_compile.py
 ```
 
@@ -213,3 +216,19 @@ The services approach is being proven **here first**, then folded back upstream.
 
 See [`docs/services-vs-systemd.md`](./docs/services-vs-systemd.md) for the full
 Flox-`[services]`-vs-systemd findings that motivated this port.
+
+## Optional mechanism readers
+
+The dashboard can read Today tasks, a project-session registry and isolated
+local artifacts when an installation provides them. `lib/today_list.py`,
+`lib/steward_health.py` and `lib/steward_artifacts.py` are the shared readers;
+artifact publishing validates paths and the HTTP route applies a sandbox.
+The health reader can run as `python3 lib/steward_health.py --help`.
+It reads the agent-deck profile from `[hub].deck_profile` or an explicit
+`--profile`; missing inputs produce unknown readings.
+
+Installation writers and supervisors referenced by the mechanism contracts
+(such as intake, dispatches, project-session creation and independent hub
+restart) are adapter boundaries. They are not commands installed by this core.
+Use the seven contract documents in `docs/` to implement those boundaries for
+an installation without copying its accounts, standing orders or runtime data.
