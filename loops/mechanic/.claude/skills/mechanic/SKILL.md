@@ -145,13 +145,14 @@ fingerprint of its condition and one of five review stages:
 
     mechanic.py propose '{"title":"...","subsystem":"hub",
                           "condition":"...","desired_outcome":"...",
-                          "completion_check":"...","class":"cost"}'
+                          "completion_check":"...","class":"cost",
+                          "classification":"action"}'
 
 That files the task AND writes the matching `finding` line to history.jsonl
 with the same task id and finding id, so the two records cannot drift. It
 prints `t-N new f-<night>-NN` or `t-N recurrence f-<night>-NN`.
 
-**All five of those fields are required** (the consistency contract), because a proposal
+**All five fields plus classification are required** (the consistency contract), because a proposal
 missing any of them is not something the operator can decide on:
 
 | field | what it answers |
@@ -424,7 +425,7 @@ recorded, `windows` says `done` until the next night.
    Writing P1 gives you no authority to make the change, and neither does
    the operator agreeing with it in the channel — that is the hub's work, or the
    development session's. There is no lane in which it becomes yours.
-9. `record '{"event":"pass_done","findings":N,"proposed":N,"observed":N,"no_proposal":N}'`,
+9. `record '{"event":"pass_done"}'`,
    then append one summary line to `../../state/ledger.jsonl` as
    `{"ts","actor":"mechanic","kind":"activity","summary":"..."}`.
 
@@ -524,3 +525,25 @@ Run `/loop 20m /mechanic` in a dedicated session. Outside the window
 every tick is a one-line heartbeat; inside it, the first tick runs the
 night's single pass (a later tick `resume`s it if it was interrupted).
 Never set or export ANTHROPIC_API_KEY.
+
+## Durable filing and pass boundaries
+
+Every proposal declares `classification`: `action` for a chosen next step,
+`clarification` when alternatives cannot yet be stated, or `decision` for a
+choice. A decision also carries `decision_question`, two `options` with a
+consequence each, `recommendation`, and `defer_consequence`. A recommendation
+may explicitly be `not recorded`; the key is still required.
+
+Use `recurrence_of: "t-N"` when this is evidence of the same existing condition.
+The engine validates that row and retains its identity even when wording or
+counts change. It never chooses a prior task by similar prose.
+
+`mechanic.py tally` counts recorded findings. `pass_done` derives its counts
+from history; never type totals from memory. An interrupted pass records
+`mechanic.py pass failed --reason "..."` (optionally `--night YYYY-MM-DD`).
+This produces a failed terminal run and preserves the partial history.
+
+`mechanic.py memory-triage --older-than-days 14` prepares one disposition
+proposal per long-waiting memory candidate and pins recurrence identity.
+A candidate remains unrecallable until an authorized curator promotes it.
+This diagnostic proposes; it never promotes or rejects a memory itself.

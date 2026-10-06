@@ -197,9 +197,8 @@ def load_config() -> dict:
                 f'pass_start = "{CONFIG_DEFAULTS["pass_start"]}"\n'
                 f'pass_end = "{CONFIG_DEFAULTS["pass_end"]}"\n')
     cfg = dict(CONFIG_DEFAULTS)
-    if tomllib:
-        with open(path, "rb") as f:
-            cfg.update(tomllib.load(f))
+    with open(path, "rb") as f:
+        cfg.update(tomllib.load(f))
     return cfg
 
 
@@ -987,7 +986,7 @@ def validate_event(e: dict, night: str, events: list[dict]) -> str | None:
         if e.get("action") == "proposed":
             return ("a proposed finding is filed with `mechanic.py propose`, "
                     "which writes the durable proposal task and this line "
-                    "together (a prior finding)")
+                    "together (P-02)")
         if e.get("subsystem") not in SUBSYSTEMS:
             return (f"subsystem must be one of: {', '.join(SUBSYSTEMS)} "
                     f"(got {e.get('subsystem')!r})")
@@ -999,6 +998,13 @@ def validate_event(e: dict, night: str, events: list[dict]) -> str | None:
                     "from never having looked")
         return None
     if kind == "pass_done":
+        typed = [k for k in (TALLY_TOTAL, *TALLY_KEYS) if k in e]
+        if typed:
+            return (f"the tally is not yours to type ({', '.join(typed)}) — "
+                    "the engine counts tonight's `finding` rows by action and "
+                    "stamps them on this line itself. Record "
+                    "`{\"event\":\"pass_done\"}` and read the numbers back "
+                    "off it (t-251)")
         gaps = missing_subsystems(events)
         if gaps:
             return (f"the pass is not complete: {len(gaps)} of "
@@ -1091,16 +1097,22 @@ def cmd_record(event_json: str, cfg: dict) -> int:
         e.setdefault("finding", next_finding_id(night, events))
         # The ledger first, for the same reason `propose` calls the estate
         # first: a history line whose outcome never reached the shared record
-        # is a finding only this loop can see, which is the gap a prior finding closes.
+        # is a finding only this loop can see, which is the gap P-09 closes.
         ok, err = emit_finding_outcome(e, night)
         if not ok:
             print(f"record: the finding outcome did not reach the ledger "
                   f"({err}) — nothing recorded", file=sys.stderr)
             return 1
+    if e.get("event") == "pass_done":
+        # the contract. `events` is tonight's history as it stands BEFORE this line,
+        # and a pass boundary is not a finding, so every finding the night
+        # recorded is already in it. Stamped before the append and before the
+        # ledger emit, so history.jsonl and the shared row carry one tally.
+        e.update(finding_tally(events))
     e = append_history(e, cfg)
-    # a prior finding, after the history line rather than before it. A finding's estate
+    # P-06, after the history line rather than before it. A finding's estate
     # row comes FIRST because a history line claiming an outcome nobody outside
-    # this loop can see is the gap a prior finding closed. A pass boundary is the other
+    # this loop can see is the gap P-09 closed. A pass boundary is the other
     # way round: history.jsonl is what `derive_phase` reads to decide whether
     # tonight is a fresh pass or a resume, so it must never be missing because
     # a second store was locked. Best-effort, and it says so if it failed.
@@ -1113,6 +1125,12 @@ def cmd_record(event_json: str, cfg: dict) -> int:
             print(f"[warn] {e['event']} did not reach the shared Ledger ({why}) "
                   "— history.jsonl has it", file=sys.stderr)
     trailer = f" [{e['finding']}]" if e.get("finding") else ""
+    if e["event"] == "pass_done":
+        # Printed back because this is now the pass's only source for these
+        # numbers: the summary ledger line and REPORT.md are written from what
+        # comes out here, not from what anyone remembers the contract.
+        trailer = " — " + ", ".join(f"{k}={e[k]}"
+                                    for k in (TALLY_TOTAL, *TALLY_KEYS))
     print(f"recorded {e['event']}{trailer} (night {e['night']})")
     return 0
 
@@ -1228,7 +1246,7 @@ def emit_pass_event(e: dict, night: str,
     records `pass_start` twice for one night — a resumed tick replaying its
     own history — lands one row. That is the same night, not a second pass.
 
-    a prior finding rides on the same row rather than beside it: this boundary IS the
+    P-08 rides on the same row rather than beside it: this boundary IS the
     mechanic's scheduled-run record, so it carries `mechanic/<night>` and the
     run outcome. One event, one row, two readings of it.
     """
@@ -1238,11 +1256,16 @@ def emit_pass_event(e: dict, night: str,
         return True, ""
     outcome = run_outcome_for(name, list(tonight_events))
     run = f"{LEDGER_SUBSYSTEM}/{night}"
-    counts = {k: e[k] for k in ("findings", "proposed", "applied")
+    # The whole tally, not the two-of-four this used to pick. The numbers are
+    # counted rather than typed now the contract, so the shared row can carry the
+    # breakdown instead of sending a reader outside this loop to history.jsonl
+    # for it. `applied` is legacy — no pass has written one since the apply
+    # lane was removed (P-14) — and is passed through if it ever turns up.
+    counts = {k: e[k] for k in (TALLY_TOTAL, *TALLY_KEYS, "applied")
               if e.get(k) is not None}
     tail = (" — " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             if counts else "")
-    # a prior finding. The pass's own intake row says which facts were in scope when the
+    # P-05. The pass's own intake row says which facts were in scope when the
     # night started — the ids AND the scopes, because a promotion moves a
     # memory and the record is of what was recalled THEN. Only on the boundary
     # that begins the pass: `pass_done` and `pass_failed` are about what the
@@ -1254,10 +1277,18 @@ def emit_pass_event(e: dict, night: str,
         if why:
             print(f"[warn] memory recall did not reach the pass_start row "
                   f"({why}) — the pass still runs", file=sys.stderr)
+    # A failure's reason travels with it into the shared store, not only into
+    # history.jsonl. The whole difference between a recorded `failed` and a
+    # derived `incomplete` is that somebody said what broke, and a reader of
+    # `estate events --run-outcome failed` is exactly who needs to see it.
+    reason = str(e.get("reason") or "").strip()
+    detail = ["--detail", reason[:500]] if reason else []
+    summary = (f"night {night}: {name}{tail}"
+               + (f" ({reason})" if reason else ""))[:300]
     rc, out, err = _estate(
         "event", "--actor", ESTATE_ACTOR, "--kind", "activity",
-        "--summary", f"night {night}: {name}{tail}"[:300],
-        "--subsystem", LEDGER_SUBSYSTEM, "--phase", phase,
+        "--summary", summary,
+        "--subsystem", LEDGER_SUBSYSTEM, "--phase", phase, *detail,
         # The fingerprint stays keyed on (night, event name) and NOT on the run
         # outcome. A resumed pass that recorded findings after an empty first
         # tick must not be able to file a second `pass_done` under a different
@@ -1268,7 +1299,8 @@ def emit_pass_event(e: dict, night: str,
             key=night, ts=night, event=name),
         "--run-id", run, "--run-outcome", outcome,
         "--refs", json.dumps(dict(counts, **recall, night=night, event=name,
-                                  run=run, run_outcome=outcome),
+                                  run=run, run_outcome=outcome,
+                                  **({"reason": reason} if reason else {})),
                              sort_keys=True))
     return rc == 0, (err or out)
 
@@ -1313,8 +1345,9 @@ def emit_finding_outcome(e: dict, night: str, task: str = "") -> tuple[bool, str
 def cmd_propose(payload_json: str, cfg: dict) -> int:
     """File one proposal durably, and record the matching finding line.
 
-    Payload, all five required (a prior finding — a proposal the operator cannot act on is not a
-    proposal):
+    Payload, all six required (P-09 and the contract — a proposal the operator cannot act on
+    is not a proposal, and one that does not say what KIND of thing it is
+    arrives in the same undifferentiated list as everything else):
       title             the recommendation, in one line
       subsystem         which of the nine this is about
       condition         what was observed. The fingerprint derives from it, so
@@ -1322,7 +1355,31 @@ def cmd_propose(payload_json: str, cfg: dict) -> int:
                         differently on another night, land on the same task
       desired_outcome   what the estate looks like once this is settled
       completion_check  how anyone tells it actually is
-    Optional: class, intent, summary, note.
+      classification    `decision`, `action` or `clarification` the contract
+
+    A `classification` of `decision` requires four more: `question`,
+    `alternatives` (>= 2, each an object with `option` and `consequence`),
+    `recommendation` — the key is REQUIRED and the value may be the exact
+    words "not recorded" — and `defer_consequence`. `clarification` is a real
+    and cheap exit for a condition with no statable options yet; inventing an
+    option set for one would be worse than the gap it closed.
+
+    Optional: class, intent, summary, note, recurrence_of, fingerprint.
+
+    `fingerprint` pins the proposal's identity by NAME instead of deriving it
+    from the condition prose the contract. Use it only when the caller already
+    knows a stable name for the condition — `memory-candidate:m-51` — and
+    namespace it, because two numbering schemes with the same bare key is a
+    collision this store has already had once. A caller that pins nothing is
+    deduplicated on its wording exactly as before.
+
+    `recurrence_of` is a task id the contract. Use it when tonight's evidence is
+    another sighting of a condition already on file and only the instance
+    values moved — a changed-file count, a date, a hash. Those live inside the
+    condition prose the fingerprint is derived from, so the same condition
+    hashes differently on the second night and would otherwise be filed as a
+    discovery. Pinning it says which proposal this is a sighting OF instead of
+    leaving it to be guessed, and the observation is recorded there.
 
     The estate call comes FIRST. If it fails, nothing is recorded here either —
     a finding line claiming a task id that does not exist is worse than a pass
@@ -1334,61 +1391,9 @@ def cmd_propose(payload_json: str, cfg: dict) -> int:
         raise SystemExit(f"propose: not valid JSON: {err}")
     if not isinstance(payload, dict):
         raise SystemExit("propose: payload must be a JSON object")
-    for field in ("title", "condition", "desired_outcome", "completion_check"):
-        if not _nonempty(payload, field):
-            raise SystemExit(
-                f'propose: "{field}" is required and must be non-empty. A '
-                "reviewable proposal names the condition, the desired "
-                "outcome, and the check that says it is done (a prior finding)")
-    if payload.get("subsystem") not in SUBSYSTEMS:
-        raise SystemExit("propose: \"subsystem\" must be one of: "
-                         f"{', '.join(SUBSYSTEMS)} "
-                         f"(got {payload.get('subsystem')!r})")
-    night, events = tonight(cfg)
-    finding = next_finding_id(night, events)
-    title = _nonempty(payload, "title")
-    condition = _nonempty(payload, "condition")
-    refs = {"source": PROPOSAL_SOURCE, "night": night, "finding": finding,
-            "subsystem": payload["subsystem"]}
-    if payload.get("class"):
-        refs["class"] = payload["class"]
-    argv = ["proposal", "add", title, "--condition", condition,
-            "--desired-outcome", _nonempty(payload, "desired_outcome")[:500],
-            "--completion-check", _nonempty(payload, "completion_check")[:500],
-            "--actor", ESTATE_ACTOR, "--refs", json.dumps(refs, sort_keys=True)]
-    argv += ["--intent", (_nonempty(payload, "intent") or
-                          f"{_nonempty(payload, 'desired_outcome')} "
-                          f"Done when: {_nonempty(payload, 'completion_check')}"
-                          )[:500]]
-    if payload.get("note"):
-        argv += ["--note", str(payload["note"])[:500]]
-    rc, out, err = _estate(*argv)
-    if rc != 0 or not out.startswith("t-"):
-        print(f"propose: bin/estate refused this proposal: {err or out}",
-              file=sys.stderr)
-        return 1
-    task = out.splitlines()[0].strip()
-    disposition = "recurrence" if "recurrence" in err else "new"
-    line = {
-        "event": "finding", "action": "proposed",
-        "class": payload.get("class") or "unclassified",
-        "subsystem": payload["subsystem"], "finding": finding,
-        "task": task, "disposition": disposition,
-        "summary": payload.get("summary") or title,
-        "condition": condition,
-        "desired_outcome": _nonempty(payload, "desired_outcome"),
-        "completion_check": _nonempty(payload, "completion_check"),
-    }
-    ok, why = emit_finding_outcome(line, night, task=task)
-    if not ok:
-        # The task exists and carries the finding id; only the linking event
-        # failed. Say so loudly rather than recording a history line that
-        # claims an outcome nobody outside this loop can see.
-        print(f"propose: {task} was filed, but its outcome event did not reach "
-              f"the ledger ({why}) — nothing recorded in history",
-              file=sys.stderr)
-        return 1
-    append_history(line, cfg)
+    rc, task, disposition, finding = file_proposal(payload, cfg)
+    if rc != 0:
+        return rc
     # stdout is exactly one machine-readable line: the caller wants the id.
     print(f"{task} {disposition} {finding}")
     return 0
@@ -1621,10 +1626,8 @@ def cmd_gather(cfg: dict, full: bool = False, save: bool = True) -> int:
         print("baseline: none (cold run) — full digest, snapshot written for "
               "next time")
 
-    registry: dict = {}
-    if tomllib:
-        with open(os.path.join(root, "loops.toml"), "rb") as f:
-            registry = tomllib.load(f)
+    with open(os.path.join(root, "loops.toml"), "rb") as f:
+        registry = tomllib.load(f)
     loops = registry.get("loops", {})
     prev_reg = prev.get("registry") or {}
     print("\n== registry (loops.toml) ==")
@@ -1643,11 +1646,11 @@ def cmd_gather(cfg: dict, full: bool = False, save: bool = True) -> int:
             print(f"{name}: [REMOVED from registry since baseline]")
 
     # One deck read for every session (was: one `session show` per loop).
-    hub = hub_config(registry)
-    sessions, deck_note = deck_sessions(hub["deck_profile"])
+    sessions, deck_note = deck_sessions(hub_config(registry)["deck_profile"])
     print("\n== sessions (agent-deck ls --json, one call) ==")
     if deck_note:
         print(deck_note)
+    hub = hub_config(registry)
     titles = {hub["session"]: "hub"}
     for name, lc in loops.items():
         if lc.get("persona"):
@@ -1688,7 +1691,7 @@ def cmd_gather(cfg: dict, full: bool = False, save: bool = True) -> int:
         registry_iv = (loops.get(name) or {}).get("interval")
         # A loop the operator deliberately took off its registry cadence records that
         # in state/<name>/pace-override — the same file bin/ops health reads
-        # Judging it against the registry interval anyway is how this
+        # the contract. Judging it against the registry interval anyway is how this
         # check produced a nightly false alarm on a loop that was doing exactly
         # what he asked. `dynamic` gets NO verdict at all: a self-pacing loop
         # and a dead one leave the same stale heartbeat, and guessing between
@@ -1820,7 +1823,7 @@ def cmd_gather(cfg: dict, full: bool = False, save: bool = True) -> int:
     prop_lines, proposals = proposal_digest(prev.get("proposals") or {}, full)
     print("\n".join(prop_lines))
 
-    print("\n== extraction (public core allowlist, three buckets) ==")
+    print("\n== extraction (nano-ops allowlist, three buckets) ==")
     ext_lines, extraction = extraction_digest(
         root, registry, prev.get("extraction") or {}, full)
     print("\n".join(ext_lines))
@@ -1862,6 +1865,488 @@ def cmd_report() -> int:
     return 0
 
 
+TALLY_TOTAL = "findings"
+
+
+TALLY_KEYS = {"proposed": "proposed", "observed": "observed",
+              "no_proposal": "no-proposal"}
+
+
+def finding_tally(events: list[dict]) -> dict[str, int]:
+    """Tonight's findings, counted, grouped by action the contract.
+
+    The engine does this arithmetic because the model kept getting it wrong.
+    The pass ends hours after the first finding was recorded, so the tally in
+    the summary was a number remembered rather than a number counted, and on
+    three nights running it contradicted the very file it was appended to.
+
+    The insertion order here is the order the key has always appeared in
+    history.jsonl, so a stamped line reads exactly like the hand-typed ones
+    that came before it.
+    """
+    found = [e for e in events if e.get("event") == "finding"]
+    tally = {TALLY_TOTAL: len(found)}
+    for key, action in TALLY_KEYS.items():
+        tally[key] = sum(1 for e in found if e.get("action") == action)
+    return tally
+
+
+def cmd_pass(args, cfg: dict) -> int:
+    """Record a pass boundary the pass itself is not going to record the contract.
+
+    `record` can already carry any boundary, and the ordinary night uses it.
+    This exists for the one boundary the ordinary night CANNOT reach: a pass
+    that ABORTED. P-08 keeps "ran and found nothing", "ran and broke" and
+    "never ran" apart, and the middle one is precisely the state in which no
+    later tick is going to record anything for you — so it needs a door that
+    does not depend on the pass surviving to walk through it. The night shift
+    has had one since P-08 (`review.py pass failed`); this is the same door.
+
+    A reason is REQUIRED, for the reason `no-proposal` requires one: a bare
+    `failed` is indistinguishable from a run nobody can account for, and the
+    whole value of a recorded failure over a derived `incomplete` is that
+    somebody who knew what broke said so.
+
+    `--night` exists because the abort and the discovery are rarely in the
+    same window. A pass that died at 23:50 and is noticed at 09:00 belongs to
+    the night it started, and without the override the only slot reachable is
+    the one the clock is in now — which would file the failure against a run
+    that never happened and leave the real one `incomplete` forever.
+    """
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise SystemExit("pass failed: --reason is required — a failure with "
+                         "no account of what broke says no more than the "
+                         "`incomplete` it replaces")
+    night = (getattr(args, "night", "") or "").strip() or night_id(
+        local_now(), (cfg.get("pass_start") or "").strip(),
+        (cfg.get("pass_end") or "").strip())
+    events = [e for e in load_history() if e.get("night") == night]
+    e = append_history({"event": "pass_failed", "night": night,
+                        "reason": reason}, cfg)
+    ok, why = emit_pass_event(e, night, events)
+    if not ok:
+        print(f"[warn] pass_failed did not reach the shared Ledger ({why}) "
+              "— history.jsonl has it", file=sys.stderr)
+    print(f"recorded pass_failed (failed) for night {night}")
+    return 0
+
+
+def file_proposal(payload: dict, cfg: dict) -> tuple[int, str, str, str]:
+    """The filing itself, for callers that already hold a payload object.
+
+    Split out of `cmd_propose` for `memory-triage` the contract, which builds its
+    payloads in code and files several in one run. It is deliberately the SAME
+    function and not a second door: a second filing path is how the finding
+    line and the estate row start disagreeing again, which is the whole thing
+    P-02 closed.
+
+    Returns (rc, task, disposition, finding). rc is non-zero when nothing was
+    filed, and in that case the reason has already been printed to stderr.
+    """
+    for field in ("title", "condition", "desired_outcome", "completion_check"):
+        if not _nonempty(payload, field):
+            raise SystemExit(
+                f'propose: "{field}" is required and must be non-empty. A '
+                "reviewable proposal names the condition, the desired "
+                "outcome, and the check that says it is done (P-09)")
+    if payload.get("subsystem") not in SUBSYSTEMS:
+        raise SystemExit("propose: \"subsystem\" must be one of: "
+                         f"{', '.join(SUBSYSTEMS)} "
+                         f"(got {payload.get('subsystem')!r})")
+    classification = check_classification(payload)
+    night, events = tonight(cfg)
+    finding = next_finding_id(night, events)
+    title = _nonempty(payload, "title")
+    condition = _nonempty(payload, "condition")
+    refs = {"source": PROPOSAL_SOURCE, "night": night, "finding": finding,
+            "subsystem": payload["subsystem"]}
+    if payload.get("class"):
+        refs["class"] = payload["class"]
+    # the contract. The NORMALIZED fields, straight from the validator, into the same
+    # refs envelope the P-09 review record already rides in. Passing them back
+    # through CLI flags would round-trip the alternatives through a string
+    # separator and could lose one that contains it.
+    refs.update(classification)
+    recurrence_of = str(payload.get("recurrence_of") or "").strip()
+    # Nothing handed to `proposal add` is sliced the contract. bin/estate has no
+    # length bound anywhere on its write path — review_fields() only strips
+    # whitespace — so a [:500] here was never respecting a store limit, it was
+    # inventing one, and inventing it SILENTLY: the store, `proposal show` and
+    # /estate.html all render the stump as if it were the whole record. Thirty
+    # filed proposals lost their desired outcome or completion check mid-word
+    # before this came out. If a real bound is ever wanted it belongs in
+    # bin/estate, where every writer meets it once and it can refuse or
+    # truncate loudly.
+    argv = ["proposal", "add", title, "--condition", condition,
+            "--desired-outcome", _nonempty(payload, "desired_outcome"),
+            "--completion-check", _nonempty(payload, "completion_check"),
+            "--actor", ESTATE_ACTOR, "--refs", json.dumps(refs, sort_keys=True)]
+    # A condition the caller knows by a STABLE NAME rather than by its prose
+    # the contract. bin/estate's own note on `--fingerprint` invites exactly this:
+    # the derived fingerprint is a hash of the wording, so a condition whose
+    # write-up is regenerated each run is a fresh discovery every time unless
+    # the identity is pinned. Namespace it — `task:4` meant two different
+    # things in two numbering schemes once already.
+    pinned_fingerprint = _nonempty(payload, "fingerprint")
+    if pinned_fingerprint:
+        argv += ["--fingerprint", pinned_fingerprint]
+    if recurrence_of:
+        # Asserted identity. bin/estate owns every reason to refuse one — the
+        # task must exist, be a proposal, and not contradict a condition
+        # already on file — and a refusal there stops this pass exactly as any
+        # other refusal does, before anything is written to history.
+        argv += ["--recurrence-of", recurrence_of]
+    argv += ["--intent", (_nonempty(payload, "intent") or
+                          f"{_nonempty(payload, 'desired_outcome')} "
+                          f"Done when: {_nonempty(payload, 'completion_check')}"
+                          )]
+    if payload.get("note"):
+        argv += ["--note", str(payload["note"])]
+    rc, out, err = _estate(*argv)
+    if rc != 0 or not out.startswith("t-"):
+        print(f"propose: bin/estate refused this proposal: {err or out}",
+              file=sys.stderr)
+        return 1, "", "", finding
+    task = out.splitlines()[0].strip()
+    disposition = "recurrence" if "recurrence" in err else "new"
+    line = {
+        "event": "finding", "action": "proposed",
+        "class": payload.get("class") or "unclassified",
+        "subsystem": payload["subsystem"], "finding": finding,
+        "task": task, "disposition": disposition,
+        "summary": payload.get("summary") or title,
+        "condition": condition,
+        "desired_outcome": _nonempty(payload, "desired_outcome"),
+        "completion_check": _nonempty(payload, "completion_check"),
+    }
+    if recurrence_of:
+        # A pinned recurrence and a hashed one both read `recurrence` here.
+        # The history line says which, so a later pass reading its own record
+        # can tell the two apart without the store.
+        line["recurrence_of"] = recurrence_of
+    # The finding line and the estate row agree by construction, and the contract is
+    # part of the record now — a history reader can count how many of the
+    # night's proposals were decisions without opening the store.
+    line.update(classification)
+    ok, why = emit_finding_outcome(line, night, task=task)
+    if not ok:
+        # The task exists and carries the finding id; only the linking event
+        # failed. Say so loudly rather than recording a history line that
+        # claims an outcome nobody outside this loop can see.
+        print(f"propose: {task} was filed, but its outcome event did not reach "
+              f"the ledger ({why}) — nothing recorded in history",
+              file=sys.stderr)
+        return 1, task, disposition, finding
+    append_history(line, cfg)
+    return 0, task, disposition, finding
+
+
+TRIAGE_DIR = "memory-triage"
+
+
+TRIAGE_CADENCE_DAYS = 7.0
+
+
+TRIAGE_AGE_DAYS = 14.0
+
+
+TRIAGE_SUBSYSTEM = "memory"
+
+
+TRIAGE_FINGERPRINT_PREFIX = "memory-candidate:"
+
+
+TRIAGE_ID_RE = re.compile(r"^m-\d+$")
+
+
+CANDIDATE_QUERY = ("memory", "list", "--status", "candidate")
+
+
+TRIAGE_SHARED_SCOPE = "shared"
+
+
+def triage_state_dir() -> str:
+    d = os.path.join(state_dir(), TRIAGE_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def triage_last_run_path() -> str:
+    return os.path.join(triage_state_dir(), "last-run")
+
+
+def triage_last_run() -> dt.datetime | None:
+    """The mark, or None for a mark that is missing or unreadable.
+
+    Unreadable reads as "never run", so the step runs. That is the fail-open
+    direction on purpose, and it is only safe because the filing is idempotent:
+    a candidate already on file LINKS. The opposite default would let one
+    corrupt byte silence the triage forever, with nothing saying so.
+    """
+    try:
+        with open(triage_last_run_path()) as fh:
+            return parse_ts(fh.read().strip())
+    except OSError:
+        return None
+
+
+def triage_due_state(now: dt.datetime) -> tuple[bool, str]:
+    """Is a triage owed? The cadence lives here, in the thing that remembers.
+
+    Same arrangement as `bin/mechanism-audit`'s, and for its stated reason: a
+    week counter in SKILL.md prose is a second declaration, and it drifts in
+    the direction that makes a pass skip work it owed.
+    """
+    last = triage_last_run()
+    if last is None:
+        return True, "no triage has ever been recorded"
+    age = (now - last).total_seconds() / 86400.0
+    if age >= TRIAGE_CADENCE_DAYS:
+        return True, (f"last triage {age:.1f}d ago "
+                      f"(cadence {TRIAGE_CADENCE_DAYS:g}d)")
+    return False, (f"last triage {age:.1f}d ago — next due in "
+                   f"{TRIAGE_CADENCE_DAYS - age:.1f}d")
+
+
+def candidate_ids() -> tuple[list[str], str]:
+    """Every memory currently at `candidate`, by id. ([], reason) on a store
+    that would not answer — never ([], "") , because an empty list from a
+    failed read and an empty list from a store with nothing waiting are the
+    same bytes and only one of them is a fact about the estate
+    (docs/absence-contract.md)."""
+    rc, out, err = _estate(*CANDIDATE_QUERY)
+    if rc != 0:
+        return [], (err or out or
+                    f"`bin/estate {' '.join(CANDIDATE_QUERY)}` would not run")
+    ids = []
+    for line in out.splitlines():
+        token = (line.split() or [""])[0]
+        if TRIAGE_ID_RE.match(token):
+            ids.append(token)
+    return ids, ""
+
+
+def candidate_row(key: str) -> tuple[dict, str]:
+    """One candidate's stored row, or ({}, reason).
+
+    `memory show` prints the row as JSON and then its event history, so the
+    row is DECODED off the front of the output rather than line-parsed — the
+    events below it are prose and would break any split.
+    """
+    rc, out, err = _estate("memory", "show", key)
+    if rc != 0:
+        return {}, (err or out or f"bin/estate memory show {key} would not run")
+    try:
+        row, _ = json.JSONDecoder().raw_decode(out)
+    except ValueError as exc:
+        return {}, f"could not read the stored row ({exc})"
+    if not isinstance(row, dict) or not row.get("id"):
+        return {}, "the stored row is not a memory"
+    return row, ""
+
+
+def triage_payload(row: dict) -> dict:
+    """One waiting candidate as a complete `propose` payload.
+
+    Everything in the condition is STABLE — the id, the scope, the kind, the
+    creation date and the fact's own body, which the store makes immutable.
+    The age is deliberately absent from both the title and the condition: it
+    is a different sentence every week, and the contract is the record of what that
+    costs.
+    """
+    key = row["id"]
+    scope = str(row.get("scope") or "").strip()
+    kind = str(row.get("kind") or "").strip()
+    created = str(row.get("created_at") or "")[:10]
+    body = " ".join(str(row.get("body") or "").split())
+    has_provenance = bool(str(row.get("source_refs") or "").strip())
+
+    archive_cmd = f"bin/estate memory archive {key}"
+    alternatives = []
+    if scope != TRIAGE_SHARED_SCOPE:
+        alternatives.append({
+            "option": f"Promote it where it already is: "
+                      f"`bin/estate memory promote {key} --scope {scope}`",
+            "consequence": f"the fact becomes active at scope {scope}, so "
+                           f"`bin/estate memory recall --scope {scope}` serves "
+                           f"it at intake and no other loop sees it.",
+        })
+    # §5.3: a shared ACTIVE memory must cite what it generalizes from, so the
+    # estate-wide command is only ready to run when the row already carries
+    # provenance. Printing it bare on a row that has none would hand over a
+    # command that fails, which is worse than not printing one.
+    shared_cmd = f"bin/estate memory promote {key} --scope shared"
+    if not has_provenance:
+        shared_cmd += " --source-refs '{\"tasks\": [\"t-N\"]}'"
+    alternatives.append({
+        "option": f"Promote it estate-wide: `{shared_cmd}`",
+        "consequence": ("every session in the estate recalls it at intake."
+                        + ("" if has_provenance else
+                           " This row cites no provenance, and §5.3 refuses a "
+                           "shared active fact without it, so the promotion "
+                           "has to name what it generalizes from.")),
+    })
+    alternatives.append({
+        "option": f"Archive it: `{archive_cmd}`",
+        "consequence": "the fact leaves the live set, stays queryable among "
+                       "the retired rows, and stops counting as something "
+                       "waiting on a decision.",
+    })
+    return {
+        "title": f"{key} ({scope}) has waited at 'candidate' since {created} — "
+                 f"promote it or archive it",
+        "subsystem": TRIAGE_SUBSYSTEM,
+        "fingerprint": TRIAGE_FINGERPRINT_PREFIX + key,
+        "condition":
+            f"{key} has stood at status 'candidate' in the estate memory store "
+            f"since {created} (scope {scope}, kind {kind}). A candidate is not "
+            f"recallable: `bin/estate memory recall` serves active rows only "
+            f"(P-05), so no session has ever been handed this fact, and "
+            f"`bin/estate memory promote` — the one path out — has never fired "
+            f"in the estate's recorded history. The fact reads: {body}",
+        "desired_outcome":
+            f"{key} is out of 'candidate'. Either it is active at a stated "
+            f"scope, where recall will serve it, or it is archived, where it "
+            f"stops being a fact the estate recorded and never used.",
+        "completion_check":
+            f"`bin/estate memory show {key}` reports a status other than "
+            f"'candidate'.",
+        "classification": "decision",
+        "question": f"Promote {key}, and to which scope, or archive it?",
+        "alternatives": alternatives,
+        # The engine can derive that a fact is waiting. It cannot derive
+        # whether the fact is true enough to bind sessions, and a manufactured
+        # recommendation is exactly the confidence §5.3 exists to refuse.
+        "recommendation": "not recorded",
+        "defer_consequence":
+            f"{key} stays unrecallable. Nothing in the estate reads a "
+            f"candidate, so the fact keeps costing storage and audit attention "
+            f"without ever reaching a session, and the next mechanism audit "
+            f"counts the same row again.",
+        "summary": f"{key} has waited at 'candidate' since {created}",
+    }
+
+
+def cmd_memory_triage(args, cfg: dict) -> int:
+    """Give every long-waiting memory candidate a disposition path the contract.
+
+    Exit 0 clean, 1 if a candidate that should have been filed was not, 2 if
+    the candidate set itself could not be read. A store that would not answer
+    is `unobservable` and never an empty board — same rule as everywhere else.
+    """
+    now = local_now()
+    due, why = triage_due_state(now)
+    if args.due:
+        print(("due — " if due else "not due — ") + why)
+        return 0 if due else 1
+    if args.if_due and not due:
+        print(f"memory candidate triage not due — {why}")
+        return 0
+
+    ids, reason = candidate_ids()
+    if reason:
+        print(f"memory candidate triage: unobservable — {reason}",
+              file=sys.stderr)
+        return 2
+
+    filed = linked = waiting = refused = unreadable = 0
+    for key in ids:
+        row, why_not = candidate_row(key)
+        if why_not:
+            # One unreadable row is not an empty board either: it is counted
+            # and named, and the run exits non-zero for it.
+            print(f"{key:>6}  unreadable  {why_not}")
+            unreadable += 1
+            continue
+        created = parse_ts(row.get("created_at"))
+        if created is None:
+            print(f"{key:>6}  unreadable  no readable created_at "
+                  f"({row.get('created_at')!r})")
+            unreadable += 1
+            continue
+        age = (now - created).total_seconds() / 86400.0
+        if age < TRIAGE_AGE_DAYS:
+            print(f"{key:>6}  waiting     {age:.1f}d of {TRIAGE_AGE_DAYS:g}d")
+            waiting += 1
+            continue
+        payload = triage_payload(row)
+        if args.dry_run:
+            print(f"{key:>6}  would-file  {age:.1f}d  "
+                  f"fingerprint {payload['fingerprint']}")
+            filed += 1
+            continue
+        try:
+            rc, task, disposition, _ = file_proposal(payload, cfg)
+        except SystemExit as exc:
+            # A payload this engine built and the classification gate refused
+            # is a defect HERE, not a finding about the estate. Say so, count
+            # it, and keep going — one bad row must not cost the others their
+            # filing.
+            print(f"{key:>6}  refused     {exc}", file=sys.stderr)
+            refused += 1
+            continue
+        if rc != 0:
+            refused += 1
+            continue
+        if disposition == "recurrence":
+            print(f"{key:>6}  linked      {task}  (already on file)")
+            linked += 1
+        else:
+            print(f"{key:>6}  filed       {task}  {age:.1f}d")
+            filed += 1
+
+    print(f"\n{len(ids)} candidate(s) · {filed} filed · {linked} linked · "
+          f"{waiting} not yet {TRIAGE_AGE_DAYS:g}d old · {refused} refused · "
+          f"{unreadable} unreadable")
+    if args.record and not args.dry_run:
+        with open(triage_last_run_path(), "w") as fh:
+            fh.write(now.isoformat())
+        print(f"recorded: {rel_or_path(triage_last_run_path())}",
+              file=sys.stderr)
+    if unreadable:
+        return 2
+    return 1 if refused else 0
+
+
+def rel_or_path(path: str) -> str:
+    """Repo-relative when the path is inside the repo, absolute otherwise. A
+    state dir pointed elsewhere ($MECHANIC_STATE_DIR, a worktree) would
+    otherwise print a ladder of `..` nobody can read."""
+    try:
+        out = os.path.relpath(path, repo_root())
+    except ValueError:
+        return path
+    return path if out.startswith(os.pardir) else out
+
+DECISION_KEYS = ("classification", "question", "alternatives",
+                 "recommendation", "defer_consequence")
+
+def check_classification(payload: dict) -> dict:
+    """The the contract gate, run through `bin/estate decision check` (S-t475).
+
+    The validator lives once, in lib/estate_decisions.py. This engine may not
+    import lib/ — loop engines run against a fabricated repo root in their own
+    tests — so it reaches the rule the same way it reaches every other durable
+    thing in the estate: as a subprocess. A second copy here is precisely how
+    the mechanic's gate and the follow-ups gate would drift apart.
+
+    Returns the normalized fields to merge into the proposal's refs. Raises
+    SystemExit naming the key at fault, because a filing that quietly became
+    an `action` for want of a word is the defect this schema exists to stop.
+    """
+    supplied = {key: payload[key] for key in DECISION_KEYS
+                if key in payload and payload[key] is not None}
+    rc, out, err = _estate("decision", "check", json.dumps(supplied))
+    if rc != 0:
+        raise SystemExit(f"propose: {(err or out) or 'classification refused'}")
+    try:
+        fields = json.loads(out)
+    except json.JSONDecodeError:
+        raise SystemExit("propose: `estate decision check` returned no usable "
+                         f"payload ({out!r}) — nothing filed")
+    return fields
+
 def main(argv=None) -> int:
     cfg = load_config()
     ap = argparse.ArgumentParser(description="mechanic engine")
@@ -1874,12 +2359,29 @@ def main(argv=None) -> int:
                    help="do not write digest.json (ad hoc inspection)")
     p = sub.add_parser("record")
     p.add_argument("event_json")
+    p = sub.add_parser("pass", help="record a pass boundary by hand (t-385)")
+    p.add_argument("state", choices=("failed",))
+    p.add_argument("--reason", required=True,
+                   help="what broke — required, and it reaches the Ledger")
+    p.add_argument("--night", help="the run slot, if the abort was not tonight")
     sub.add_parser("subsystems", help="the nine subsystems every pass examines")
     sub.add_parser("checklist", help="tonight's nine-subsystem coverage (a prior finding)")
     p = sub.add_parser("proposals", help="live proposal tasks by review stage")
     p.add_argument("--stage")
     p = sub.add_parser("propose", help="file one proposal durably (a prior finding)")
     p.add_argument("payload_json")
+    p = sub.add_parser("memory-triage",
+                       help="file a disposition proposal for every memory "
+                            "that has waited at 'candidate' (t-1095)")
+    p.add_argument("--if-due", action="store_true",
+                   help="run only if the weekly cadence says so")
+    p.add_argument("--due", action="store_true",
+                   help="print whether a run is owed and exit (0 = due)")
+    p.add_argument("--record", action="store_true",
+                   help="stamp the cadence in "
+                        "state/mechanic/memory-triage/last-run")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would be filed; file nothing")
     sub.add_parser("report")
     args = ap.parse_args(argv)
 
@@ -1889,6 +2391,8 @@ def main(argv=None) -> int:
         return cmd_gather(cfg, full=args.full, save=args.save)
     if args.cmd == "record":
         return cmd_record(args.event_json, cfg)
+    if args.cmd == "pass":
+        return cmd_pass(args, cfg)
     if args.cmd == "subsystems":
         return cmd_subsystems()
     if args.cmd == "checklist":
@@ -1897,6 +2401,8 @@ def main(argv=None) -> int:
         return cmd_proposals(args.stage)
     if args.cmd == "propose":
         return cmd_propose(args.payload_json, cfg)
+    if args.cmd == "memory-triage":
+        return cmd_memory_triage(args, cfg)
     if args.cmd == "report":
         return cmd_report()
     ap.print_help()

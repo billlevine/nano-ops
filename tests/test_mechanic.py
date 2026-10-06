@@ -3,10 +3,10 @@
 identity, phase derivation, ledger timestamp parsing, the windows/record CLI,
 and the incremental digest (section hashing, ledger cursor, snapshot lifecycle).
 Run: python3 test_mechanic.py"""
-import contextlib
-import datetime as dt
 import importlib.machinery
 import importlib.util
+import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -143,7 +143,7 @@ class TestRecentEntries(unittest.TestCase):
         lines = [
             '{"ts":"2026-07-18T16:10:46Z","actor":"hub","kind":"activity","summary":"old enough"}',
             '{"ts":"2026-07-17T10:00:00Z","actor":"hub","kind":"activity","summary":"too old"}',
-            '{"ts":1784401391,"actor":"spotter","kind":"error","summary":"epoch ts"}',
+            '{"ts":1784401391,"actor":"pr-tracker","kind":"error","summary":"epoch ts"}',
             'not json at all',
             '{"actor":"x","summary":"no ts"}',
         ]
@@ -176,15 +176,14 @@ class TestCli(unittest.TestCase):
             self.assertIn("phase=resume", r.stdout)
 
             # The nine-subsystem checklist stands between a started pass and a
-            # finished one (a prior finding), so the lifecycle walks through it.
+            # finished one (P-09), so the lifecycle walks through it.
             for name in mechanic.SUBSYSTEMS:
                 r = self.run_cli(["record", json.dumps(
                     {"event": "subsystem_check", "subsystem": name,
                      "result": "ok", "note": "nothing moved"})], now, d)
                 self.assertEqual(r.returncode, 0, r.stderr)
 
-            r = self.run_cli(
-                ["record", '{"event":"pass_done","findings":2}'], now, d)
+            r = self.run_cli(["record", '{"event":"pass_done"}'], now, d)
             self.assertEqual(r.returncode, 0, r.stderr)
             r = self.run_cli(["windows"], now, d)
             self.assertIn("phase=done", r.stdout)
@@ -283,21 +282,6 @@ class TestPolicyPairDivergence(unittest.TestCase):
         self.assertNotIn("POLICY PAIR DRIFT", out)
 
 
-class TestHubConfig(unittest.TestCase):
-    def test_empty_registry_is_anonymous(self):
-        self.assertEqual(mechanic.hub_config({}), {
-            "persona": "ops", "session": "ops (hub)", "deck_profile": "ops"})
-
-    def test_config_and_environment_override_defaults(self):
-        registry = {"hub": {"persona": "the keeper",
-                            "session_title": "control (hub)",
-                            "deck_profile": "configured"}}
-        self.assertEqual(mechanic.hub_config(registry)["session"], "control (hub)")
-        with mock.patch.dict(os.environ, {"MECHANIC_DECK_PROFILE": "override"}):
-            self.assertEqual(mechanic.hub_config(registry)["deck_profile"],
-                             "override")
-
-
 class TestParseInterval(unittest.TestCase):
     def test_units(self):
         self.assertEqual(mechanic.parse_interval("20m"), 1200)
@@ -351,7 +335,7 @@ NOW_N2 = "2026-07-20T02:30:00-04:00"
 
 LOOPS_TOML = """
 [hub]
-slack_channel_id = "example-channel"
+slack_channel_id = "D1"
 
 [loops.demo]
 dir = "loops/demo"
@@ -359,7 +343,7 @@ skill = "demo"
 interval = "20m"
 autostart = true
 persona = "the demo"
-model = "model-standard"
+model = "model-a"
 """
 
 # The point of the digest is that big manuals stop being re-read, so the demo
@@ -369,9 +353,9 @@ DEMO_SKILL = f"# demo skill\n## Alpha\nalpha body\n{FILLER}\n## Beta\nbeta body\
 
 DECK = {
     "ops (hub)": {"title": "ops (hub)", "status": "waiting",
-                        "model_id": "model-standard"},
+                        "model_id": "model-a"},
     "the demo (demo)": {"title": "the demo (demo)", "status": "waiting",
-                        "model_id": "model-standard"},
+                        "model_id": "model-a"},
 }
 
 
@@ -494,11 +478,11 @@ class TestGatherDigest(unittest.TestCase):
     def test_registry_and_model_drift(self):
         self.gather(NOW_N1)
         write(os.path.join(self.root, "loops.toml"),
-              LOOPS_TOML.replace("model-standard", "model-economy"))
+              LOOPS_TOML.replace("model-a", "model-b"))
         out = self.gather(NOW_N2)
         self.assertIn("[CHANGED since baseline", out)
-        self.assertIn("loops.toml model=model-economy but live "
-                      "model=model-standard", out)
+        self.assertIn("loops.toml model=model-b but live "
+                      "model=model-a", out)
 
     def test_state_size_delta_only_for_changed_files(self):
         self.gather(NOW_N1)
@@ -520,7 +504,7 @@ class TestGatherDigest(unittest.TestCase):
         self.gather(NOW_N2, save=False)
         self.assertEqual(self.snapshot(), before)
 
-    # --- pace override ------------------------------------------------------
+    # --- pace override the contract -------------------------------------------
     # A loop the operator deliberately took off its registry cadence records that in
     # state/<name>/pace-override. Before this, the heartbeat check judged it
     # against loops.toml anyway and filed a drift line every night for a loop
@@ -597,11 +581,11 @@ class TestGatherDigest(unittest.TestCase):
             'interval = "on-demand"\n'
             "autostart = false\n"
             'persona = "the gauges"\n'
-            'model = "model-standard"\n'))
+            'model = "model-a"\n'))
         # Deck has only the hub — both loops are absent from agent-deck.
         deck = {"ops (hub)": {"title": "ops (hub)",
                                     "status": "waiting",
-                                    "model_id": "model-standard"}}
+                                    "model_id": "model-a"}}
         env = {"MECHANIC_NOW": NOW_N1, "MECHANIC_REPO_ROOT": self.root,
                "MECHANIC_STATE_DIR": self.state}
         buf = io.StringIO()
@@ -631,17 +615,15 @@ class TestGatherDigest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# scope-safe memory recall (the consistency contract)
+# scope-safe memory recall (gap audit P-05)
 # --------------------------------------------------------------------------- #
 class TestMemoryRecall(unittest.TestCase):
-    """The mechanic's half of a prior finding, against a REAL throwaway estate store
+    """The mechanic's half of P-05, against a REAL throwaway estate store
     driven by the real `bin/estate` — the whole point of the section is that
     the pass reads memory only through that CLI, so a mocked store would test
     the wrong thing. ESTATE_STATE_DIR keeps it off real state."""
 
-    ESTATE = os.path.abspath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        os.pardir, "bin", "estate"))
+    ESTATE = os.path.join(ROOT, "bin", "estate")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -859,8 +841,8 @@ class TestExtractionDigest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = os.path.join(self.tmp.name, "private fork")
-        self.core = os.path.join(self.tmp.name, "public core")
+        self.root = os.path.join(self.tmp.name, "operations")
+        self.core = os.path.join(self.tmp.name, "nano-ops")
         # The allowlist lives in the fork (self.root), not in the core.
         write(os.path.join(self.root, "docs/extraction-allowlist.md"),
               ALLOWLIST_MD)
@@ -1047,7 +1029,7 @@ class TestExtractionDigest(unittest.TestCase):
 
 
 class TestPropose(unittest.TestCase):
-    """Gap audit a prior finding — a proposal becomes a durable estate task, and the
+    """Gap audit P-02 — a proposal becomes a durable estate task, and the
     history line that records it carries the same task id.
 
     The pairing is the point. Before this, REPORT.md was the only record and
@@ -1055,9 +1037,7 @@ class TestPropose(unittest.TestCase):
     every night. A finding line and an estate row that can disagree would be
     the same defect with extra steps.
     """
-    ESTATE = os.path.abspath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        os.pardir, "bin", "estate"))
+    ESTATE = os.path.join(ROOT, "bin", "estate")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1087,12 +1067,16 @@ class TestPropose(unittest.TestCase):
 
     @staticmethod
     def payload(**over):
-        """A complete a prior finding proposal. Every field below is required by
+        """A complete P-09 proposal. Every field below is required by
         `propose`, so a test that only cares about one of them still has to
         carry the rest — the same as the pass does."""
         base = {"title": "a condition", "subsystem": "hub",
                 "condition": "a condition", "desired_outcome": "it stops",
-                "completion_check": "a week without it"}
+                "completion_check": "a week without it",
+                # the contract. `action` is the cheapest honest word for scenery:
+                # these cases are about the P-02/P-09 pairing, and the
+                # classification gate has its own class below.
+                "classification": "action"}
         base.update(over)
         return json.dumps(base)
 
@@ -1161,7 +1145,7 @@ class TestPropose(unittest.TestCase):
         r = self.run_cli(["proposals"])
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    # -- a prior finding: the proposal has to be reviewable ---------------------------- #
+    # -- P-09: the proposal has to be reviewable ---------------------------- #
     def test_every_review_field_is_required(self):
         for missing in ("title", "condition", "desired_outcome",
                         "completion_check"):
@@ -1176,6 +1160,56 @@ class TestPropose(unittest.TestCase):
         self.assertIn("must be one of", r.stderr)
         r = self.run_cli(["propose", self.payload(subsystem="dashboard")])
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    # -- the contract: recurrence identity can be pinned --------------------------- #
+    #
+    # The real pair. One unresolved extraction:5 drift, written up on two
+    # nights with different counts, dates and hashes, filed as the contract and then
+    # the contract because the fingerprint is derived from prose that moved.
+    DRIFT_ONE = ("nano-ops's mechanic extraction (extraction:5) has drifted: "
+                 "four ported files changed since the 2026-07-29 sync (a1b2c3d)")
+    DRIFT_TWO = ("nano-ops's mechanic extraction (extraction:5) has drifted: "
+                 "six ported files changed since the 2026-08-06 sync (9f8e7d6)")
+
+    def test_a_pinned_recurrence_lands_on_the_task_it_names(self):
+        first = self.run_cli(["propose", self.payload(
+            title="re-sync the mechanic extraction",
+            subsystem="mechanic", condition=self.DRIFT_ONE)])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        task = first.stdout.split()[0]
+        again = self.run_cli(["propose", self.payload(
+            title="re-sync the mechanic extraction (now six files)",
+            subsystem="mechanic", condition=self.DRIFT_TWO,
+            recurrence_of=task)])
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(again.stdout.split()[0], task)
+        self.assertEqual(again.stdout.split()[1], "recurrence")
+        # One task, and the second sighting recorded on it.
+        self.assertEqual(self.estate("proposal", "list").stdout.count("t-"), 1)
+        self.assertIn("recurrences       1",
+                      self.estate("proposal", "show", task).stdout)
+        line = self.history()[-1]
+        self.assertEqual(line["disposition"], "recurrence")
+        self.assertEqual(line["recurrence_of"], task)
+        self.assertEqual(line["task"], task)
+
+    def test_the_same_pair_unpinned_is_two_proposals(self):
+        a = self.run_cli(["propose", self.payload(
+            subsystem="mechanic", condition=self.DRIFT_ONE)])
+        b = self.run_cli(["propose", self.payload(
+            subsystem="mechanic", condition=self.DRIFT_TWO)])
+        self.assertNotEqual(a.stdout.split()[0], b.stdout.split()[0])
+        self.assertEqual(b.stdout.split()[1], "new")
+
+    def test_an_unpinned_finding_line_says_nothing_about_recurrence_of(self):
+        self.run_cli(["propose", self.payload()])
+        self.assertNotIn("recurrence_of", self.history()[-1])
+
+    def test_a_pin_the_store_refuses_records_nothing(self):
+        r = self.run_cli(["propose", self.payload(recurrence_of="t-404")])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no task matches", r.stderr)
+        self.assertEqual(self.history(), [])
 
     def test_the_review_record_reaches_the_store(self):
         r = self.run_cli(["propose", self.payload(
@@ -1220,7 +1254,7 @@ class TestPropose(unittest.TestCase):
 
 
 class TestSubsystemChecklist(unittest.TestCase):
-    """Gap audit a prior finding, S07 — a pass proves it examined all nine subsystems.
+    """Gap audit P-09, S07 — a pass proves it examined all nine subsystems.
 
     Before this, the five diagnostic lenses were prose and the pass summary
     was a tally. A night that never looked at the dashboard produced exactly
@@ -1272,14 +1306,14 @@ class TestSubsystemChecklist(unittest.TestCase):
     def test_pass_done_is_refused_while_a_row_is_missing(self):
         for name in mechanic.SUBSYSTEMS[:-1]:
             self.check(name)
-        r = self.run_cli(["record", '{"event":"pass_done","findings":0}'])
+        r = self.run_cli(["record", '{"event":"pass_done"}'])
         self.assertEqual(r.returncode, 1)
         self.assertIn(mechanic.SUBSYSTEMS[-1], r.stderr)
         self.assertNotIn("pass_done", [e["event"] for e in self.history()])
 
     def test_pass_done_is_accepted_once_all_nine_are_recorded(self):
         self.check_all()
-        r = self.run_cli(["record", '{"event":"pass_done","findings":0}'])
+        r = self.run_cli(["record", '{"event":"pass_done"}'])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.history()[-1]["event"], "pass_done")
 
@@ -1324,7 +1358,7 @@ class TestSubsystemChecklist(unittest.TestCase):
         self.assertIn("2026-07-31", r.stderr)
 
     def test_legacy_history_still_loads(self):
-        # No migration: a night recorded before a prior finding has no check rows and no
+        # No migration: a night recorded before P-09 has no check rows and no
         # finding ids, and nothing here rewrites or rejects it.
         path = os.path.join(self.mech, "history.jsonl")
         with open(path, "w") as f:
@@ -1415,9 +1449,9 @@ class TestChecklistDigest(unittest.TestCase):
 class TestProposalDigest(unittest.TestCase):
     """Same warm/cold contract for the proposal section — and the ids of the
     rows that collapse stay on the page, so nothing goes quiet."""
-    ROWS = ("  task-0001  [ready     ] proposal     (pending-review) the hub "
+    ROWS = ("  t-0001  [ready     ] proposal     (pending-review) the hub "
             "drops intents\n"
-            "  task-0002  [ready     ] proposal     (approved-backlog) the "
+            "  t-0002  [ready     ] proposal     (approved-backlog) the "
             "spotter double-posts\n")
 
     def run_it(self, out, prev=None, full=False, rc=0):
@@ -1431,14 +1465,14 @@ class TestProposalDigest(unittest.TestCase):
         self.assertIn("2 on file", out)
         self.assertIn("the hub drops intents", out)
         self.assertIn("the spotter double-posts", out)
-        self.assertEqual(sorted(snap["prop_rows"]), ["task-0001", "task-0002"])
+        self.assertEqual(sorted(snap["prop_rows"]), ["t-0001", "t-0002"])
 
     def test_unmoved_rows_collapse_to_their_ids(self):
         cold, snap = self.run_it(self.ROWS)
         warm, _ = self.run_it(self.ROWS, prev=snap)
         self.assertIn("2 on file", warm)
         self.assertIn("unchanged since baseline (2)", warm)
-        self.assertIn("task-0001, task-0002", warm)  # named, never dropped
+        self.assertIn("t-0001, t-0002", warm)        # named, never dropped
         self.assertNotIn("the hub drops intents", warm)
         self.assertLess(len(warm), len(cold))
 
@@ -1452,7 +1486,7 @@ class TestProposalDigest(unittest.TestCase):
 
     def test_a_new_proposal_resurfaces_in_full(self):
         _, snap = self.run_it(self.ROWS)
-        added = self.ROWS + ("  task-0003  [ready     ] proposal     "
+        added = self.ROWS + ("  t-0003  [ready     ] proposal     "
                              "(pending-review) the briefer is late\n")
         warm, _ = self.run_it(added, prev=snap)
         self.assertIn("the briefer is late", warm)
@@ -1462,7 +1496,7 @@ class TestProposalDigest(unittest.TestCase):
         _, snap = self.run_it(self.ROWS)
         warm, _ = self.run_it("", prev=snap)
         self.assertIn("no longer listed since baseline (2)", warm)
-        self.assertIn("task-0001, task-0002", warm)
+        self.assertIn("t-0001, t-0002", warm)
 
     def test_full_ignores_the_baseline(self):
         _, snap = self.run_it(self.ROWS)
@@ -1489,7 +1523,7 @@ class TestProposalDigest(unittest.TestCase):
 
 
 class TestFindingRecords(unittest.TestCase):
-    """Gap audit a prior finding, S08/S09 — every finding is identified, attributed to a
+    """Gap audit P-09, S08/S09 — every finding is identified, attributed to a
     subsystem, and its outcome reaches the ledger. `no-proposal` carries a
     reason, because "I looked and decided against it" without the why is
     indistinguishable from never having looked."""
@@ -1554,7 +1588,7 @@ class TestFindingRecords(unittest.TestCase):
         self.assertEqual(self.finding(summary="  ").returncode, 1)
 
     def test_proposed_cannot_be_recorded_by_hand(self):
-        # The pairing a prior finding built only holds if `propose` is the only door.
+        # The pairing P-02 built only holds if `propose` is the only door.
         r = self.finding(action="proposed")
         self.assertEqual(r.returncode, 1)
         self.assertIn("mechanic.py propose", r.stderr)
@@ -1598,15 +1632,183 @@ class TestFindingRecords(unittest.TestCase):
         self.assertEqual(self.history()[-1]["event"], "pass_start")
 
 
+class TestPassDoneTally(unittest.TestCase):
+    """the night's tally is counted, never typed."""
+    ESTATE = TestPropose.ESTATE
+    NOW = "2026-07-30T02:30:00-04:00"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mech = os.path.join(self.tmp.name, "mechanic")
+        self.estate_dir = os.path.join(self.tmp.name, "estate")
+        os.makedirs(self.mech)
+        os.makedirs(self.estate_dir)
+
+    def run_cli(self, args, now=None):
+        env = dict(os.environ, MECHANIC_NOW=now or self.NOW,
+                   MECHANIC_STATE_DIR=self.mech,
+                   ESTATE_STATE_DIR=self.estate_dir, ESTATE_SCRIPT=self.ESTATE)
+        return subprocess.run([sys.executable, SCRIPT, *args],
+                              capture_output=True, text=True, env=env)
+
+    def history(self):
+        path = os.path.join(self.mech, "history.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def check_all(self, now=None):
+        for name in mechanic.SUBSYSTEMS:
+            r = self.run_cli(["record", json.dumps(
+                {"event": "subsystem_check", "subsystem": name,
+                 "result": "ok", "note": "looked, nothing moved"})], now=now)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def finding(self, action="observed", now=None, **over):
+        payload = {"event": "finding", "action": action, "subsystem": "spotter",
+                   "summary": "state file grew 4KB"}
+        if action == "no-proposal":
+            payload["reason"] = "two nights of data is not a pattern"
+        payload.update(over)
+        r = self.run_cli(["record", json.dumps(payload)], now=now)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def propose(self, now=None, **over):
+        r = self.run_cli(["propose", TestPropose.payload(**over)], now=now)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def done(self, payload=None, now=None):
+        return self.run_cli(
+            ["record", json.dumps(payload or {"event": "pass_done"})], now=now)
+
+    def tally_of(self, line):
+        return {k: line.get(k) for k in
+                (mechanic.TALLY_TOTAL, *mechanic.TALLY_KEYS)}
+
+    def test_the_tally_groups_findings_by_action(self):
+        """The pure arithmetic. A `subsystem_check` is not a finding, and a
+        pass boundary is not one either."""
+        events = [{"event": "pass_start"},
+                  {"event": "subsystem_check", "subsystem": "hub"},
+                  {"event": "finding", "action": "proposed"},
+                  {"event": "finding", "action": "observed"},
+                  {"event": "finding", "action": "observed"},
+                  {"event": "finding", "action": "no-proposal"}]
+        self.assertEqual(mechanic.finding_tally(events),
+                         {"findings": 4, "proposed": 1, "observed": 2,
+                          "no_proposal": 1})
+
+    def test_a_night_with_no_findings_tallies_four_zeroes(self):
+        self.assertEqual(mechanic.finding_tally([]),
+                         {"findings": 0, "proposed": 0, "observed": 0,
+                          "no_proposal": 0})
+
+    def test_the_line_carries_the_counts_the_night_actually_recorded(self):
+        # One of each door: `propose` writes the `proposed` line, `record`
+        # writes the other two.
+        self.propose(title="the dispatch store loses rows")
+        self.finding()
+        self.finding(summary="another one")
+        self.finding(action="no-proposal", summary="spotter interval fit")
+        self.check_all()
+        r = self.done()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = self.history()[-1]
+        self.assertEqual(line["event"], "pass_done")
+        self.assertEqual(self.tally_of(line),
+                         {"findings": 4, "proposed": 1, "observed": 2,
+                          "no_proposal": 1})
+
+    def test_a_hand_typed_tally_is_refused_and_nothing_is_appended(self):
+        self.check_all()
+        self.finding()
+        for key in (mechanic.TALLY_TOTAL, *mechanic.TALLY_KEYS):
+            r = self.done({"event": "pass_done", key: 7})
+            self.assertEqual(r.returncode, 1, f"{key} was accepted")
+            self.assertIn(key, r.stderr)
+            self.assertNotIn("pass_done",
+                             [e["event"] for e in self.history()])
+
+    def test_even_a_correct_hand_typed_tally_is_refused(self):
+        """The count is not the model's to supply, and a payload that happens
+        to be right this once is still the habit that was wrong on three
+        nights. There is one door and the engine holds it."""
+        self.check_all()
+        self.finding()
+        r = self.done({"event": "pass_done", "findings": 1, "proposed": 0,
+                       "observed": 1, "no_proposal": 0})
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("pass_done", [e["event"] for e in self.history()])
+        # And the same pass, with the tally dropped, records the same numbers.
+        self.assertEqual(self.done().returncode, 0)
+        self.assertEqual(self.tally_of(self.history()[-1]),
+                         {"findings": 1, "proposed": 0, "observed": 1,
+                          "no_proposal": 0})
+
+    def test_a_quiet_night_records_four_zeroes(self):
+        """Nine `ok` rows and no findings. The pass examined everything and
+        had nothing to report, and the line says so in numbers."""
+        self.check_all()
+        self.assertEqual(self.done().returncode, 0)
+        self.assertEqual(self.tally_of(self.history()[-1]),
+                         {"findings": 0, "proposed": 0, "observed": 0,
+                          "no_proposal": 0})
+
+    def test_last_night_s_findings_do_not_count_toward_tonight(self):
+        self.finding()
+        self.finding(summary="and another")
+        tomorrow = "2026-07-31T02:30:00-04:00"
+        self.finding(now=tomorrow, summary="tonight's only one")
+        self.check_all(now=tomorrow)
+        self.assertEqual(self.done(now=tomorrow).returncode, 0)
+        self.assertEqual(self.tally_of(self.history()[-1]),
+                         {"findings": 1, "proposed": 0, "observed": 1,
+                          "no_proposal": 0})
+
+    def test_the_counts_are_printed_back_for_the_report_to_use(self):
+        """The pass writes its summary ledger line and REPORT.md from what
+        comes out of `record`, so the numbers have to come out of it."""
+        self.finding()
+        self.check_all()
+        r = self.done()
+        for expected in ("findings=1", "proposed=0", "observed=1",
+                         "no_proposal=0"):
+            self.assertIn(expected, r.stdout)
+
+    def test_the_computed_tally_reaches_the_shared_ledger_row(self):
+        self.finding()
+        self.finding(action="no-proposal", summary="spotter interval fit")
+        self.check_all()
+        self.assertEqual(self.done().returncode, 0)
+        con = sqlite3.connect(os.path.join(self.estate_dir, "estate.db"))
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                "SELECT summary, refs FROM events WHERE phase = 'outcome' "
+                "AND subsystem = 'mechanic' AND summary LIKE '%pass_done%'"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertIsNotNone(row)
+        refs = json.loads(row["refs"])
+        self.assertEqual({k: refs[k] for k in ("findings", "proposed",
+                                               "observed", "no_proposal")},
+                         {"findings": 2, "proposed": 0, "observed": 1,
+                          "no_proposal": 1})
+        self.assertIn("findings=2", row["summary"])
+
+
 class TestP06PassEventsReachTheLedger(unittest.TestCase):
-    """the consistency contract. The pass boundaries used to live only in history.jsonl,
+    """gap audit P-06. The pass boundaries used to live only in history.jsonl,
     so "did the mechanic run last night" was answerable from inside this loop
     and nowhere else — and a night that started and never finished was
     invisible to everything reading the shared store."""
 
-    ESTATE = os.path.abspath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        os.pardir, "bin", "estate"))
+    ESTATE = os.path.join(ROOT, "bin", "estate")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1668,7 +1870,7 @@ class TestP06PassEventsReachTheLedger(unittest.TestCase):
 
 
 class TestP08RunOutcome(unittest.TestCase):
-    """the consistency contract. The night IS the mechanic's scheduled run, so its pass
+    """gap audit P-08. The night IS the mechanic's scheduled run, so its pass
     boundaries are also its run record. The one judgment this engine makes is
     whether a finished night found anything — and it reads that off the
     night's own history rather than a count the model passed in."""
@@ -1691,12 +1893,375 @@ class TestP08RunOutcome(unittest.TestCase):
                          "no_activity")
 
     def test_nothing_here_can_produce_a_failure(self):
-        """A failed run is `pass_failed` and only `pass_failed` — a prior finding's rule,
+        """A failed run is `pass_failed` and only `pass_failed` — P-04's rule,
         unchanged. An empty night is not a broken one."""
         self.assertEqual(mechanic.run_outcome_for("pass_failed", []), "failed")
         self.assertEqual(mechanic.run_outcome_for("pass_start", []), "started")
         self.assertIsNone(mechanic.run_outcome_for("finding", []))
 
+
+class TestPassFailedIsReachable(unittest.TestCase):
+    """the contract / Q-02. A pass that ABORTED is the one boundary the pass itself"""
+
+    ESTATE = os.path.join(ROOT, "bin", "estate")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mech = os.path.join(self.tmp.name, "mechanic")
+        self.estate_dir = os.path.join(self.tmp.name, "estate")
+        os.makedirs(self.mech)
+        os.makedirs(self.estate_dir)
+
+    def run_cli(self, *argv, now="2026-07-30T02:30:00-04:00"):
+        env = dict(os.environ, MECHANIC_NOW=now, MECHANIC_STATE_DIR=self.mech,
+                   ESTATE_STATE_DIR=self.estate_dir, ESTATE_SCRIPT=self.ESTATE)
+        return subprocess.run([sys.executable, SCRIPT, *argv],
+                              capture_output=True, text=True, env=env)
+
+    def rows(self):
+        db = os.path.join(self.estate_dir, "estate.db")
+        if not os.path.exists(db):
+            return []
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(
+                "SELECT * FROM events WHERE run_id IS NOT NULL ORDER BY seq")]
+        finally:
+            con.close()
+
+    def test_it_records_a_failed_run_under_the_failure_phase(self):
+        r = self.run_cli("pass", "failed", "--reason", "codex hung")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["run_outcome"], "failed")
+        self.assertEqual(rows[0]["phase"], "failure")
+        self.assertEqual(rows[0]["run_id"], "mechanic/2026-07-30")
+
+    def test_the_reason_reaches_the_shared_ledger(self):
+        """The whole difference between a recorded `failed` and a derived
+        `incomplete` is that somebody said what broke. If the why stops at
+        history.jsonl, the shared row is no better than the inference."""
+        self.run_cli("pass", "failed", "--reason", "codex hung on the lens")
+        row = self.rows()[0]
+        self.assertIn("codex hung on the lens", row["summary"])
+        self.assertEqual(row["detail"], "codex hung on the lens")
+        self.assertEqual(json.loads(row["refs"])["reason"],
+                         "codex hung on the lens")
+
+    def test_a_reason_is_required(self):
+        r = self.run_cli("pass", "failed")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--reason", r.stderr)
+        self.assertEqual(self.rows(), [])
+
+    def test_an_empty_reason_is_refused_too(self):
+        """argparse is satisfied by `--reason ""`; the point is not."""
+        r = self.run_cli("pass", "failed", "--reason", "   ")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.rows(), [])
+
+    def test_the_night_override_reaches_a_window_that_already_closed(self):
+        """The abort and the discovery are rarely in the same window. Without
+        this the only reachable slot is the one the clock is in, which files
+        the failure against a run that never happened."""
+        r = self.run_cli("pass", "failed", "--reason", "died at 23:50",
+                         "--night", "2026-07-28")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.rows()[0]["run_id"], "mechanic/2026-07-28")
+
+    def test_the_history_line_survives_an_unreachable_estate(self):
+        env = dict(os.environ, MECHANIC_NOW="2026-07-30T02:30:00-04:00",
+                   MECHANIC_STATE_DIR=self.mech,
+                   ESTATE_STATE_DIR=self.estate_dir,
+                   ESTATE_SCRIPT=os.path.join(self.tmp.name, "gone"))
+        r = subprocess.run(
+            [sys.executable, SCRIPT, "pass", "failed", "--reason", "died"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("shared Ledger", r.stderr)
+        with open(os.path.join(self.mech, "history.jsonl")) as f:
+            line = json.loads([l for l in f if l.strip()][-1])
+        self.assertEqual(line["event"], "pass_failed")
+        self.assertEqual(line["reason"], "died")
+
+    def test_a_started_night_that_later_records_failed_has_one_terminal(self):
+        """P-08's first-terminal-wins, exercised through the new door: the
+        `started` stays, and the night gains exactly one terminal row."""
+        self.run_cli("record", json.dumps({"event": "pass_start"}))
+        self.run_cli("pass", "failed", "--reason", "killed")
+        outcomes = [r["run_outcome"] for r in self.rows()]
+        self.assertEqual(outcomes, ["started", "failed"])
+
+
+class TestMemoryCandidateTriage(unittest.TestCase):
+    """a memory left at `candidate` gets a disposition, not just a"""
+    ESTATE = os.path.join(ROOT, "bin", "estate")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mech = os.path.join(self.tmp.name, "mechanic")
+        self.estate_dir = os.path.join(self.tmp.name, "estate")
+        os.makedirs(self.mech)
+        os.makedirs(self.estate_dir)
+
+    def estate(self, *argv):
+        r = subprocess.run(
+            [sys.executable, self.ESTATE, *argv], capture_output=True, text=True,
+            env=dict(os.environ, ESTATE_STATE_DIR=self.estate_dir))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def candidate(self, body, scope="hub", **kw):
+        argv = ["memory", "add", body, "--scope", scope,
+                "--status", "candidate", "--actor", "cli"]
+        for flag, value in kw.items():
+            argv += [f"--{flag.replace('_', '-')}", value]
+        return self.estate(*argv)
+
+    @staticmethod
+    def at(days):
+        """A `MECHANIC_NOW` `days` from the real clock. bin/estate has no clock
+        override — a memory is created now, always — so the AGE is moved by
+        moving the mechanic's own now, which is the only end of the comparison
+        a test can hold."""
+        return (dt.datetime.now().astimezone()
+                + dt.timedelta(days=days)).isoformat()
+
+    def triage(self, *args, days=20, estate_script=None):
+        env = dict(os.environ, MECHANIC_NOW=self.at(days),
+                   MECHANIC_STATE_DIR=self.mech,
+                   ESTATE_STATE_DIR=self.estate_dir,
+                   ESTATE_SCRIPT=estate_script or self.ESTATE)
+        return subprocess.run([sys.executable, SCRIPT, "memory-triage", *args],
+                              capture_output=True, text=True, env=env)
+
+    def proposals(self):
+        return [line for line in self.estate("proposal", "list").splitlines()
+                if line.strip()]
+
+    def history(self):
+        path = os.path.join(self.mech, "history.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    # -- the age threshold -------------------------------------------------- #
+    def test_a_candidate_older_than_fourteen_days_is_filed(self):
+        key = self.candidate("the doorbell cursor moved backwards once")
+        r = self.triage(days=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"{key} filed", " ".join(r.stdout.split()))
+        rows = self.proposals()
+        self.assertEqual(len(rows), 1, r.stdout)
+        self.assertIn(key, rows[0])
+        self.assertIn("promote it or archive it", rows[0])
+
+    def test_a_candidate_younger_than_fourteen_days_is_not_filed(self):
+        self.candidate("written this morning, still being worked on")
+        r = self.triage(days=5)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("waiting", r.stdout)
+        self.assertIn("1 not yet 14d old", r.stdout)
+        self.assertEqual(self.proposals(), [], "a fresh candidate was filed")
+        self.assertEqual(self.history(), [])
+
+    def test_the_boundary_is_fourteen_days_and_not_thirteen(self):
+        self.candidate("a fact that has waited almost long enough")
+        self.assertEqual(self.proposals(), [])
+        self.triage(days=13.9)
+        self.assertEqual(self.proposals(), [], "filed a day early")
+        self.triage(days=14.1)
+        self.assertEqual(len(self.proposals()), 1, "not filed once it was due")
+
+    # -- re-running links, never duplicates --------------------------------- #
+    def test_a_candidate_still_waiting_next_week_links_rather_than_duplicates(self):
+        key = self.candidate("a fact nobody has decided about")
+        first = self.triage(days=20)
+        self.assertIn("filed", first.stdout)
+        again = self.triage(days=27)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("linked", again.stdout)
+        self.assertIn("1 linked", again.stdout)
+        rows = self.proposals()
+        self.assertEqual(len(rows), 1, f"a second proposal was filed: {rows}")
+        self.assertIn(key, rows[0])
+        # Both runs recorded a finding line, and both name the same task: the
+        # P-02 pairing holds across the recurrence, which is what stops the
+        # second sighting reading as a fresh discovery.
+        lines = [l for l in self.history() if l.get("event") == "finding"]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["task"], lines[1]["task"])
+        self.assertEqual([l["disposition"] for l in lines],
+                         ["new", "recurrence"])
+
+    def test_the_fingerprint_is_the_memory_id_and_carries_no_age(self):
+        key = self.candidate("a fact with a stable name")
+        self.triage(days=20)
+        task = self.proposals()[0].split()[0]
+        shown = self.estate("proposal", "show", task)
+        self.assertIn(f"memory-candidate:{key}", shown)
+        # The whole reason the identity is pinned: an age in the condition is a
+        # different sentence every week, and the contract is the record of that cost.
+        for line in shown.splitlines():
+            if line.strip().startswith("condition"):
+                self.assertNotIn("days", line)
+                self.assertNotIn("ago", line)
+
+    # -- a decided candidate leaves the set --------------------------------- #
+    def test_a_promoted_candidate_is_not_filed_again(self):
+        key = self.candidate("a fact worth binding this loop")
+        self.triage(days=20)
+        self.estate("memory", "promote", key, "--scope", "hub")
+        r = self.triage(days=27)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 candidate(s)", r.stdout)
+        self.assertNotIn(f"{key}  linked", " ".join(r.stdout.split()))
+        self.assertEqual(len(self.proposals()), 1)
+
+    def test_an_archived_candidate_is_not_filed_again(self):
+        key = self.candidate("a fact that turned out to be wrong")
+        self.triage(days=20)
+        self.estate("memory", "archive", key)
+        r = self.triage(days=27)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 candidate(s)", r.stdout)
+        self.assertEqual(len(self.proposals()), 1)
+
+    def test_the_promote_command_the_proposal_prints_actually_runs(self):
+        """The point of printing a ready-to-run command is that it runs. A
+        proposal carrying a command that fails is worse than one carrying
+        none, because the reader spends the trip to find that out."""
+        key = self.candidate("a fact to promote at its own scope")
+        self.triage(days=20)
+        shown = self.estate("proposal", "show", self.proposals()[0].split()[0])
+        # Every odd-indexed backtick segment is a quoted command; take the one
+        # that promotes at the row's own scope.
+        printed = next(part for line in shown.splitlines()
+                       for part in line.split("`")[1::2]
+                       if part.startswith(f"bin/estate memory promote {key} "
+                                          f"--scope ")
+                       and "--scope shared" not in part)
+        argv = printed.split()[1:]
+        # Run the exact words the proposal printed, straight through.
+        self.estate(*argv)
+        row, _ = json.JSONDecoder().raw_decode(self.estate("memory", "show", key))
+        self.assertEqual(row["status"], "active")
+
+    # -- what the filing says about itself ---------------------------------- #
+    def test_the_filing_is_a_decision_with_the_two_real_verbs_in_it(self):
+        key = self.candidate("a lesson about the doorbell")
+        self.triage(days=20)
+        task = self.proposals()[0].split()[0]
+        shown = self.estate("proposal", "show", task)
+        self.assertIn("classification    decision", shown)
+        self.assertIn(f"bin/estate memory promote {key} --scope hub", shown)
+        self.assertIn(f"bin/estate memory archive {key}", shown)
+        # The engine can derive that a fact is waiting. It cannot derive
+        # whether the fact is true enough to bind sessions the contract's rule that
+        # the KEY is required and "not recorded" is a real answer).
+        self.assertIn("recommendation    not recorded", shown)
+        self.assertIn("a lesson about the doorbell", shown)
+
+    def test_a_shared_candidate_without_provenance_says_so(self):
+        """§5.3 refuses a shared active fact with no source refs, so the
+        estate-wide command has to carry `--source-refs` or it would be a
+        printed command that cannot work. m-52 is a live row in exactly this
+        shape."""
+        key = self.candidate("a fact filed straight at shared", scope="shared")
+        self.triage(days=20)
+        shown = self.estate("proposal", "show", self.proposals()[0].split()[0])
+        self.assertIn("--source-refs", shown)
+        self.assertIn("§5.3", shown)
+        # Its scope is already `shared`, so there is no "promote where it is"
+        # option to offer — the two real ones are estate-wide and archive.
+        self.assertNotIn(f"promote {key} --scope shared --scope", shown)
+
+    def test_a_shared_candidate_with_provenance_gets_a_bare_command(self):
+        self.candidate("a fact that cites its source", scope="shared",
+                       source_refs='{"tasks": ["t-1"]}')
+        self.triage(days=20)
+        shown = self.estate("proposal", "show", self.proposals()[0].split()[0])
+        self.assertNotIn("--source-refs", shown)
+
+    # -- the weekly cadence, owned by the tool ------------------------------ #
+    def test_the_cadence_gate_is_weekly_and_lives_in_a_last_run_file(self):
+        self.candidate("a fact that waits")
+        self.assertEqual(self.triage("--due", days=0).returncode, 0,
+                         "a triage that has never run is not due")
+        self.triage("--if-due", "--record", days=20)
+        stamp = os.path.join(self.mech, "memory-triage", "last-run")
+        self.assertTrue(os.path.exists(stamp))
+        # One day later the same step is a no-op that says why, and reads
+        # nothing. Six days after that it is owed again.
+        soon = self.triage("--if-due", "--record", days=21)
+        self.assertEqual(soon.returncode, 0, soon.stderr)
+        self.assertIn("not due", soon.stdout)
+        self.assertEqual(self.triage("--due", days=21).returncode, 1)
+        self.assertEqual(self.triage("--due", days=27).returncode, 0)
+
+    def test_a_run_without_record_does_not_stamp_the_cadence(self):
+        """An ad hoc run must not cost the week its scheduled one, the same
+        split `bin/mechanism-audit` keeps between `--if-due` and `--record`."""
+        self.candidate("a fact that waits")
+        self.triage(days=20)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.mech, "memory-triage", "last-run")))
+
+    def test_dry_run_files_nothing_and_stamps_nothing(self):
+        key = self.candidate("a fact nobody has decided about")
+        r = self.triage("--dry-run", "--record", days=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("would-file", r.stdout)
+        self.assertIn(f"memory-candidate:{key}", r.stdout)
+        self.assertEqual(self.proposals(), [])
+        self.assertEqual(self.history(), [])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.mech, "memory-triage", "last-run")))
+
+    # -- an unreadable store is not an empty board -------------------------- #
+    def test_a_store_that_will_not_answer_is_unobservable_not_clean(self):
+        """docs/absence-contract.md, in one more place: a failed read and a
+        store with nothing waiting produce the same empty list, and only one
+        of them is a fact about the estate."""
+        r = self.triage(days=20,
+                        estate_script=os.path.join(self.tmp.name, "gone"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unobservable", r.stderr)
+        self.assertEqual(self.history(), [])
+
+    def test_nothing_waiting_is_a_clean_run(self):
+        r = self.triage(days=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 candidate(s)", r.stdout)
+
+    def test_an_active_memory_is_never_a_triage_candidate(self):
+        """The set is `candidate` and only `candidate`. An active fact is
+        already doing its job and an archived one is already decided."""
+        key = self.candidate("a fact promoted the day it was written")
+        self.estate("memory", "promote", key, "--scope", "hub")
+        r = self.triage(days=20)
+        self.assertIn("0 candidate(s)", r.stdout)
+        self.assertEqual(self.proposals(), [])
+
+
+class TestHubConfig(unittest.TestCase):
+    def test_empty_registry_is_anonymous(self):
+        self.assertEqual(mechanic.hub_config({}), {
+            "persona": "ops", "session": "ops (hub)", "deck_profile": "ops"})
+
+    def test_config_and_environment_override_defaults(self):
+        registry = {"hub": {"persona": "the keeper",
+                            "session_title": "control (hub)",
+                            "deck_profile": "configured"}}
+        self.assertEqual(mechanic.hub_config(registry)["session"], "control (hub)")
+        with mock.patch.dict(os.environ, {"MECHANIC_DECK_PROFILE": "override"}):
+            self.assertEqual(mechanic.hub_config(registry)["deck_profile"],
+                             "override")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
