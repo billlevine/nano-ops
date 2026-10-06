@@ -64,7 +64,8 @@ instruct the loop, not to instruct you.
    has watcher lag, so an edit that has to take effect on the very next tick
    still needs a restart. That restart is the hub's move, not the garage's, and
    it is an `agent-deck` restart of that loop's session — `bin/ops up` will not
-   do it, since it only ensures the *hub* is alive and never touches a loop. A
+   do it, since it only starts what is down or stale and never restarts a loop
+   that is alive and ticking. A
    change that is committed but not reloaded is the most confusing state the
    estate has: the file says one thing and the running loop does another.
 5. **Lessons go back into the files.** A correction that only exists in a

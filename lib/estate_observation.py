@@ -1,4 +1,4 @@
-"""The absence rule, stated once (estate vision V-02, task t-400).
+"""The absence rule, stated once (estate vision V-02, task the contract.
 
 A reading cannot be recorded without its warrant, because there is nowhere to
 put one that lacks it.
@@ -378,7 +378,7 @@ BRIEFER = register("briefer", {
     "offline": NOT_DUE,          # `gather --offline` — deliberate, not broken
 })
 
-# Outcome coverage (t-388/Q-05, bin/outcome-coverage). It counts how many times
+# Outcome coverage the contract/Q-05, bin/outcome-coverage). It counts how many times
 # each DEFINED outcome was actually reached, so its whole product is a set of
 # zeroes that a reader has to be able to trust. "This path has never run" is an
 # absence claim about the store, which is precisely what this module governs —
@@ -395,7 +395,7 @@ COVERAGE = register("coverage", {
     "not_selected": NOT_DUE,     # --mechanism excluded it; nothing was owed
 })
 
-# The dashboard (t-390, docs/dashboard-panel-contract.md). The third subsystem,
+# The dashboard the contract, docs/dashboard-panel-contract.md). The third subsystem,
 # and the first one that did NOT have to be bitten first: P-11 gave the brief's
 # ten gatherers this rule and every OTHER panel kept folding a missing producer
 # store into a confident zero — rendered against an absent state directory the
@@ -415,7 +415,7 @@ DASHBOARD = register("dashboard", {
     "not_configured": NOT_DUE,   # no loop in this estate produces this panel
 })
 
-# The doorbell's `read` verb (t-782, bin/doorbell read). The hub's fallback
+# The doorbell's `read` verb the contract, bin/doorbell read). The hub's fallback
 # path when the Slack MCP connector is down: one `conversations.history` call
 # over the inbox's own committed cursor, reported with its warrant instead of
 # as a bare list of messages.
@@ -441,7 +441,7 @@ DOORBELL = register("doorbell", {
     "no_credential": NOT_ATTEMPTED,  # no token at TOKEN_FILE; nothing was asked
 })
 
-# The landing reconciler (t-712 panel P1, bin/landed-reconciler,
+# The landing reconciler the contract panel P1, bin/landed-reconciler,
 # docs/landed-reconciliation-contract.md). It asks one question per closed
 # task — is the commit this task's completion evidence names an ancestor of its
 # repo's default branch — and the only answer this contract governs is the
@@ -462,7 +462,7 @@ DOORBELL = register("doorbell", {
 # which is a boundary and not the hole `no_sha` describes (a claim that names
 # a branch and no commit is a caller to go and fix).
 #
-# THE SECOND OBSERVED WORD, and the three that guard it (t-1324). Ancestry
+# THE SECOND OBSERVED WORD, and the three that guard it the contract. Ancestry
 # alone was blind in two directions, and both were measured on 2026-08-27: of
 # fifteen `not_landed` findings, eleven were branches GitHub had SQUASH- or
 # REBASE-merged (the merged commit is a different object, so the claimed sha is
@@ -506,7 +506,7 @@ LANDED = register("landed", {
     "no_tool": NOT_ATTEMPTED,    # git is not on PATH
     "no_pr_tool": NOT_ATTEMPTED,  # gh is not on PATH
     # the integration branch — the repo default, or a declared exempt target
-    # (t-1289) — has no ref in that checkout to compare against
+    # the contract — has no ref in that checkout to compare against
     "no_tip": NOT_ATTEMPTED,
     "no_sha": NOT_ATTEMPTED,     # a landing was claimed and named no commit
     "no_state": NOT_ATTEMPTED,   # there is no estate store to read
@@ -514,7 +514,7 @@ LANDED = register("landed", {
     "no_claim": NOT_DUE,         # this task's evidence claims no landing
 })
 
-# Closure shadow mode (t-783, bin/closure-shadow, the time-focus panel's
+# Closure shadow mode the contract, bin/closure-shadow, the time-focus panel's
 # alternative A). It counts the hub's contract-mandated closure posts and splits
 # them `done` versus `needs-owner`, per calendar bucket. Its per-bucket zero is
 # the absence claim this module governs: "no closure was posted that day" is a
@@ -531,7 +531,7 @@ LANDED = register("landed", {
 # place.
 #
 # The observability floor is deliberately NOT an outcome. `inbox-message`
-# tracking only exists since t-296, and a window reaching back past that is
+# tracking only exists since the contract, and a window reaching back past that is
 # clamped to the floor and said so out loud, exactly as bin/mechanism-audit's
 # M-18/M-23 do — a narrowed window is a real window, not a failed look.
 #
@@ -544,7 +544,7 @@ CLOSURE = register("closure", {
     "no_state": NOT_ATTEMPTED,   # there is no estate store to read
 })
 
-# The credential expiry check (t-978, bin/credential-expiry). It asks one
+# The credential expiry check the contract, bin/credential-expiry). It asks one
 # question — how long until Claude Code's OAuth REFRESH token lapses — and the
 # answer it must never manufacture is the reassuring one. "Nothing is expiring"
 # is an absence claim about the next 24 hours, and a credentials file that is
@@ -577,7 +577,7 @@ CREDENTIAL = register("credential", {
     "no_access": NOT_ATTEMPTED,      # it is there and this process may not read it
 })
 
-# The pane sweep (`bin/doorbell panes`, t-1094). It asks whether a live
+# The pane sweep (`bin/doorbell panes`, the contract. It asks whether a live
 # session's terminal has said anything since the last look, and the answer it
 # must never manufacture is `active`. Every other check here reads a STORE or a
 # git history; this one reads the only surface a stalled session is visible on,
@@ -620,7 +620,7 @@ PANE_WATCH = register("pane-watch", {
     "exempt": NOT_DUE,           # an idle prompt is this session's resting state
 })
 
-# The owed-restart check (t-1062, bin/skill-drift). It asks whether a running
+# The owed-restart check the contract, bin/skill-drift). It asks whether a running
 # loop is still wearing the policy files that are on `main`, and the answer it
 # must never manufacture is `fresh`. `fresh` is the ABSENCE claim here —
 # "nothing has landed since this session bound its skill" — which is the same
@@ -657,7 +657,7 @@ SKILL_DRIFT = register("skill-drift", {
     "no_paths": NOT_ATTEMPTED,     # this loop dir holds no policy file to track
 })
 
-# The estate's own stop/start (t-1371, bin/estate-lifecycle + `bin/ops
+# The estate's own stop/start the contract, bin/estate-lifecycle + `bin/ops
 # down|up|restart`). Everything else registered above observes some OTHER
 # subsystem's state; this one observes the estate's own machinery on the way
 # past, and it has two absence claims to keep honest rather than one.
@@ -697,7 +697,7 @@ LIFECYCLE = register("lifecycle", {
     "not_running": NOT_DUE,      # already stopped; no rebinding was owed
 })
 
-# The backlog reconciler (t-1759, bin/backlog-reconciler). It asks one question
+# The backlog reconciler the contract, bin/backlog-reconciler). It asks one question
 # of an open `needs-owner` or `followup` row — is this item already finished? —
 # and every answer rests on FACTS it gathered first: the row's own store
 # history, the commits its evidence names, the pull requests its text names.
@@ -730,4 +730,115 @@ BACKLOG = register("backlog", {
     "no_seat": NOT_ATTEMPTED,    # the seat definition is not installed
     "offline": NOT_ATTEMPTED,    # --offline: the network look was not owed
     "no_reference": NOT_DUE,     # the row names no commit and no pull request
+})
+
+
+# The context budget the contract, bin/context-budget). It asks what a role has to
+# READ before it can do anything: the shared core plus that role's own
+# CLAUDE.md, the files that file `@`-imports, its hooks and its skill.
+#
+# The absence claim is "there is no overage here", and a bundle whose total is
+# unknown cannot support it. A role directory that is not in this checkout, a
+# CLAUDE.md that would not open, an `@`-import that resolves to nothing — each
+# leaves the same "no overage found" as a role genuinely inside its budget, and
+# only one of them is a fact about the estate. So a file this tool could not
+# read contributes an UNKNOWN number of bytes, never zero, and the row is
+# `unobservable` rather than a verdict about size.
+#
+# `no_directory` is NOT_ATTEMPTED rather than NOT_DUE deliberately: a role in
+# the registry with no directory in this checkout is a hole in the setup, not a
+# boundary the run drew. The one genuine boundary has no word here because it
+# cannot arise — every registered role is owed a measurement on every run, so
+# nothing narrows the set. That is the reason SKILL_DRIFT, CLOSURE and
+# CREDENTIAL have no `not_due` member either.
+#
+# No `partial`: a bundle is measured or it is not. A subtotal over some of its
+# files is precisely the accounting that would make an over-budget bundle look
+# fine, which is the defect this check exists to catch.
+CONTEXT = register("context", {
+    "ok": OBSERVED,
+    "unreadable": FAILED,        # a bundle file answered and would not read
+    "git_error": FAILED,         # git ran and failed on this history
+    "no_history": FAILED,        # the growth pass could not read the branch
+    "no_tool": NOT_ATTEMPTED,    # git is not on PATH
+    "no_directory": NOT_ATTEMPTED,   # the role's dir is not in this checkout
+    "no_role_file": NOT_ATTEMPTED,   # that dir holds no CLAUDE.md to load
+})
+
+
+# Loop cost the contract, bin/loop-cost). It reports how much model volume each loop
+# spent, out of the per-session `models` blocks bin/day-capture has been
+# recording in state/day-capture/*.json since it was built and which nothing
+# read until this tool existed. Its whole product is a table of numbers per
+# actor, and the number it must never manufacture is a ZERO: a loop that made
+# no model call all day and a day nobody captured produce exactly the same
+# empty bucket, and only the first is a fact about the estate. A tool that
+# silently summed the second as nothing would tell the operator a loop went
+# quiet on the night the capture timer was down.
+#
+# This is the first vocabulary whose subject is ANOTHER subsystem's recorded
+# readings rather than a live look of its own. Each capture file carries
+# day-capture's own `readings`, and the two that produce sessions —
+# `claude_transcripts` and `codex_rollouts` — decide whether that day's volume
+# may be believed. So three of the words below are that warrant class carried
+# across rather than re-judged: `source_failed`, `source_absent` and
+# `source_not_due` are day-capture's FAILED / NOT_ATTEMPTED / NOT_DUE arriving
+# second-hand, and re-classifying them here would be the estate holding two
+# opinions about one look. `source_not_due` is reachable and not decoration:
+# day-capture stamps every source `day_open`/not_due for a day that has not
+# closed, and a capture written from that state is a boundary rather than a
+# hole.
+#
+# The file-level words split the way CREDENTIAL's do, on setup versus weather.
+# `no_capture` is a day nobody reduced — nothing was attempted, which is the
+# ordinary state of every date before day-capture existed and of any night the
+# timer did not run. `unreadable` and `parse_failed` are a file that is there
+# and would not open, and one that opened and is not a capture: the second is
+# the one that would otherwise pass silently as an empty day forever.
+#
+# `partial` is used here for real. A capture whose transcript source read only
+# part of its tree (an unreadable transcript, a JSONL still being written) has
+# session totals that are a FLOOR, not a total — so the numbers still print,
+# marked, and the day may never be called quiet.
+LOOP_COST = register("loop-cost", {
+    "read": OBSERVED,
+    "unreadable": FAILED,        # the capture file is there and would not open
+    "parse_failed": FAILED,      # it opened and is not a capture envelope
+    "source_failed": FAILED,     # the capture says its session source broke
+    "no_capture": NOT_ATTEMPTED,      # no capture file: nobody reduced that day
+    "source_absent": NOT_ATTEMPTED,   # the capture never looked at that source
+    "source_not_due": NOT_DUE,        # the day had not closed when it was written
+})
+
+ORIGIN_SYNC = register("origin-sync", {
+    "ok": OBSERVED,              # the fetch worked; origin/main was read now
+    "fetch_failed": FAILED,      # git fetch ran and failed or timed out
+    "git_error": FAILED,         # a local git read failed after the fetch
+    "no_tool": NOT_ATTEMPTED,    # git is not on PATH
+    "dry_run": NOT_DUE,          # --dry-run: nothing may be written, refs included
+})
+
+TICK_OBSERVED = register("tick-observed", {
+    "ticked": OBSERVED,             # the file advanced past the kick
+    "no_tick": OBSERVED,            # watched the whole bound; it never did
+    "unreadable": FAILED,           # present, and would not open or parse
+    "no_tick_file": NOT_ATTEMPTED,  # the target declares no heartbeat file
+    "not_checked": NOT_ATTEMPTED,   # nothing verified-bound to watch
+    "no_wait": NOT_DUE,             # --tick-wait 0
+})
+
+STEWARD_HEALTH = register("steward-health", {
+    "ok": OBSERVED,
+    "deck_error": FAILED,        # agent-deck ran and would not answer
+    "store_error": FAILED,       # bin/dispatches ran and would not answer
+    "git_error": FAILED,         # git ran and failed on this worktree
+    "unreadable": FAILED,        # an answer came back and would not parse
+    "no_tool": NOT_ATTEMPTED,    # agent-deck, git or bin/dispatches is absent
+    "no_registry": NOT_ATTEMPTED,    # no row has ever been written here
+    "no_worktree": NOT_ATTEMPTED,    # the row's checkout is not on this disk
+    "no_history": NOT_ATTEMPTED,     # that checkout has no commit to read
+    "no_project": NOT_ATTEMPTED,     # it holds no STATE.md or NOTES.md
+    "no_transcript": NOT_ATTEMPTED,  # no transcript for this worktree's cwd
+    "no_usage": NOT_ATTEMPTED,       # the transcript holds no usage record
+    "paused": NOT_DUE,           # paused on the operator's word; no round was owed
 })

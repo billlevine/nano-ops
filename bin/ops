@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ops — the operator CLI for this estate.
 #
-#   ops up                     ensure the hub session is alive and ticking
+#   ops up                     ensure the hub and every autostart loop are
+#                              alive and ticking (runs health's own remedies)
 #   ops status                 agent-deck sessions + this repo's Flox services
 #   ops health                 READ-ONLY registry sweep; prints only anomalies
 #   ops doctor                 preflight: toolchain, config, invariants
@@ -40,6 +41,21 @@ DECK_GROUP="$(hub_field group "$PERSONA")"
 # duplicate hub.
 AGENTDECK_PROFILE="$(hub_field deck_profile ops)"
 export AGENTDECK_PROFILE
+# The export is belt-and-braces for anything this script shells out to that it
+# does not control. Every agent-deck call below — and every agent-deck command
+# it PRINTS for an operator to run — threads `-p "$DECK_PROFILE"` explicitly
+# instead of relying on it: a printed remedy is pasted into a shell that has no
+# such export, and a bare call there resolves against whatever the ambient
+# default happens to be.
+DECK_PROFILE="$AGENTDECK_PROFILE"
+
+# The command every session here is launched with. An unattended session that
+# stops on a permission prompt is a stalled session nobody sees, and a bare
+# `-c claude` does not reliably land in bypass-permissions mode when the target
+# directory already exists — so the flag is spelled out rather than inherited
+# from a settings default. Override with $OPS_CLAUDE_CMD.
+CLAUDE_CMD="${OPS_CLAUDE_CMD:-claude --dangerously-skip-permissions}"
+HUB_MODEL="${HUB_MODEL:-$(hub_field model "")}"
 
 dash_hostport() {  # echo "<host> <port>" from loops.toml [dashboard]
   python3 - "$REPO/loops.toml" <<'PY'
@@ -52,13 +68,14 @@ print(d.get("host", "127.0.0.1"), int(d.get("port", 8422)))
 PY
 }
 
-registry_autostart() {  # one row per autostart loop, tab-separated
-  # "<title>\t<name>\t<secs>\t<interval>\t<dir>\t<skill>\t<model>" for each
-  # [loops.*] with autostart=true: the session TITLE ("<persona> (<name>)",
-  # matching the hub skill §5), the loop name, the interval in seconds (-1 if
-  # unparseable, e.g. "on-demand"), the raw interval string, and the three
-  # fields the restart commands health prints need — dir, skill, registry
-  # model.
+registry_autostart() {  # one row per autostart loop, unit-separated
+  # "<title>\t<name>\t<secs>\t<interval>\t<dir>\t<skill>\t<recovery>\t<model>"
+  # for each [loops.*] with autostart=true: the session TITLE ("<persona>
+  # (<name>)", matching the hub skill §5), the loop name, the interval in
+  # seconds (-1 if unparseable, e.g. "on-demand"), the raw interval string, the
+  # fields the restart commands health prints need — dir, skill, the loop's
+  # declared re-arm shape ("kick" unless `recovery = "stop-start"`, see
+  # rearm_command) and the registry model.
   python3 - "$REPO/loops.toml" <<'PY'
 import sys, tomllib
 UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -77,9 +94,13 @@ for name, c in loops.items():
     persona = (c.get("persona") or "").strip()
     title = f"{persona} ({name})" if persona else name
     iv = c.get("interval", "")
-    print("\t".join([title, name, str(secs(iv)), iv,
+    print("\x1f".join([title, name, str(secs(iv)), iv,
                      c.get("dir", "") or f"loops/{name}",
                      c.get("skill", "") or name,
+                     # Never empty, and before model: IFS=$'\t' is whitespace
+                     # to `read`, so an empty field that is not the LAST one
+                     # collapses and shifts every field after it.
+                     str(c.get("recovery", "") or "kick"),
                      c.get("model", "") or ""]))
 PY
 }
@@ -97,6 +118,99 @@ interval_secs() {  # "<interval string>" -> seconds, or -1 if unparseable
     d) [ -n "$n" ] && [[ "$n" =~ ^[0-9]+$ ]] && { echo $((n * 86400)); return; } ;;
   esac
   echo -1
+}
+
+# ── re-arming a LIVE session: stop+start, not a bare kick ────────────────────
+#
+# `agent-deck session send "<title>" "/loop <interval> /<skill>"` into a session
+# that is already alive ARMS A SECOND SCHEDULE. The bundled `/loop` skill's
+# wakeup chain is not replaced by a later `/loop` and is not cancelled by
+# `/clear` — only a real process restart takes it down. So every kick and
+# every hand recovery that re-arms a live loop can leave one more schedule
+# behind, and a loop that has been recovered a few times ends up firing at a
+# multiple of its registered cadence while every freshness check calls it
+# healthy.
+#
+# A loop declared `recovery = "stop-start"` in its [loops.<name>] block
+# therefore gets a STOP+START re-arm wherever this file prints one, and never a
+# bare send. It is heavier than a kick — the session loses its context — which
+# is why it is declared per loop and not the default: it belongs on a loop
+# where an extra schedule has actually been seen to accumulate.
+stop_start_command() {  # stop_start_command <title> <loop argument>
+  # Stop, start, re-arm. The stop is what takes the armed schedules down with
+  # the process; the start alone does not resume ticking, so the kick follows
+  # it and carries the interval.
+  printf 'agent-deck -p %s session stop "%s"  &&  sleep 3  &&  agent-deck -p %s session start "%s"  &&  sleep 10  &&  agent-deck -p %s session send "%s" "%s"' \
+    "$DECK_PROFILE" "$1" "$DECK_PROFILE" "$1" "$DECK_PROFILE" "$1" "$2"
+}
+
+rearm_command() {  # rearm_command <recovery> <title> <loop argument>
+  # The command that puts a LIVE session back on its cadence. `<loop argument>`
+  # is the whole `/loop <interval> /<skill>` string, already interval-qualified
+  # by the caller, because the interval is the half that gets dropped.
+  local recovery="$1" title="$2" loop_arg="$3"
+  if [ "$recovery" = "stop-start" ]; then
+    stop_start_command "$title" "$loop_arg"
+  else
+    printf 'agent-deck -p %s session send "%s" "%s"' \
+      "$DECK_PROFILE" "$title" "$loop_arg"
+  fi
+}
+
+# ── the tick log: how many times a loop really ticked ────────────────────────
+#
+# `state/<name>/last_tick` is overwritten on every tick, so it can say how long
+# ago the last one was and can never say how MANY there were. An upper bound on
+# the tick rate needs a counter, and the counter has to be written by the thing
+# that ticks: `state/<name>/tick-log` holds one epoch-seconds line per tick,
+# appended by that loop's own engine and pruned by it to the last day.
+#
+# Only loops whose engine writes it can be judged. A loop with no tick log gets
+# NO RATE VERDICT — not a clean one — and `cmd_health` says how many were
+# judged, because "nothing printed" must never read as "the rate was checked
+# and it was fine" (docs/absence-contract.md).
+tick_rate_hour() {  # tick_rate_hour <loop name> -> ticks in the last hour, or -1
+  local log="$REPO/state/$1/tick-log"
+  [ -r "$log" ] || { echo -1; return; }
+  awk -v cutoff="$(( $(date +%s) - 3600 ))" '
+    $1 ~ /^[0-9]+$/ && $1 >= cutoff { n++ } END { print n + 0 }' "$log" 2>/dev/null \
+    || echo -1
+}
+
+# A loop may declare `tick_health = "log"` when verbs other than its tick
+# update last_tick. Missing or empty evidence is unchecked, never healthy.
+tick_missed_from_log() {  # tick_missed_from_log <loop name>
+  python3 - "$REPO/loops.toml" "$1" <<'PYCONF'
+import sys, tomllib
+try:
+    loops = tomllib.load(open(sys.argv[1], "rb")).get("loops", {})
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if loops.get(sys.argv[2], {}).get("tick_health") == "log" else 1)
+PYCONF
+}
+
+tick_log_last() {  # tick_log_last <loop name> -> newest tick epoch, or -1
+  local log="$REPO/state/$1/tick-log" newest
+  [ -r "$log" ] || { echo -1; return; }
+  newest=$(awk '$1 ~ /^[0-9]+$/ && $1 > m { m = $1 } END { print m + 0 }' \
+    "$log" 2>/dev/null) || { echo -1; return; }
+  [ "${newest:-0}" -gt 0 ] || { echo -1; return; }
+  echo "$newest"
+}
+
+tick_rate_allowed() {  # tick_rate_allowed <interval seconds> -> ticks/hour ceiling
+  # What the cadence implies, plus room for the ticks a cadence does not
+  # produce: an operator's kick, a `bin/ops up`, a tick that ran long and let
+  # the next one land inside the same hour. Half the implied rate or two,
+  # whichever is larger — so a 15m loop is flagged at 7 ticks in an hour and a
+  # SINGLE extra armed schedule (8/hour, the doubling this exists to catch) is
+  # caught, while an ordinary hour of 4 plus a hand kick is not.
+  local implied=$(( 3600 / ${1:-3600} )) slack
+  [ "$implied" -lt 1 ] && implied=1
+  slack=$(( implied / 2 ))
+  [ "$slack" -lt 2 ] && slack=2
+  echo $(( implied + slack ))
 }
 
 # ── doctor ───────────────────────────────────────────────────────────────────
@@ -138,23 +252,45 @@ cmd_doctor() {
 
 # ── hub lifecycle ────────────────────────────────────────────────────────────
 
+# Bring the estate up: the hub, then every autostart loop.
+#
+# `up` used to launch the hub and stop there, while `health` ENUMERATED the
+# autostart loops and printed the command that would start each one for a
+# person to type. The loops are now started here by EXECUTING those same
+# strings — `health_scan` produces them once and both verbs use them — so the
+# launch logic has exactly one copy and the printed remedy cannot drift from
+# the performed one.
+#
+# Every stage is TESTED rather than trusted to `set -e`: a failed `agent-deck
+# launch` for the hub would otherwise take the script out before a single loop
+# was started. Each stage says whether it worked, `up` carries that out in its
+# exit status, and the stages after a failed one still run — a hub that would
+# not come back is no reason to leave the loops down too.
 cmd_up() {
+  local rc=0
   mkdir -p "$REPO/state/hub"
+  up_hub   || { echo "up: the hub did not come back" >&2; rc=1; }
+  up_loops || rc=1
+  return "$rc"
+}
+
+up_hub() {
   # Existence check via `session show` (non-zero only if absent). NOT
   # `ls | awk '{print $1}'` — that truncates a multi-word title like
   # "ops (hub)" to "ops", so an exact match always misses and this would try to
   # launch a duplicate, leaving the registered branch below unreachable.
-  if ! agent-deck session show "$HUB_TITLE" >/dev/null 2>&1; then
-    # The hub routes, dispatches, and relays; heavy work is offloaded to other
-    # sessions, and it is stateless per tick (it reloads cursor/ledger/skill from
-    # disk), so a cheaper model plus aggressive compaction costs nothing
-    # functional. Override with $HUB_MODEL.
-    agent-deck launch "$REPO/hub" -c claude -model "${HUB_MODEL:-claude-sonnet-5}" \
-      -t "$HUB_TITLE" -g "$DECK_GROUP" -m "/loop /hub"
-    return
+  if ! agent-deck -p "$DECK_PROFILE" session show "$HUB_TITLE" >/dev/null 2>&1; then
+    # Model choice belongs to this installation. An empty setting uses the CLI default.
+    local model_args=()
+    [ -z "$HUB_MODEL" ] || model_args=(-model "$HUB_MODEL")
+    agent-deck -p "$DECK_PROFILE" launch "$REPO/hub" -cmd "$CLAUDE_CMD" \
+      "${model_args[@]}" \
+      -t "$HUB_TITLE" -g "$DECK_GROUP" -m "/loop /hub" || {
+      echo "hub: launch failed" >&2; return 1; }
+    return 0
   fi
   local st
-  st=$(agent-deck session show "$HUB_TITLE" 2>/dev/null | awk -F': *' '/^Status:/{print $2}')
+  st=$(agent-deck -p "$DECK_PROFILE" session show "$HUB_TITLE" 2>/dev/null | awk -F': *' '/^Status:/{print $2}')
   case "$st" in
     *running*|*waiting*)
       # Process is alive; a scheduled /loop wakeup may be pending. Kick only if
@@ -164,7 +300,8 @@ cmd_up() {
       age=$((now - last)); pace=$(cat "$REPO/state/hub/pace" 2>/dev/null || echo 600)
       thresh=$((pace * 2 + 120))
       if [ "$age" -gt "$thresh" ]; then
-        agent-deck session send "$HUB_TITLE" "/loop /hub"
+        agent-deck -p "$DECK_PROFILE" session send "$HUB_TITLE" "/loop /hub" || {
+          echo "hub: alive but stale, and the kick failed" >&2; return 1; }
         echo "hub alive but stale (last tick ${age}s ago) — loop kicked"
       else
         echo "hub up ($st), last tick ${age}s ago"
@@ -172,32 +309,76 @@ cmd_up() {
       ;;
     *)
       # Stopped/errored: /loop wakeups died with the process — start, then kick.
-      agent-deck session start "$HUB_TITLE"
+      agent-deck -p "$DECK_PROFILE" session start "$HUB_TITLE" || {
+        echo "hub: session start failed" >&2; return 1; }
       sleep 10
-      agent-deck session send "$HUB_TITLE" "/loop /hub"
+      agent-deck -p "$DECK_PROFILE" session send "$HUB_TITLE" "/loop /hub" || {
+        echo "hub: started, but the loop kick failed — it is up and not ticking" >&2
+        return 1; }
       echo "hub started; loop kicked"
       ;;
   esac
-  agent-deck session show "$HUB_TITLE" || true
+  agent-deck -p "$DECK_PROFILE" session show "$HUB_TITLE" || true
+}
+
+# Run `health`'s own remedy for every loop that needs one. `eval` is the point
+# rather than a shortcut: the string being run is character-for-character the
+# one `bin/ops health` prints, so a loop started here is started by the command
+# an operator would have typed — interval, model, profile and all. Only
+# `needs-start` and `needs-kick` are acted on; `off-registry` carries a remedy
+# too and it undoes a cadence the operator chose on purpose, which is never
+# `up`'s to do. `tick-rate` and `tick-missed` are skipped for a different
+# reason: both are report-only findings about a loop that is already running,
+# and neither is the question `up` is asking. `tick-missed`'s remedy is a READ;
+# `tick-rate`'s is a stop+start, which is a recovery decision and not a
+# bring-the-estate-up step.
+#
+# `--for-start` because `up` asks "which loops are not running", and a
+# heartbeat written a minute before a shutdown is not evidence that anything is
+# running now. `health`'s heartbeat veto is right for `health` and would make
+# `up` after a stop a silent no-op.
+up_loops() {
+  local kind title message remedy acted=0 rc=0
+  while IFS=$'\t' read -r kind title message remedy; do
+    case "$kind" in
+      needs-start|needs-kick) ;;
+      *) continue ;;
+    esac
+    [ -n "$remedy" ] || continue
+    acted=$((acted + 1))
+    echo "$kind $title"
+    echo "  → $remedy"
+    if eval "$remedy"; then
+      echo "  ok"
+    else
+      echo "  FAILED — the hub is up but this loop is not" >&2
+      rc=1
+    fi
+  done < <(health_scan --for-start)
+  [ "$acted" -eq 0 ] && echo "all autostart loops already alive and fresh"
+  return "$rc"
 }
 
 cmd_status() {
-  agent-deck status || true
-  agent-deck ls || true
+  agent-deck -p "$DECK_PROFILE" status || true
+  agent-deck -p "$DECK_PROFILE" ls || true
   echo "--- flox services ($REPO)"
   flox services status -d "$REPO" 2>&1 || echo "(no activation running — start with: flox activate --start-services)"
 }
 
 # READ-ONLY health pass across the registry. Runs the exact classification
-# cmd_up already runs for the hub's own session — staleness threshold
-# 2*interval+120s; no live session or a stopped/errored one -> needs-start,
-# alive+stale -> needs-kick, alive+fresh -> ok — for every [loops.*] with
-# autostart=true, and prints ONLY the anomalies (a clean pass prints one "ok"
-# line). It NEVER starts, kicks, or mutates anything: this is the diagnostic
-# half of cmd_up, and the hub tick (skill §5) is the operator that acts on the
-# needs-start/needs-kick lines it emits (still applying its own crash-loop
-# breaker before restarting). Session TITLE is "<persona> (<name>)"; heartbeat
-# is state/<name>/last_tick (epoch seconds).
+# up_hub already runs for the hub's own session — staleness threshold
+# 2*interval+120s; no live session -> needs-start, a stopped/errored one ->
+# needs-start unless its own heartbeat is fresh, alive+stale -> needs-kick,
+# alive+fresh -> ok, plus two report-only records over the same heartbeat:
+# alive and not advancing inside 1.5*interval+120s -> tick-missed, and ticking
+# more often in the last hour than the cadence implies -> tick-rate — for every
+# [loops.*] with autostart=true, and prints ONLY the anomalies (a clean pass
+# prints one "ok" line). It NEVER starts, kicks, or mutates anything: the hub
+# tick (skill §5) is the operator that acts on the lines it emits (still
+# applying its own crash-loop breaker before restarting), and `bin/ops up` runs
+# the needs-start/needs-kick remedies itself. Session TITLE is
+# "<persona> (<name>)"; heartbeat is state/<name>/last_tick (epoch seconds).
 #
 # Every anomaly line is followed by an indented "→" line carrying the EXACT
 # command that fixes it, with the loop's registry interval already inside the
@@ -220,16 +401,70 @@ cmd_status() {
 # never the invisible state. A `dynamic` loop is reported with NO liveness
 # verdict at all: a self-pacing loop and a dead one produce the same stale
 # heartbeat, and this says so out loud instead of guessing.
-cmd_health() {
-  local now anomalies=0 overrides=0 loops=0
-  local title name secs interval dir skill model thresh st last age t
+#
+# One record per thing the sweep found, tab-separated:
+#
+#     <kind>\t<title>\t<message>\t<remedy>
+#
+# and one final `count` record carrying the number of autostart loops, and (in
+# its `<title>` and `<message>` positions) how many of them the tick-rate check
+# could judge — `count\t<loops>\t<rated>\t`. The REMEDY is a value rather than
+# a line of output so that `bin/ops up` can execute exactly the string
+# `bin/ops health` prints — the same bytes, produced once — instead of keeping
+# a second copy of the launch logic that drifts from the printed one.
+#
+# Kinds: needs-attn, off-registry, needs-start, needs-kick, tick-missed,
+# tick-rate, tick-unread. A record with an empty remedy has none to give.
+#
+# TWO CALLERS, TWO QUESTIONS. `bin/ops health` asks "is anything wrong that
+# somebody should act on"; `up_loops` asks "which loops are not running".
+# Those come apart once a fresh heartbeat may veto a `needs-start` (see the
+# fallback branch below). For `health` the veto is the whole point: agent-deck's
+# Status column can be wrong, and a loop whose engine wrote `last_tick` seconds
+# ago is not a loop to restart. For `up_loops` the veto would be a silent no-op
+# — right after a stop every heartbeat is fresh, because the loops were ticking
+# a minute ago, so an `up` that trusted them would start nothing and say "all
+# autostart loops already alive and fresh" over a dead estate. `--for-start`
+# turns the veto off, and it is the only difference between the two reads:
+# every remedy string is still produced here, once, by this function.
+#
+# THE HEARTBEAT HAS AN UPPER BOUND AND A PER-INTERVAL FLOOR. The staleness
+# check asks one question — is the gap since the last tick under
+# 2*interval+120s — and many ticks an hour read as perfect freshness by it,
+# while a loop that fires on time and does no work reads as healthy until it is
+# two whole intervals late. Two more records, both REPORT-ONLY and neither
+# acted on by `up_loops`:
+#
+#   tick-rate    the loop ticked MORE often in the last hour than its cadence
+#                can explain — the accumulated-schedule shape. Needs a counter,
+#                because last_tick is overwritten; see `tick_rate_hour`.
+#   tick-missed  the heartbeat did not advance within one interval and a half,
+#                which is what a tick that narrated without ever invoking its
+#                engine looks like from here. It is ALSO what a legitimately
+#                long pass looks like, and the record says so: the remedy reads
+#                the session's own output rather than restarting anything.
+#
+# Only one liveness record per loop: `needs-kick` (the graver claim) supersedes
+# `tick-missed`, so a dead loop is reported once and not twice.
+#
+# BOTH OF THOSE LIVE IN THE ALIVE BRANCH, WHICH IS WHERE THE VETO MEETS THEM. A
+# loop agent-deck calls stopped whose heartbeat is fresh is vetoed and
+# `continue`s before either check — so it is counted in `loops` and not in
+# `rated`, and the `ok` line reports it as UNJUDGED on rate rather than clean.
+# That is the honest reading: the sweep never established that loop is really
+# ticking, only that agent-deck and `last_tick` disagree about it.
+health_scan() {
+  local now loops=0 rated=0 for_start=no
+  local title name secs interval dir skill model recovery thresh st last age t
   local pace_file pace pace_secs kick_interval basis
+  local basis_secs miss_thresh rate rate_cap loop_arg tick_last tick_age
+  [ "${1:-}" = "--for-start" ] && for_start=yes
   now=$(date +%s)
   # ONE structured read for the whole sweep — `ls --json` carries the same
   # Status a per-session `show` prints, with untruncated titles, so we index by
   # title instead of spawning a show per autostart loop.
   local deck_json
-  deck_json="$(agent-deck ls --json 2>/dev/null || echo '[]')"
+  deck_json="$(agent-deck -p "$DECK_PROFILE" ls --json 2>/dev/null || echo '[]')"
   declare -A DECK_STATUS
   # Program from the heredoc, deck JSON via a /dev/fd file arg — piping the JSON
   # into `python3 -` would collide with the heredoc, which is python's stdin.
@@ -254,49 +489,57 @@ for s in (data if isinstance(data, list) else []):
     print(t.replace("\t", " ").replace("\n", " ") + "\t" + st.replace("\t", " "))
 PY
 )
-  while IFS=$'\t' read -r title name secs interval dir skill model; do
+  while IFS=$'\x1f' read -r title name secs interval dir skill recovery model; do
     [ -n "$name" ] || continue
     loops=$((loops + 1))
     if [ "$secs" -le 0 ]; then
-      echo "needs-attn   $title — unparseable interval '${interval}' in loops.toml"
-      anomalies=$((anomalies + 1)); continue
+      printf 'needs-attn\t%s\t%s\t%s\n' "$title" \
+        "$title — unparseable interval '${interval}' in loops.toml" ""
+      continue
     fi
     # The interval this loop is re-armed with, and the basis its heartbeat is
     # judged against. Both come from the registry unless state/<name>/pace-
     # override replaces them — and an override is reported, never assumed.
-    kick_interval="$interval"; basis="$interval"; thresh=$((secs * 2 + 120))
+    kick_interval="$interval"; basis="$interval"; basis_secs="$secs"
+    thresh=$((secs * 2 + 120))
     pace_file="$REPO/state/$name/pace-override"
     pace=""
     if [ -f "$pace_file" ]; then
       pace="$(tr -d '[:space:]' < "$pace_file" 2>/dev/null || true)"
     fi
     if [ -n "$pace" ]; then
-      overrides=$((overrides + 1))
       last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
       age=$((now - last))
       if [ "$pace" = "dynamic" ]; then
         # Self-pacing by instruction. There is no expected interval, so there
-        # is no threshold — and a heartbeat age is a fact, not a verdict.
-        echo "off-registry $title — self-paced by override (state/$name/pace-override = dynamic); registry says ${interval}. Deliberate, so no kick and NO liveness verdict: last tick ${age}s ago, and a self-pacing loop is indistinguishable from a dead one."
-        echo "             → restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  agent-deck session send \"$title\" \"/loop $interval /$skill\""
+        # is no threshold — and a heartbeat age is a fact, not a verdict. The
+        # tick-rate and tick-missed records are both derived from an expected
+        # cadence, so they are off here too, for the same reason.
+        printf 'off-registry\t%s\t%s\t%s\n' "$title" \
+          "$title — self-paced by override (state/$name/pace-override = dynamic); registry says ${interval}. Deliberate, so no kick and NO liveness verdict: last tick ${age}s ago, and a self-pacing loop is indistinguishable from a dead one." \
+          "restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  $(rearm_command "$recovery" "$title" "/loop $interval /$skill")"
         continue
       fi
       pace_secs=$(interval_secs "$pace")
       if [ "$pace_secs" -le 0 ]; then
-        echo "needs-attn   $title — unreadable pace override '${pace}' in state/$name/pace-override (want a /loop interval like '60m', or 'dynamic')"
-        anomalies=$((anomalies + 1)); continue
+        printf 'needs-attn\t%s\t%s\t%s\n' "$title" \
+          "$title — unreadable pace override '${pace}' in state/$name/pace-override (want a /loop interval like '60m', or 'dynamic')" ""
+        continue
       fi
-      kick_interval="$pace"; basis="$pace"; thresh=$((pace_secs * 2 + 120))
-      echo "off-registry $title — paced at ${pace} by override (state/$name/pace-override); registry says ${interval}. Deliberate, so no kick: freshness is judged against ${thresh}s = 2*${pace}+120, and last tick was ${age}s ago."
-      echo "             → restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  agent-deck session send \"$title\" \"/loop $interval /$skill\""
+      kick_interval="$pace"; basis="$pace"; basis_secs="$pace_secs"
+      thresh=$((pace_secs * 2 + 120))
+      printf 'off-registry\t%s\t%s\t%s\n' "$title" \
+        "$title — paced at ${pace} by override (state/$name/pace-override); registry says ${interval}. Deliberate, so no kick: freshness is judged against ${thresh}s = 2*${pace}+120, and last tick was ${age}s ago." \
+        "restore the registry cadence with: rm $REPO/state/$name/pace-override  &&  $(rearm_command "$recovery" "$title" "/loop $interval /$skill")"
     fi
     # Absent from the ls --json read = no such session (never launched, or
     # removed) — that's a `launch`, not a `start`, so keep it distinct from a
     # registered-but-stopped session below.
     if [ -z "${DECK_STATUS[$title]+x}" ]; then
-      echo "needs-start  $title — unregistered (no agent-deck session) → launch"
-      echo "             → agent-deck launch $REPO/$dir -c claude -t \"$title\" -g \"$DECK_GROUP\"${model:+ -model $model} -m \"/loop $kick_interval /$skill\""
-      anomalies=$((anomalies + 1)); continue
+      printf 'needs-start\t%s\t%s\t%s\n' "$title" \
+        "$title — unregistered (no agent-deck session) → launch" \
+        "agent-deck -p $DECK_PROFILE launch $REPO/$dir -cmd \"$CLAUDE_CMD\" -t \"$title\" -g \"$DECK_GROUP\"${model:+ -model $model} -m \"/loop $kick_interval /$skill\""
+      continue
     fi
     st="${DECK_STATUS[$title]}"
     case "$st" in
@@ -305,26 +548,135 @@ PY
         # (2x interval + 120s) ticks are an anomaly — a fresh one is left alone.
         last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
         age=$((now - last))
+        loop_arg="/loop $kick_interval /$skill"
+        # One interval and a half, plus the same two minutes the staleness
+        # threshold already allows: a loop on cadence is never more than one
+        # interval plus its own turn behind, and half an interval is the room
+        # that turn gets. A pass that outruns it is reported as what it is
+        # rather than as a dead loop, which is why the record carries no
+        # restart.
+        miss_thresh=$((basis_secs * 3 / 2 + 120))
         if [ "$age" -gt "$thresh" ]; then
-          echo "needs-kick   $title — alive but stale (last tick ${age}s ago > ${thresh}s = 2*${basis}+120). A dead wakeup chain and a loop running off its cadence look identical from here."
-          echo "             → agent-deck session send \"$title\" \"/loop $kick_interval /$skill\""
-          anomalies=$((anomalies + 1))
+          printf 'needs-kick\t%s\t%s\t%s\n' "$title" \
+            "$title — alive but stale (last tick ${age}s ago > ${thresh}s = 2*${basis}+120). A dead wakeup chain and a loop running off its cadence look identical from here." \
+            "$(rearm_command "$recovery" "$title" "$loop_arg")"
+        elif tick_missed_from_log "$name" \
+             && tick_last=$(tick_log_last "$name") && [ "$tick_last" -lt 0 ]; then
+          # This loop's heartbeat is written by verbs that are not
+          # ticks, so without its tick log there is no liveness floor at all —
+          # and a fresh `last_tick` must not stand in for one.
+          printf 'tick-unread\t%s\t%s\t%s\n' "$title" \
+            "$title — tick-missed could not be checked: state/$name/tick-log is missing, unreadable or holds no tick (warrant: failed). This loop's last_tick is written by verbs that are not ticks, so a fresh one (${age}s ago) proves nothing here. Not a pass." \
+            "agent-deck -p $DECK_PROFILE session output \"$title\""
+        elif tick_missed_from_log "$name" \
+             && tick_age=$((now - tick_last)) && [ "$tick_age" -gt "$miss_thresh" ]; then
+          printf 'tick-missed\t%s\t%s\t%s\n' "$title" \
+            "$title — alive, and the tick log (state/$name/tick-log, written only by a real tick) has not advanced in ${tick_age}s (> ${miss_thresh}s = 1.5*${basis}+120), whatever last_tick says (${age}s ago). Either a tick completed without ever invoking this loop's engine, or a pass is still running long. Read the session before acting; never restart on this line alone." \
+            "agent-deck -p $DECK_PROFILE session output \"$title\""
+        elif [ "$last" -gt 0 ] && [ "$age" -gt "$miss_thresh" ]; then
+          # The session is alive and not yet stale, and its heartbeat still did
+          # not advance inside one interval — which is exactly what a completed
+          # tick that never invoked the loop's engine looks like from outside
+          # it. It is also what a pass longer than the margin looks like, and
+          # nothing on disk tells the two apart, so this REPORTS and the remedy
+          # reads the session rather than restarting it.
+          printf 'tick-missed\t%s\t%s\t%s\n' "$title" \
+            "$title — alive, not yet stale, and the heartbeat has not advanced in ${age}s (> ${miss_thresh}s = 1.5*${basis}+120). Either a tick completed without ever invoking this loop's engine, or a pass is still running long. Read the session before acting; never restart on this line alone." \
+            "agent-deck -p $DECK_PROFILE session output \"$title\""
+        fi
+        # The upper bound. Independent of the age checks above: a loop can be
+        # perfectly fresh and firing six times too often, and that is the
+        # accumulated-schedule shape this exists to name.
+        rate=$(tick_rate_hour "$name")
+        if [ "$rate" -ge 0 ]; then
+          rated=$((rated + 1))
+          rate_cap=$(tick_rate_allowed "$basis_secs")
+          if [ "$rate" -gt "$rate_cap" ]; then
+            printf 'tick-rate\t%s\t%s\t%s\n' "$title" \
+              "$title — ticked ${rate} times in the last hour against a ${basis} cadence (ceiling ${rate_cap}; state/$name/tick-log). Every re-arm of a live session leaves its old /loop schedule armed, and /clear does not cancel one — only a stop+start does. This remedy is a stop+start whatever the loop, because a kick here would add the very thing being reported." \
+              "$(stop_start_command "$title" "$loop_arg")"
+          fi
         fi
         ;;
       *)
         # Registered but stopped/errored (or no Status line): the /loop wakeup
         # died with the process — revive with `session start` + kick.
-        echo "needs-start  $title — session ${st:-unknown} (stopped/errored) → start + kick"
-        echo "             → agent-deck session start \"$title\"  &&  sleep 10  &&  agent-deck session send \"$title\" \"/loop $kick_interval /$skill\""
-        anomalies=$((anomalies + 1))
+        #
+        # UNLESS THE HEARTBEAT SAYS OTHERWISE. agent-deck's status string is
+        # evidence about the registry that is supposed to be watching the loop;
+        # the loop's own heartbeat, written by its engine on every tick, is
+        # evidence about the loop. Two signals disagreeing is not a dead loop —
+        # it is a bad status read. So the SAME freshness test the running/
+        # waiting branch applies is applied here, against the same `$thresh`
+        # (which already carries the pace override). A fresh heartbeat
+        # suppresses the anomaly outright; a stale or absent one (an unread file
+        # reads 0, which is stale by any threshold) emits `needs-start` exactly
+        # as before. The suppression is bounded by that same threshold, so a
+        # session that really died a moment after its last tick is reported
+        # within one interval — the latency the alive-but-stale branch has
+        # always had.
+        last=$(cat "$REPO/state/$name/last_tick" 2>/dev/null || echo 0)
+        age=$((now - last))
+        if [ "$for_start" != "yes" ] && [ "$age" -le "$thresh" ]; then
+          continue
+        fi
+        printf 'needs-start\t%s\t%s\t%s\n' "$title" \
+          "$title — session ${st:-unknown} (stopped/errored) → start + kick" \
+          "agent-deck -p $DECK_PROFILE session start \"$title\"  &&  sleep 10  &&  agent-deck -p $DECK_PROFILE session send \"$title\" \"/loop $kick_interval /$skill\""
         ;;
     esac
   done < <(registry_autostart)
+  # The second field is how many of those loops carried a readable tick log.
+  # It rides here rather than being recomputed by the caller, so the "ok" line
+  # can say what the rate check actually covered instead of letting silence
+  # stand in for a verdict.
+  printf 'count\t%s\t%s\t\n' "$loops" "$rated"
+}
+
+cmd_health() {
+  local kind title message remedy anomalies=0 overrides=0 loops=0 rated=0
+  # `tick-unread`  is neither an anomaly nor a pass: a check that
+  # could not be made. It is held back and printed as its own record when
+  # there are anomalies to sit beside, and folded INTO the ok line when there
+  # are none — so a clean estate still prints exactly one line, and that line
+  # never claims a check it did not make.
+  local unread_lines=() unread_note=""
+  while IFS=$'\t' read -r kind title message remedy; do
+    case "$kind" in
+      count) loops="$title"; rated="$message"; continue ;;
+      off-registry) overrides=$((overrides + 1)) ;;
+      tick-unread)
+        unread_lines+=("$(printf '%-13s%s' "$kind" "$message")${remedy:+
+             → $remedy}")
+        unread_note="${unread_note}; NOT CHECKED: ${message}"
+        continue ;;
+      needs-attn|needs-start|needs-kick|tick-missed|tick-rate)
+        anomalies=$((anomalies + 1)) ;;
+    esac
+    # Every kind pads to the same 13 columns, which is what puts the "→" line
+    # under the text it fixes rather than under the label.
+    printf '%-13s%s\n' "$kind" "$message"
+    [ -n "$remedy" ] && echo "             → $remedy"
+  done < <(health_scan)
+  if [ "$anomalies" -gt 0 ] && [ "${#unread_lines[@]}" -gt 0 ]; then
+    printf '%s\n' "${unread_lines[@]}"
+  fi
   if [ "$anomalies" -eq 0 ]; then
-    if [ "$overrides" -eq 0 ]; then
-      echo "ok  all ${loops} autostart loops healthy (alive + fresh heartbeat)"
+    # What the upper bound actually covered, carried INSIDE the ok line so a
+    # clean estate still prints exactly one (hub SKILL §5 reads it that way). A
+    # loop whose engine writes no state/<name>/tick-log cannot be judged on
+    # rate at all, and an "ok" that did not say so would be an absence claim
+    # nobody made (docs/absence-contract.md).
+    local rate_note=""
+    if [ "${rated:-0}" -lt "${loops:-0}" ]; then
+      rate_note="; tick rate judged for ${rated:-0} of ${loops} (no tick log for the rest — unjudged, not clean)"
+    fi
+    if [ -n "$unread_note" ]; then
+      echo "ok  ${loops} autostart loops alive + fresh heartbeat, but not every check could be made${rate_note}${unread_note}"
+    elif [ "$overrides" -eq 0 ]; then
+      echo "ok  all ${loops} autostart loops healthy (alive + fresh heartbeat)${rate_note}"
     else
-      echo "ok  ${loops} autostart loops healthy; ${overrides} off-registry by override (above) — deliberate, not an anomaly"
+      echo "ok  ${loops} autostart loops healthy; ${overrides} off-registry by override (above) — deliberate, not an anomaly${rate_note}"
     fi
   fi
 }
@@ -419,12 +771,14 @@ cmd_compact() {
     ledger="$REPO/state/ledger.jsonl"
     mkdir -p "$(dirname "$ledger")"
 
-    hub_path=$(agent-deck session show "$HUB_TITLE" --json 2>/dev/null \
+    hub_path=$(agent-deck -p "$DECK_PROFILE" session show "$HUB_TITLE" --json 2>/dev/null \
       | python3 -c "import json,sys; print(json.load(sys.stdin)['path'])") || rc=1
 
-    agent-deck session set "$HUB_TITLE" model "${HUB_MODEL:-claude-sonnet-5}" || rc=1
-    agent-deck session set "$HUB_TITLE" claude-session-id ""  || rc=1
-    agent-deck session stop "$HUB_TITLE" >/dev/null 2>&1 || true  # ok if stopped
+    if [ -n "$HUB_MODEL" ]; then
+      agent-deck -p "$DECK_PROFILE" session set "$HUB_TITLE" model "$HUB_MODEL" || rc=1
+    fi
+    agent-deck -p "$DECK_PROFILE" session set "$HUB_TITLE" claude-session-id ""  || rc=1
+    agent-deck -p "$DECK_PROFILE" session stop "$HUB_TITLE" >/dev/null 2>&1 || true  # ok if stopped
     sleep 3
 
     if [ "$rc" -eq 0 ]; then
@@ -481,7 +835,7 @@ print(json.dumps({'ts': '$ts_iso', 'actor': 'ops', 'kind': 'error',
 }
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # Refuse arguments this dispatcher would otherwise drop on the floor.

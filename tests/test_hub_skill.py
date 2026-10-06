@@ -168,6 +168,147 @@ class IntakeManifest(unittest.TestCase):
         self.assertIn(GUARD, self.manifest.lower())
 
 
+class DeckProfile(unittest.TestCase):
+    """The profile is checked first and threaded on every agent-deck call.
+
+    agent-deck's `-p` is a free selector with no ownership check, and its
+    ambient default is not this installation's profile, so a tick running in
+    the wrong place operates another store's sessions silently. Guarded: the
+    check opens §0, a mismatch (unset included) stops the tick, and no recipe
+    anywhere in the skill calls agent-deck without the flag.
+    """
+
+    def setUp(self):
+        self.text = read(SKILL)
+        self.load = sections(self.text)["0. Load context"]
+
+    def test_the_check_opens_load_context(self):
+        first = flat(self.load).split("- ", 2)[1]
+        self.assertRegex(first, r"(?i)deck profile .* FIRST, before any agent-deck call")
+
+    def test_the_profile_resolves_from_the_registry_with_a_neutral_default(self):
+        self.assertIn("deck_profile", self.load)
+        self.assertIn('or "ops"', self.load)
+        self.assertIn("AGENTDECK_PROFILE", self.load)
+
+    def test_a_mismatch_stops_the_tick_unset_included(self):
+        self.assertRegex(flat(self.load),
+                         r"(?i)a mismatch — unset included — STOPS the tick")
+
+    def test_every_recipe_threads_the_flag(self):
+        bare = [m.group(0) for m in re.finditer(
+            r"`agent-deck (?:launch|status|ls|attach|session)\b[^`]*`", self.text)]
+        self.assertEqual(bare, [], "a bare agent-deck call in a recipe is the bug")
+        for block in re.findall(r"```bash\n(.*?)```", self.text, flags=re.S):
+            for line in block.splitlines():
+                if line.lstrip().startswith("agent-deck "):
+                    self.assertIn("-p ", line)
+
+
+class DispatchDelivery(unittest.TestCase):
+    """A launch is not a delivery, and a relay counts only real items."""
+
+    def setUp(self):
+        self.body = flat(sections(read(SKILL))[
+            "3. Handle each message — full trust, act immediately"])
+
+    def test_a_fresh_launch_is_read_back(self):
+        self.assertRegex(self.body, r"(?i)\*\*Confirm the task actually landed\.\*\* A launch is not a delivery")
+        self.assertIn("session output \"<title>\" -pane", self.body)
+        self.assertRegex(self.body, r"(?i)first-run .*trust")
+
+    def test_a_residual_item_needs_an_actor_and_an_artifact(self):
+        self.assertRegex(self.body, r"(?i)residual item has an actor AND an artifact")
+        self.assertRegex(self.body, r"(?i)Both, or it is not one")
+        self.assertRegex(self.body, r"(?i)would become a task if nobody objected")
+        self.assertIn("no residual items", self.body)
+
+
+class CursorOnlyMovesForward(unittest.TestCase):
+    def test_a_backward_write_is_refused_and_recorded(self):
+        body = flat(sections(read(SKILL))[
+            "3. Handle each message — full trust, act immediately"])
+        self.assertRegex(body, r"(?i)cursor may stand still; it never moves backward")
+        self.assertRegex(body, r"(?i)refused write is not silent")
+        self.assertRegex(body, r"(?i)advance it once, on the last of them")
+
+
+class LiveLoopRecovery(unittest.TestCase):
+    """A kick into a live session arms a second schedule; it never replaces one."""
+
+    def test_a_repeat_kick_becomes_a_stop_and_start(self):
+        body = flat(sections(read(SKILL))["5. Health pass"])
+        self.assertRegex(body, r"(?i)arms a second schedule")
+        self.assertRegex(body, r"(?i)`/clear` does not cancel")
+        self.assertRegex(body, r"(?i)stop, a start, and then the kick")
+
+
+class HealthRecordKinds(unittest.TestCase):
+    """Every record kind `bin/ops health` prints has a line in §5 saying what
+    the tick does with it — an unexplained kind is one the tick will guess at."""
+
+    def setUp(self):
+        self.body = flat(sections(read(SKILL))["5. Health pass"])
+        self.ops = read(os.path.join(REPO, "bin", "ops"))
+
+    def test_every_printed_kind_is_covered(self):
+        kinds = re.search(r"# Kinds: ([^.]*)\.", self.ops).group(1)
+        names = [k.strip(" #") for k in flat(kinds.replace("#", " ")).split(",")]
+        self.assertIn("tick-rate", names)
+        for kind in names:
+            if kind == "needs-attn":
+                continue  # agent-deck's own status line, not a loop record
+            with self.subTest(kind=kind):
+                self.assertIn("`%s " % kind, self.body)
+
+    def test_tick_missed_is_a_read_not_a_restart(self):
+        self.assertRegex(self.body, r"(?i)`tick-missed …`.*read, do not act")
+        self.assertRegex(self.body, r"(?i)never restart a loop on this line alone")
+
+    def test_tick_rate_is_never_answered_with_a_kick(self):
+        self.assertRegex(self.body, r"(?i)do not answer this line with a kick")
+
+    def test_a_declared_stop_start_loop_runs_the_printed_command(self):
+        self.assertIn('recovery = "stop-start"', self.body)
+        self.assertRegex(self.body, r"(?i)run the printed command, never the bullet")
+
+    def test_an_override_is_left_alone(self):
+        self.assertRegex(self.body, r"(?i)`off-registry …`.*not yours to fix")
+
+
+class PaneSweep(unittest.TestCase):
+    def setUp(self):
+        text = read(SKILL)
+        self.sweep = flat(sub_section(text, "The pane sweep"))
+        self.prompt = flat(sub_section(text, "Text at the prompt"))
+
+    def test_the_report_is_read_once_per_health_pass(self):
+        self.assertIn("bin/doorbell panes --report", self.sweep)
+        self.assertRegex(self.sweep, r"(?i)once per health pass")
+
+    def test_a_flag_is_a_signal_never_a_trigger(self):
+        self.assertRegex(self.sweep, r"(?i)signal, never a trigger")
+        self.assertRegex(self.sweep, r"(?i)never kick or restart a session because the sweep")
+
+    def test_an_unspeakable_report_is_not_an_empty_one(self):
+        self.assertRegex(self.sweep, r"(?i)exit 2 means the report could not speak")
+        self.assertRegex(self.sweep, r"(?i)not evidence that nothing is stalled")
+
+    def test_prompt_box_text_is_never_submitted_without_a_record(self):
+        self.assertRegex(self.prompt, r"(?i)\*\*Never submit it\*\*")
+        self.assertRegex(self.prompt, r"(?i)THIS session actually sent those exact words")
+        self.assertRegex(self.prompt, r"(?i)composed, never adopted")
+
+
+class FailedRead(unittest.TestCase):
+    def test_a_failed_read_never_advances_the_cursor(self):
+        body = flat(sub_section(read(SKILL), "A failed READ"))
+        self.assertRegex(body, r"(?i)never advance the cursor file on a read")
+        self.assertIn("bin/doorbell read --inbox", body)
+        for warrant in ("`observed`", "`partial`", "`failed`"):
+            self.assertIn(warrant, body)
+        self.assertRegex(body, r"(?i)three consecutive failed reads")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

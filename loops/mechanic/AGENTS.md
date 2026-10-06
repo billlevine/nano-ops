@@ -94,3 +94,11 @@ uses the persona compiler, add this loop to `personas/config.toml`, place the
 generated marker pair here, and run `bin/persona-compile --install`. A persona
 may shape voice and judgment emphasis; it never adds authority or changes a
 required action.
+
+- `pass_done` derives finding totals from recorded history. Use `mechanic.py
+  tally` to read them; do not supply hand-counted totals. An aborted pass uses
+  `mechanic.py pass failed --reason "..."` so the shared run is terminal.
+- A proposal declares action, decision or clarification. A decision supplies
+  its question, alternatives and consequences, recommendation and defer
+  consequence. Pin `recurrence_of` to an existing task for new evidence of
+  the same condition, rather than minting a new identity from changed prose.

@@ -21,10 +21,17 @@ path; the fixtures invent neutral ones, exactly as a stranger's install would.
 """
 from __future__ import annotations
 
+import contextlib
+import gzip
+import http.client
 import importlib.util
+import io
 import json
 import os
+import sqlite3
+import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
@@ -35,6 +42,13 @@ _loader = SourceFileLoader("_dashboard", str(_HERE / "dashboard"))
 _spec = importlib.util.spec_from_loader("_dashboard", _loader)
 dash = importlib.util.module_from_spec(_spec)
 _loader.exec_module(dash)
+
+# the drill-down moved OUT of the periodic snapshot and INTO
+# `GET /estate-detail`, so the P-16 guarantee is tested where it now lives.
+_srv_loader = SourceFileLoader("_dashboard_server", str(_HERE / "dashboard-server"))
+_srv_spec = importlib.util.spec_from_loader("_dashboard_server", _srv_loader)
+srv = importlib.util.module_from_spec(_srv_spec)
+_srv_loader.exec_module(srv)
 
 NOW = datetime.now(timezone.utc)
 
@@ -509,7 +523,7 @@ FIELDS = ("available", "input", "output", "cache_creation", "cache_read",
           "cost_by_loop", "top_sessions")
 
 
-class EphemeralQueueTest(unittest.TestCase):
+class DispatchSessionsTest(unittest.TestCase):
     def setUp(self):
         self.old_state = dash.STATE
         self.tmp = tempfile.TemporaryDirectory()
@@ -529,33 +543,139 @@ class EphemeralQueueTest(unittest.TestCase):
     def test_tracked_session_joins_dispatch_context(self):
         (dash.STATE / "hub" / "dispatches.json").write_text(json.dumps({
             "ephemeral - dashboard-build": {
-                "kind": "build", "ref": "acme/api#181", "task_id": "t-181"
+                "kind": "build", "ref": "widget#181", "task_id": "t-181"
             }
         }))
-        item = dash.build_ephemeral(self.now, [self.session])[0]
+        item = dash.build_dispatch_sessions(self.now, [self.session])[0]
         self.assertEqual((item["kind"], item["ref"], item["task_id"]),
-                         ("build", "acme/api#181", "t-181"))
-        card = dash.render_ephemeral([item])
-        self.assertIn('class="es-ref">acme/api#181</div>', card)
+                         ("build", "widget#181", "t-181"))
+        card = dash.render_dispatch_sessions([item])
+        self.assertIn('class="es-ref">widget#181</div>', card)
         self.assertIn('class="es-kind">build</span>', card)
+        self.assertIn('class="es-kind">ephemeral</span>', card)
         self.assertNotIn("href=", card)
 
     def test_untracked_session_keeps_the_original_card_fields(self):
-        item = dash.build_ephemeral(self.now, [self.session])[0]
+        item = dash.build_dispatch_sessions(self.now, [self.session])[0]
         self.assertNotIn("ref", item)
         self.assertNotIn("kind", item)
-        card = dash.render_ephemeral([item])
+        card = dash.render_dispatch_sessions([item])
         self.assertNotIn('class="es-ref"', card)
-        self.assertNotIn('class="es-kind"', card)
+        self.assertIn('class="es-kind">ephemeral</span>', card)
         self.assertIn("dashboard-build", card)
         self.assertIn("5m alive", card)
+
+    def test_stopped_history_is_not_in_flight_but_open_dispatch_is_visible(self):
+        stopped = dict(self.session, status="stopped")
+        self.assertEqual(dash.build_dispatch_sessions(self.now, [stopped], {}), [])
+        for status in ("open", "resolved"):
+            with self.subTest(status=status):
+                rows = dash.build_dispatch_sessions(self.now, [stopped], {
+                    stopped["title"]: {"status": status}})
+                self.assertEqual(len(rows), int(status == "open"))
+                if rows:
+                    card = dash.render_dispatch_sessions(rows)
+                    self.assertIn("stopped", card)
+                    self.assertNotIn("alive", card)
+
+    def test_failed_tracker_cannot_hide_stopped_work(self):
+        stopped = dict(self.session, status="stopped")
+        self.assertEqual(len(dash.build_dispatch_sessions(
+            self.now, [stopped], {}, dispatches_known=False)), 1)
+        # The implicit producer read must preserve the same warrant.
+        self.assertEqual(len(dash.build_dispatch_sessions(self.now, [stopped])), 1)
+
+    def test_error_and_unknown_sessions_remain_visible(self):
+        for status in ("error", "unknown", "running", "waiting", "idle"):
+            with self.subTest(status=status):
+                self.assertEqual(len(dash.build_dispatch_sessions(
+                    self.now, [dict(self.session, status=status)], {})), 1)
+
+    def test_resolved_persistent_ask_is_not_current_work(self):
+        title = "the catalog steward"
+        for sessions in ([], [dict(self.session, title=title)]):
+            self.assertEqual(dash.build_dispatch_sessions(self.now, sessions, {
+                title: {"kind": "persistent-ask", "status": "resolved"}}), [])
 
     def test_dispatch_metadata_is_escaped(self):
         item = {"slug": "safe", "status": "waiting", "age": 1,
                 "path": None, "ref": "<ref>", "kind": "x&y"}
-        card = dash.render_ephemeral([item])
+        card = dash.render_dispatch_sessions([item])
         self.assertIn("&lt;ref&gt;", card)
         self.assertIn("x&amp;y", card)
+
+    def test_live_persistent_ask_joins_the_same_deck_snapshot(self):
+        title = "the catalog steward (catalog-meta)"
+        persistent = {
+            "title": title, "group": dash.HUB_GROUP, "status": "waiting",
+            "created_at": "2026-07-31T11:50:00+00:00",
+            "path": "/tmp/catalog-meta", "id": "session-2",
+        }
+        dispatches = {title: {
+            "kind": "persistent-ask", "task_id": "t-667",
+            "worktree": "/tmp/catalog-meta",
+        }}
+        item = next(i for i in dash.build_dispatch_sessions(
+            self.now, [self.session, persistent], dispatches)
+                    if i["session_type"] == "persistent-ask")
+        self.assertEqual((item["slug"], item["status"], item["id"]),
+                         (title, "waiting", "session-2"))
+        card = dash.render_dispatch_sessions([item])
+        self.assertIn(title, card)
+        self.assertIn('class="es-kind">persistent-ask</span>', card)
+
+    def test_missing_persistent_ask_renders_the_mismatch(self):
+        title = "the missing steward"
+        items = dash.build_dispatch_sessions(self.now, [], {title: {
+            "kind": "persistent-ask", "task_id": "t-668",
+            "worktree": "/tmp/missing",
+        }})
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["status"], "session not found")
+        card = dash.render_dispatch_sessions(items)
+        self.assertIn(title, card)
+        self.assertIn("session not found", card)
+        self.assertIn("persistent-ask", card)
+
+
+class LoopIntervalTest(unittest.TestCase):
+    def setUp(self):
+        self.old_state = dash.STATE
+        self.tmp = tempfile.TemporaryDirectory()
+        dash.STATE = Path(self.tmp.name)
+        self.registry = {"loops": {"mechanic": {
+            "persona": "the mechanic", "interval": "20m",
+        }}}
+
+    def tearDown(self):
+        dash.STATE = self.old_state
+        self.tmp.cleanup()
+
+    def loop(self):
+        return next(row for row in dash.build_loops(self.registry, 0, {})
+                    if row["name"] == "mechanic")
+
+    def override(self, value: str):
+        path = dash.STATE / "mechanic" / "pace-override"
+        path.parent.mkdir(parents=True)
+        path.write_text(value, encoding="utf-8")
+
+    def test_override_replaces_registry_interval(self):
+        self.override(" 120m \n")
+        row = self.loop()
+        self.assertEqual(row["interval"], "120m")
+        self.assertEqual(row["interval_seconds"], 7200)
+
+    def test_missing_override_falls_back_to_registry(self):
+        row = self.loop()
+        self.assertEqual(row["interval"], "20m")
+        self.assertEqual(row["interval_seconds"], 1200)
+
+    def test_dynamic_override_has_no_fixed_interval(self):
+        self.override(" dynamic\n")
+        row = self.loop()
+        self.assertEqual(row["interval"], "dynamic (override)")
+        self.assertIsNone(row["interval_seconds"])
 
 
 def line(ts: datetime, sid: str, loop_dir: str, model: str,
@@ -774,7 +894,12 @@ class BriefHistoryTest(unittest.TestCase):
         self.assertEqual(brief["body"], "# Brief 7\n")
 
     def test_no_reports_has_empty_history(self):
-        self.assertEqual(dash.build_brief(), {"available": False, "reports": []})
+        brief = dash.build_brief()
+        self.assertEqual((brief["available"], brief["reports"]), (False, []))
+        # and it says WHY there is no history, rather than leaving the
+        # panel to guess that the briefer simply had a quiet morning.
+        self.assertEqual(brief["reading"]["outcome"], "no_state")
+        self.assertFalse(brief["reading"]["empty_is_evidence"])
 
 
 class BriefDeliveryTest(unittest.TestCase):
@@ -885,6 +1010,396 @@ class ShellExtensionTest(unittest.TestCase):
         self.assertIn("new CustomEvent('ops-dashboard-data',{detail:d})", page)
 
 
+class ShellRegenerationTest(unittest.TestCase):
+    """the HTML shells are regenerator output, not a manual step."""
+    SNAP = {"estate": "estate", "operator": "operator"}
+    PAGES = ("index.html", "estate.html", "dashboard-v2.html", "stewards.html")
+
+    def setUp(self):
+        self.old_state = dash.STATE
+        self.tmp = tempfile.TemporaryDirectory()
+        dash.STATE = Path(self.tmp.name) / "state"   # deliberately absent
+
+    def tearDown(self):
+        dash.STATE = self.old_state
+        self.tmp.cleanup()
+
+    def shells(self):
+        return tuple(dash.STATE / name for name in self.PAGES)
+
+    def test_every_shell_is_written_from_one_snapshot(self):
+        written = dash.write_shells(self.SNAP)
+        index, estate, v2, stewards = self.shells()
+        self.assertEqual([p for p, _ in written], [index, estate, v2, stewards, dash.STATE / "stewards.json"])
+        for path, size in written:
+            self.assertTrue(path.exists(), path)
+            self.assertEqual(len(path.read_bytes()), size)
+            if path.suffix == ".html":
+                self.assertTrue(path.read_text(encoding="utf-8").startswith("<!doctype html>"))
+        self.assertIn("dashboard.json", index.read_text(encoding="utf-8"))
+        self.assertIn("estate operations", estate.read_text(encoding="utf-8"))
+
+    def test_every_shell_opens_with_the_same_page_nav(self):
+        """One nav bar on every served page, the same links in the same order,
+        with only the page's own link marked current (the operator, 2026-09-23)."""
+        import dashboard_nav
+        dash.write_shells(self.SNAP)
+        for (key, href, _), path in zip(
+                (dashboard_nav.PAGES[i] for i in (0, 2, 1, 3)), self.shells()):
+            page = path.read_text(encoding="utf-8")
+            self.assertEqual(page.count('class="page-nav"'), 1, path.name)
+            self.assertIn(dashboard_nav.render(key), page, path.name)
+            self.assertEqual(page.count('aria-current="page"'), 1, path.name)
+            self.assertEqual(page.count('id="themebtn"'), 1, path.name)
+        served = srv._allow()
+        for _, href, _ in dashboard_nav.PAGES:
+            self.assertIn(href, served, f"nav links {href}, which is not served")
+
+    def test_no_served_shell_is_left_off_the_cycle(self):
+        """The whole point: a page bin/dashboard-index knows about and the
+        refresh cycle does not is a page that goes stale silently. There is one
+        renderer list now, and dashboard-index calls into it."""
+        written = {p.name for p, _ in dash.write_shells(self.SNAP)}
+        self.assertEqual(written, set(self.PAGES) | {"stewards.json"})
+        src = (_HERE / "dashboard-index").read_text(encoding="utf-8")
+        self.assertIn("dashboard.write_shells", src)
+        for name in self.PAGES:
+            self.assertNotIn(f'"state" / "{name}"', src,
+                             f"{name} is written by a second code path")
+
+    def test_a_rendering_change_reaches_the_next_cycle(self):
+        """The defect itself: new rendering code, same served page."""
+        pages = self.shells()
+        dash.write_shells(self.SNAP)
+        before = tuple(p.read_bytes() for p in pages)
+        old_css = dash.CSS
+        try:
+            dash.CSS = old_css + "\n.t149-probe{color:red}"
+            dash.write_shells(self.SNAP)
+        finally:
+            dash.CSS = old_css
+        for path, prior in zip(pages, before):
+            self.assertNotEqual(path.read_bytes(), prior, path)
+            self.assertIn(".t149-probe{color:red}", path.read_text(encoding="utf-8"))
+
+    def test_shells_are_replaced_atomically(self):
+        """A reader must never catch a half-written page off the server."""
+        dash.write_shells(self.SNAP)
+        leftovers = [p.name for p in dash.STATE.iterdir() if ".tmp." in p.name]
+        self.assertEqual(leftovers, [])
+
+    def test_the_json_cycle_writes_every_served_file(self):
+        """`bin/dashboard --json` is exactly what dashboard-refresh runs."""
+        real_snapshot, real_payload, argv = (dash.build_snapshot,
+                                             dash.build_payload, sys.argv)
+        dash.build_snapshot = lambda: dict(self.SNAP)
+        dash.build_payload = lambda s: {**s, "tier": 1}
+        sys.argv = ["dashboard", "--json"]
+        dash.STATE.mkdir(parents=True, exist_ok=True)
+        try:
+            self.assertEqual(dash.main(), 0)
+        finally:
+            dash.build_snapshot, dash.build_payload = real_snapshot, real_payload
+            sys.argv = argv
+        for name in ("dashboard.json",) + self.PAGES:
+            self.assertTrue((dash.STATE / name).exists(), name)
+        # The fragment stays off the token-free path.
+        self.assertFalse((dash.STATE / "dashboard.body.html").exists())
+
+
+class DashboardTransportTest(unittest.TestCase):
+    """The periodic snapshot is precompressed and conditionally served."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name)
+        self.saved_dash_state = dash.STATE
+        self.saved_server_state = srv.STATE
+        dash.STATE = self.state
+        srv.STATE = str(self.state)
+        self.payload = {"generated_epoch": 123, "message": "compress me " * 100}
+        dash.write_dashboard_json(self.payload)
+        self.httpd = srv.Server(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        dash.STATE = self.saved_dash_state
+        srv.STATE = self.saved_server_state
+        self.tmp.cleanup()
+
+    def request(self, method="GET", headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        conn.request(method, "/dashboard.json", headers=headers or {})
+        response = conn.getresponse()
+        result = response.status, dict(response.getheaders()), response.read()
+        conn.close()
+        return result
+
+    def test_generation_atomically_writes_matching_gzip_and_validators(self):
+        identity = (self.state / "dashboard.json").read_bytes()
+        compressed = (self.state / "dashboard.json.gz").read_bytes()
+        self.assertEqual(gzip.decompress(compressed), identity)
+        self.assertEqual(json.loads(identity), self.payload)
+        self.assertTrue((self.state / "dashboard.json.validators.json").exists())
+        self.assertEqual([], [p for p in self.state.iterdir() if ".tmp." in p.name])
+
+    def test_identity_get_and_matching_conditional_get(self):
+        status, headers, body = self.request()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, (self.state / "dashboard.json").read_bytes())
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+        self.assertEqual(headers["Vary"], "Accept-Encoding")
+        self.assertNotIn("Content-Encoding", headers)
+        status, conditional_headers, body = self.request(
+            headers={"If-None-Match": headers["ETag"]})
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(conditional_headers["ETag"], headers["ETag"])
+
+    def test_gzip_get_and_head_report_selected_representation(self):
+        requested = {"Accept-Encoding": "br, gzip"}
+        status, headers, body = self.request(headers=requested)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Encoding"], "gzip")
+        self.assertEqual(headers["Vary"], "Accept-Encoding")
+        self.assertEqual(gzip.decompress(body),
+                         (self.state / "dashboard.json").read_bytes())
+        status, head_headers, head_body = self.request("HEAD", requested)
+        self.assertEqual(status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertEqual(head_headers["Content-Encoding"], "gzip")
+        self.assertEqual(int(head_headers["Content-Length"]), len(body))
+        status, _, conditional_body = self.request(
+            "HEAD", {**requested, "If-None-Match": headers["ETag"]})
+        self.assertEqual(status, 304)
+        self.assertEqual(conditional_body, b"")
+
+
+class FollowupResolveRouteTest(unittest.TestCase):
+    """POST /followup-resolve calls the follow-up store's own resolution
+    operation. A store that has none (the standalone predecessor of the
+    estate-backed shim) must be answered with a stated 501, never a 409 that
+    reads as "somebody else moved this row"."""
+
+    PAYLOAD = {"id": "t-5", "expected_status": "open", "note": "handled"}
+
+    def setUp(self):
+        saved = (srv._load_followups, srv.write_token,
+                 srv.proposal_write_authorized)
+        self.addCleanup(lambda: (
+            setattr(srv, "_load_followups", saved[0]),
+            setattr(srv, "write_token", saved[1]),
+            setattr(srv, "proposal_write_authorized", saved[2])))
+        # A follow-up module with no `apply_followup_resolve` at all.
+        srv._load_followups = lambda: type("Legacy", (), {})()
+
+    def test_a_store_without_the_operation_is_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            srv.apply_followup_resolution(dict(self.PAYLOAD))
+
+    def test_the_route_answers_501_not_a_conflict(self):
+        srv.write_token = lambda: "tok"
+        srv.proposal_write_authorized = lambda headers: True
+        httpd = srv.Server(("127.0.0.1", 0), srv.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1])
+        conn.request("POST", "/followup-resolve",
+                     body=json.dumps(self.PAYLOAD),
+                     headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        conn.close()
+        self.assertEqual(response.status, 501)
+        self.assertIn("predates", body["error"])
+
+
+class FollowupResolveEndpointTest(unittest.TestCase):
+    """POST /followup-resolve against the REAL estate-backed `bin/followups`.
+
+    The class above pins the fallback for a store that has no resolution
+    operation; this one pins the route itself, now that the store has one.
+    Same posture as the proposal route and deliberately so: fail-closed auth
+    before the body is read, an in-process call into the operation the CLI
+    itself uses, optimistic concurrency, and a 409 on a stale snapshot.
+
+    The entry point is `bin/followups`' and NOT `bin/estate`'s, which is the
+    one thing about this route that is not obvious. A follow-up sits at
+    `open`, and `open` offers `ready` and `drop` — there is no `done` verb to
+    reach, so a generic status transition would have refused this row.
+    Resolution is the follow-up envelope's own operation.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name)
+        self._saved = (srv.STATE, srv.ACKS, srv.ESTATE_DB)
+        srv.STATE = str(self.state)
+        srv.ACKS = str(self.state / "dashboard-acks.json")
+        srv.ESTATE_DB = str(self.state / "estate.db")
+        followups = srv._load_followups()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(followups.main([
+                "add", "Chase the thing",
+                "--source", "example-loop", "--classification", "action",
+            ]), 0)
+        self.httpd = srv.Server(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        srv.STATE, srv.ACKS, srv.ESTATE_DB = self._saved
+        self.tmp.cleanup()
+
+    def write_token(self, value="s3cret"):
+        secrets = self.state / "secrets"
+        secrets.mkdir(exist_ok=True)
+        (secrets / "dashboard-write-token").write_text(value + "\n",
+                                                       encoding="utf-8")
+
+    def post(self, payload, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["X-Dashboard-Token"] = token
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        conn.request("POST", "/followup-resolve",
+                     body=json.dumps(payload), headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            body = raw.decode()
+        return resp.status, body
+
+    def row(self):
+        conn = sqlite3.connect(srv.ESTATE_DB)
+        conn.row_factory = sqlite3.Row
+        try:
+            return dict(conn.execute(
+                "SELECT * FROM tasks WHERE id='t-1'").fetchone())
+        finally:
+            conn.close()
+
+    def last_event(self):
+        conn = sqlite3.connect(srv.ESTATE_DB)
+        try:
+            return conn.execute("SELECT actor, summary, detail FROM events "
+                                "ORDER BY seq DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def payload(**updates):
+        out = {"id": "t-1", "expected_status": "open",
+               "note": "Chased it; nothing further owed"}
+        out.update(updates)
+        return out
+
+    # ── fail closed ──────────────────────────────────────────────────────
+    def test_no_token_configured_fails_closed_and_changes_nothing(self):
+        status, body = self.post(self.payload())
+        self.assertEqual(status, 503)
+        self.assertIn("dashboard-write-token", body["error"])
+        self.assertEqual(self.row()["status"], "open")
+
+    def test_missing_and_wrong_tokens_are_401_and_change_nothing(self):
+        self.write_token()
+        self.assertEqual(self.post(self.payload())[0], 401)
+        self.assertEqual(self.post(self.payload(), "nope")[0], 401)
+        self.assertEqual(self.row()["status"], "open")
+
+    # ── the write itself ─────────────────────────────────────────────────
+    def test_a_valid_resolution_closes_the_row_through_the_shims_operation(self):
+        self.write_token()
+        status, body = self.post(self.payload(), "s3cret")
+        self.assertEqual(status, 200, body)
+        self.assertEqual((body["status"], body["state"], body["from_status"]),
+                         ("done", "resolved", "open"))
+        self.assertEqual(body["id"], "followup:1")  # the legacy id, as the CLI prints
+        self.assertEqual(body["task_id"], "t-1")
+        row = self.row()
+        self.assertEqual(row["status"], "done")
+        self.assertTrue(row["closed_at"])
+        # the resolution note lands in the envelope, not only in the event
+        self.assertEqual(json.loads(row["refs"])["resolution"],
+                         "Chased it; nothing further owed")
+
+    def test_the_event_is_the_shims_own_summary_and_records_the_decision_actor(self):
+        """Resolve closes through the ordinary status transition, so the
+        summary is `open -> done` — the same terminal transition every other
+        estate close writes, not a route-invented wording. The actor is the
+        page's configured decision actor, because a click on that page is the
+        person holding the write token."""
+        self.write_token()
+        self.assertEqual(self.post(self.payload(), "s3cret")[0], 200)
+        self.assertEqual(self.last_event(),
+                         (srv.decision_actor(), "open -> done",
+                          "Chased it; nothing further owed"))
+
+    # ── optimistic concurrency ───────────────────────────────────────────
+    def test_a_stale_snapshot_is_a_409_and_does_not_overwrite(self):
+        self.write_token()
+        status, body = self.post(self.payload(expected_status="needs-owner"),
+                                 "s3cret")
+        self.assertEqual(status, 409, body)
+        self.assertIn("refresh before resolving", body["error"])
+        self.assertEqual(self.row()["status"], "open")
+
+    def test_a_row_resolved_by_someone_else_first_conflicts_rather_than_repeats(self):
+        self.write_token()
+        self.assertEqual(self.post(self.payload(), "s3cret")[0], 200)
+        status, body = self.post(self.payload(note="second click"), "s3cret")
+        self.assertEqual(status, 409, body)
+        self.assertEqual(json.loads(self.row()["refs"])["resolution"],
+                         "Chased it; nothing further owed")
+
+    # ── validation ───────────────────────────────────────────────────────
+    def test_note_is_required_and_extra_fields_are_rejected(self):
+        self.write_token()
+        self.assertEqual(self.post(self.payload(note="  "), "s3cret")[0], 400)
+        self.assertEqual(self.post(self.payload(command="rm"), "s3cret")[0], 400)
+        self.assertEqual(
+            self.post(self.payload(expected_status=None), "s3cret")[0], 400)
+        self.assertEqual(self.row()["status"], "open")
+
+    def test_an_unknown_id_is_a_400_not_a_500(self):
+        self.write_token()
+        status, body = self.post(self.payload(id="t-404"), "s3cret")
+        self.assertEqual(status, 400)
+        self.assertIn("no follow-up matches", body["error"])
+
+    def test_a_task_that_is_not_a_followup_is_refused(self):
+        """`find_row` reaches follow-ups and nothing else, so this route
+        cannot be pointed at an ordinary task by editing the id in the body."""
+        self.write_token()
+        estate = srv._load_estate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(estate.main(
+                ["task", "add", "not a follow-up", "--kind", "chore"]), 0)
+        status, body = self.post(self.payload(id="t-2"), "s3cret")
+        self.assertEqual(status, 400)
+        self.assertIn("no follow-up matches", body["error"])
+
+    def test_the_legacy_id_resolves_the_same_row(self):
+        self.write_token()
+        status, body = self.post(self.payload(id="followup:1"), "s3cret")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.row()["status"], "done")
+
+
 class CapPaceTest(unittest.TestCase):
     RESET = "2026-08-03T09:00:00+00:00"
 
@@ -916,11 +1431,140 @@ class EstateDrilldownTest(unittest.TestCase):
     """P-16 — a task's drill-down is complete, not a slice of the recent tail.
 
     build_estate_activity's `events` list is deliberately the last 80 rows: it
-    backs the "recent activity" panel. Before this, the per-task drill-down
+    backs the "recent activity" panel. Before P-16 the per-task drill-down
     filtered that same list client-side, so the moment an estate got busy every
     older task rendered with no events at all — and looked like a task nothing
-    had ever happened to. `task_events` comes from `estate events`' query
-    surface instead, which is the whole table.
+    had ever happened to. The answer comes from `estate events`' query surface
+    instead, which is the whole table.
+
+    Bounding the snapshot MOVED that answer and did not weaken it. It used to
+    be computed for every task ever created on every regen and embedded in
+    dashboard.json (the bulk of estate_activity, re-parsed by every open tab
+    every 30 seconds); it is now `GET /estate-detail?task=t-N`, read on the
+    one occasion somebody opens the row. Same table, same query surface, same
+    completeness — so these tests read the endpoint, and the last one pins that
+    the snapshot SAYS it no longer carries the map rather than shipping an
+    empty one a reader could mistake for "no events".
+    """
+
+    ESTATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "bin", "estate")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old_state = dash.STATE
+        dash.STATE = Path(self.tmp.name)
+        self.addCleanup(lambda: setattr(dash, "STATE", self.old_state))
+        self.old_db = srv.ESTATE_DB
+        srv.ESTATE_DB = str(Path(self.tmp.name) / "estate.db")
+        self.addCleanup(lambda: setattr(srv, "ESTATE_DB", self.old_db))
+
+    def drilldown(self, task=None, project=None):
+        return srv.estate_detail(task, project)
+
+    def estate(self, *args):
+        import subprocess
+        import sys
+        env = dict(os.environ, ESTATE_STATE_DIR=str(dash.STATE))
+        result = subprocess.run([sys.executable, self.ESTATE, *args],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_drilldown_survives_past_the_eighty_row_recent_window(self):
+        self.estate("task", "add", "the old one", "--kind", "generic",
+                    "--actor", "hub")
+        self.estate("note", "t-1", "something happened to it", "--actor", "hub")
+        # Bury it: 90 later events push the contract clean out of the recent slice.
+        for n in range(90):
+            self.estate("event", "--actor", "hub", "--kind", "note",
+                        "--summary", f"unrelated {n}")
+        out = dash.build_estate_activity({"loops": {}})
+        self.assertTrue(out["available"])
+        recent_task_ids = {r.get("task_id") for r in out["events"]}
+        self.assertNotIn("t-1", recent_task_ids,
+                         "fixture is wrong: t-1 should have scrolled off")
+        summaries = [r["summary"] for r in self.drilldown(task="t-1")["events"]]
+        self.assertIn("something happened to it", summaries)
+        self.assertIn("task created (open)", summaries)
+
+    def test_a_tasks_events_are_only_its_own(self):
+        self.estate("task", "add", "first", "--kind", "generic")
+        self.estate("task", "add", "second", "--kind", "generic")
+        self.estate("note", "t-1", "belongs to one", "--actor", "hub")
+        self.estate("note", "t-2", "belongs to two", "--actor", "hub")
+        events = self.drilldown(task="t-1")["events"]
+        self.assertIn("belongs to one", [r["summary"] for r in events])
+        self.assertNotIn("belongs to two", [r["summary"] for r in events])
+
+    def test_drilldown_rows_are_sequence_ordered_and_actor_normalized(self):
+        self.estate("task", "add", "a task", "--kind", "generic")
+        self.estate("event", "--actor", "hub", "--kind", "note",
+                    "--summary", "under the persona name", "--task", "t-1")
+        rows = self.drilldown(task="t-1")["events"]
+        self.assertEqual([r["seq"] for r in rows],
+                         sorted(r["seq"] for r in rows))
+        self.assertEqual(rows[-1]["actor"], "hub")   # docs/actor-taxonomy.md
+
+    def test_the_drilldown_carries_the_derived_row_the_snapshot_thinned(self):
+        """A terminal task nothing else in the snapshot points at ships as a
+        collapsed row; its body — refs included — comes from here, derived by
+        the same `estate_work.build` the snapshot uses rather than a second
+        single-task derivation that could disagree with it."""
+        self.estate("task", "add", "old work", "--kind", "generic",
+                    "--actor", "hub")
+        self.estate("drop", "t-1", "superseded", "--actor", "hub")
+        row = next(t for t in dash.build_estate_activity({"loops": {}})["tasks"]
+                   if t["id"] == "t-1")
+        self.assertTrue(row["summary_only"])
+        self.assertNotIn("refs", row)
+        detail = self.drilldown(task="t-1")["task"]
+        self.assertEqual(detail["status"], "dropped")
+        self.assertIn("refs", detail)
+        self.assertIn("followup", detail)     # the full derived view, not a row
+
+    def test_an_unknown_id_is_refused_before_any_query(self):
+        for bad in ("", "t-1; drop table tasks", "../../etc/passwd", "t-"):
+            with self.assertRaises(ValueError):
+                self.drilldown(task=bad)
+
+    def test_no_estate_database_is_not_an_error(self):
+        out = dash.build_estate_activity({"loops": {}})
+        self.assertFalse(out["available"])
+        self.assertEqual(out["task_events"], {})
+        # And it says the drill-down cannot be read here, rather than leaving
+        # an empty map to be read as "no task has any history".
+        self.assertEqual(out["task_events_source"], "unavailable")
+
+    def test_the_snapshot_names_where_the_drilldown_comes_from(self):
+        """an empty `task_events` map is ambiguous on its own: a store
+        with no history and a snapshot that stopped carrying it look the same.
+        `task_events_source` is the warrant (docs/absence-contract.md)."""
+        self.estate("task", "add", "a task", "--kind", "generic")
+        self.estate("note", "t-1", "something happened", "--actor", "hub")
+        out = dash.build_estate_activity({"loops": {}})
+        self.assertEqual(out["task_events"], {})
+        self.assertEqual(out["task_events_source"], "on-demand")
+        self.assertIn("something happened",
+                      [r["summary"] for r in self.drilldown(task="t-1")["events"]])
+
+
+class BoundedSnapshotTest(unittest.TestCase):
+    """what the periodic payload carries, and what it refuses to.
+
+    `estate_work.build` reads every task ever created, and `estate_activity`
+    used to ship all of them in full plus a per-task event join over all of
+    them — most of dashboard.json on a long-lived store, growing every night
+    with no cap — and refetched entire by every open
+    tab every 30 seconds.
+
+    The bound is stated as a rule rather than a number: every task still ships
+    a row, so the Terminal/All tabs, the by-id lookup and the search
+    box still see the whole store — but a terminal task nothing else in the
+    snapshot points at ships its COLLAPSED row alone, and no row ships the
+    drill-down. Anything a panel renders without a click keeps its full row,
+    which is what the id lists below pin.
     """
 
     ESTATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -942,45 +1586,92 @@ class EstateDrilldownTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
-    def test_drilldown_survives_past_the_eighty_row_recent_window(self):
-        self.estate("task", "add", "the old one", "--kind", "generic",
-                    "--actor", "hub")
-        self.estate("note", "t-1", "something happened to it", "--actor", "hub")
-        # Bury it: 90 later events push t-1 clean out of the recent slice.
-        for n in range(90):
-            self.estate("event", "--actor", "hub", "--kind", "note",
-                        "--summary", f"unrelated {n}")
-        out = dash.build_estate_activity({"loops": {}})
-        self.assertTrue(out["available"])
-        recent_task_ids = {r.get("task_id") for r in out["events"]}
-        self.assertNotIn("t-1", recent_task_ids,
-                         "fixture is wrong: t-1 should have scrolled off")
-        summaries = [r["summary"] for r in out["task_events"]["t-1"]]
-        self.assertIn("something happened to it", summaries)
-        self.assertIn("task created (open)", summaries)
+    def populate(self):
+        self.estate("project", "add", "Rollout", "--kind", "rollout")
+        self.estate("task", "add", "still open", "--kind", "generic")
+        self.estate("task", "add", "old and closed", "--kind", "generic")
+        self.estate("drop", "t-2", "superseded", "--actor", "hub")
+        self.estate("task", "add", "closed but projected", "--kind", "generic",
+                    "--project", "p-1")
+        self.estate("drop", "t-3", "superseded", "--actor", "hub")
+        self.estate("proposal", "add", "a decided proposal",
+                    "--fingerprint", "abc123", "--condition", "c",
+                    "--desired-outcome", "d", "--completion-check", "e",
+                    "--actor", "mechanic")
+        self.estate("drop", "t-4", "rejected", "--actor", "hub")
+        return dash.build_estate_activity({"loops": {}})
 
-    def test_a_tasks_events_are_only_its_own(self):
-        self.estate("task", "add", "first", "--kind", "generic")
-        self.estate("task", "add", "second", "--kind", "generic")
-        self.estate("note", "t-1", "belongs to one", "--actor", "hub")
-        self.estate("note", "t-2", "belongs to two", "--actor", "hub")
-        events = dash.build_estate_activity({"loops": {}})["task_events"]
-        self.assertIn("belongs to one", [r["summary"] for r in events["t-1"]])
-        self.assertNotIn("belongs to two", [r["summary"] for r in events["t-1"]])
+    def rows(self, out):
+        return {t["id"]: t for t in out["tasks"]}
 
-    def test_drilldown_rows_are_sequence_ordered_and_actor_normalized(self):
-        self.estate("task", "add", "a task", "--kind", "generic")
-        self.estate("event", "--actor", "hub", "--kind", "note",
-                    "--summary", "under the persona name", "--task", "t-1")
-        rows = dash.build_estate_activity({"loops": {}})["task_events"]["t-1"]
-        self.assertEqual([r["seq"] for r in rows],
-                         sorted(r["seq"] for r in rows))
-        self.assertEqual(rows[-1]["actor"], "hub")   # docs/actor-taxonomy.md
+    def test_every_task_still_ships_a_row(self):
+        out = self.populate()
+        self.assertEqual(sorted(self.rows(out)), ["t-1", "t-2", "t-3", "t-4"])
+        self.assertEqual(sum(out["task_counts"].values()), 4)
 
-    def test_no_estate_database_is_not_an_error(self):
-        out = dash.build_estate_activity({"loops": {}})
-        self.assertFalse(out["available"])
-        self.assertEqual(out["task_events"], {})
+    def test_a_terminal_task_nothing_points_at_ships_collapsed(self):
+        rows = self.rows(self.populate())
+        self.assertTrue(rows["t-2"]["summary_only"])
+        # Everything taskRow's badges and haystack()'s search string read.
+        for field in ("id", "title", "status", "kind", "updated_at"):
+            self.assertIn(field, rows["t-2"])
+        for field in ("refs", "followup", "proposal", "blocked_by"):
+            self.assertNotIn(field, rows["t-2"])
+
+    def test_an_open_task_keeps_its_full_row(self):
+        rows = self.rows(self.populate())
+        self.assertNotIn("summary_only", rows["t-1"])
+        for field in ("followup", "proposal", "blocked_by", "due_state",
+                      "is_attention", "blocks_titles"):
+            self.assertIn(field, rows["t-1"])
+
+    def test_no_row_carries_the_refs_blob_any_more(self):
+        """`refs` is the envelope the followup/proposal/message views on the
+        same row were already derived FROM, and only the drill-down's <pre>
+        renders it raw — a large share of an unbounded snapshot."""
+        out = self.populate()
+        self.assertEqual([t["id"] for t in out["tasks"] if "refs" in t], [])
+
+    def test_a_row_a_panel_renders_without_a_click_keeps_its_full_row(self):
+        """The id lists are ordered pointers INTO `tasks`, and each of those
+        panels renders its rows' bodies with no click — a resolved follow-up
+        behind the History toggle, a rejected proposal behind its stage tab.
+        Thinning one of those would empty a panel."""
+        out = self.populate()
+        rows = self.rows(out)
+        pointed = set()
+        for key in ("attention", "followups", "proposals", "inbox_messages"):
+            pointed.update(out[key])
+        self.assertIn("t-4", out["proposals"], "fixture produced no proposal")
+        for task_id in pointed:
+            self.assertIn(task_id, rows, f"{task_id} points at nothing")
+            self.assertNotIn("summary_only", rows[task_id],
+                             f"{task_id} is rendered without a click")
+
+    def test_a_real_projects_tasks_keep_their_full_rows(self):
+        """`projectRow` names every rollup task by status and title, and
+        `projectHistory` composes their events — the synthetic `unprojected`
+        bucket is deliberately not followed, because it names every
+        unprojected task and would bound nothing."""
+        out = self.populate()
+        rows = self.rows(out)
+        project = next(p for p in out["projects"] if p["id"] == "p-1")
+        for task_id in project["rollup"]["task_ids"]:
+            self.assertNotIn("summary_only", rows[task_id])
+        self.assertTrue(rows["t-2"]["summary_only"],
+                        "an unprojected terminal task is still collapsed")
+
+    def test_the_bound_holds_as_the_store_grows(self):
+        """The completion check: the payload tracks OPEN work, not the length
+        of the store's history."""
+        base = len(json.dumps(self.populate()["tasks"]))
+        for n in range(40):
+            self.estate("task", "add", f"more history {n}", "--kind", "generic")
+            self.estate("drop", f"t-{5 + n}", "done with", "--actor", "hub")
+        grown = len(json.dumps(dash.build_estate_activity({"loops": {}})["tasks"]))
+        per_task = (grown - base) / 40
+        self.assertLess(per_task, 400,
+                        "a closed task must cost a collapsed row, not a full one")
 
 
 class EstateBlockedByTest(unittest.TestCase):
@@ -1068,15 +1759,7 @@ class EstateBlockedByTest(unittest.TestCase):
 
 
 class EstateWorkSnapshotTest(unittest.TestCase):
-    """t-135 — the estate page's four questions reach `dashboard.json`.
-
-    Projects were absent from the snapshot entirely and the dependency graph
-    was represented only by derived `blocked_by` ids, so /estate.html could not
-    have rendered a Projects or a Dependencies section from what it was given.
-    The rules themselves live in lib/estate_work.py and are tested there; what
-    is asserted here is the WIRING — that one composed read feeds the snapshot
-    and that a store which cannot answer part of it still produces a page.
-    """
+    """the estate page's four questions reach `dashboard.json`."""
 
     ESTATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "..", "bin", "estate")
@@ -1143,20 +1826,29 @@ class EstateWorkSnapshotTest(unittest.TestCase):
 
     def test_every_event_ships_exactly_once(self):
         """§4.10 — the snapshot is append-only and already grows on its own.
-        An event written against a project's TASK names both ids, so shipping
-        it under both keys would send it twice; the page joins the two
-        collections client-side, where it costs nothing."""
+        An event written against a project's TASK names both ids, so the
+        snapshot's `project_events` carries only the rows no task carries.
+
+        Now the tasks' half is not in the snapshot at all: it arrives
+        from `GET /estate-detail?project=p-N`, whose `project` filter returns
+        every row naming the project — the project's own AND its tasks' — so
+        the page composes the two with the seq dedup it always had."""
         self.populate()
         self.estate("event", "--actor", "hub", "--kind", "note",
                     "--summary", "project-level only", "--project", "p-1")
         out = dash.build_estate_activity({"loops": {}})
-        project_seqs = {r["seq"] for r in out["project_events"]["p-1"]}
-        task_seqs = {r["seq"] for events in out["task_events"].values()
-                     for r in events}
-        self.assertTrue(project_seqs and task_seqs, "fixture produced neither")
-        self.assertEqual(project_seqs & task_seqs, set())
-        self.assertTrue(all(r["project_id"] == "p-1"
-                            for r in out["project_events"]["p-1"]))
+        embedded = out["project_events"]["p-1"]
+        self.assertTrue(embedded, "fixture produced no project-level rows")
+        self.assertTrue(all(r["project_id"] == "p-1" for r in embedded))
+        self.assertTrue(all(not r["task_id"] for r in embedded),
+                        "a row a task already carries must not ship twice")
+        srv.ESTATE_DB = str(dash.STATE / "estate.db")
+        composed = srv.estate_detail(None, "p-1")["events"]
+        seqs = {r["seq"] for r in composed}
+        self.assertTrue({r["seq"] for r in embedded} <= seqs)
+        self.assertTrue(any(r["task_id"] for r in composed),
+                        "the endpoint composes the tasks' rows in")
+        self.assertEqual(len(seqs), len(composed), "and never twice")
 
     def test_derived_task_fields_ride_on_every_row(self):
         out = self.populate()
@@ -1194,6 +1886,63 @@ class EstateWorkSnapshotTest(unittest.TestCase):
         self.assertEqual(out["attention"], ["t-1"])
         self.assertEqual(out["project_events"], {})
 
+
+class ProposalVitalTest(unittest.TestCase):
+    def test_counts_the_panels_pending_review_inventory(self):
+        self.assertEqual(dash.pending_proposal_count({
+            "available": True,
+            "proposal_counts": {"pending-review": 85, "resolved": 121}}), 85)
+        self.assertEqual(dash.pending_proposal_count({
+            "available": True, "proposal_counts": {}}), 0)
+
+    def test_unread_store_is_unknown_not_zero(self):
+        count = dash.pending_proposal_count({"available": False})
+        self.assertIsNone(count)
+        card = dash.render_vitals({"loops": [], "vitals": {
+            "loops_live": 0, "needs_you": 0, "going_astray": 0,
+            "queue_queued": 0, "proposals": count}})
+        self.assertIn('class="n">?</div>', card)
+        self.assertNotIn('None', card)
+
+
+class EstateLoaderStoreGateTest(unittest.TestCase):
+    """The server repoints the estate CLI module at its own store, and the
+    module asks a second question — STORE, the resolver's gate — before it will
+    open anything. Repointing DB_PATH alone left that gate on whatever store the
+    module resolved for itself, which the endpoint tests never noticed because
+    this repo's real state/estate.db happens to exist. Everything here runs in a
+    temp dir with no state/estate.db of its own."""
+
+    def setUp(self):
+        import subprocess
+        import sys
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved = (srv.STATE, srv.ESTATE_DB, srv._ESTATE_MODULE)
+        self.addCleanup(lambda: (setattr(srv, "STATE", self.saved[0]),
+                                 setattr(srv, "ESTATE_DB", self.saved[1]),
+                                 setattr(srv, "_ESTATE_MODULE", self.saved[2])))
+        result = subprocess.run(
+            [sys.executable, os.path.join(str(_HERE), "estate"), "init"],
+            capture_output=True, text=True,
+            env=dict(os.environ, ESTATE_STATE_DIR=self.tmp.name))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        srv.STATE = self.tmp.name
+        srv.ESTATE_DB = os.path.join(self.tmp.name, "estate.db")
+        srv._ESTATE_MODULE = None
+
+    def test_the_gate_is_repointed_with_the_path(self):
+        module = srv._load_estate()
+        self.assertEqual(os.path.normpath(module.STORE.db_path),
+                         os.path.normpath(srv.ESTATE_DB))
+
+    def test_a_gate_that_resolved_elsewhere_does_not_refuse_the_servers_store(self):
+        module = srv._load_estate()
+        fresh_clone = os.path.join(self.tmp.name, "fresh", "bin", "estate")
+        module.STORE = module.estate_store.resolve(fresh_clone, env={})
+        self.assertFalse(module.STORE.exists())
+        self.assertIs(srv._load_estate(), module)
+        module.connect().close()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

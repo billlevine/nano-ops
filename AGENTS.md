@@ -29,7 +29,7 @@ private-fork/public-upstream shape.
 - `bin/dashboard`, `bin/dashboard-refresh`, `bin/dashboard-server` — the Tier-1
   local estate dashboard: renderer, regenerator, loopback-only server
 - `bin/usage-fetch` — writes `state/usage/budget.json`, the budget signal
-- `bin/followups` — durable standing-action-item store
+- `bin/followups` — durable standing-action-item store, a shim over `bin/estate`
 - `bin/persona-compile` — compiles `personas/` into one body per role.
   `--install` writes that body to a `persona.md` sidecar beside each target and
   puts a stable `@persona.md` import between the target's generated markers, so

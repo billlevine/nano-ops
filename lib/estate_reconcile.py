@@ -1,4 +1,4 @@
-"""Cross-store scope reconciliation (t-389, gap audit Q-06).
+"""Cross-store scope reconciliation the contract, gap audit Q-06).
 
 THE TWO STORES
 --------------
@@ -108,6 +108,10 @@ INDEX_FILE = "MEMORY.md"
 DECLARE_RE = re.compile(r"^\s*estate\s*:\s*(.+?)\s*$", re.MULTILINE)
 ID_RE = re.compile(r"m-\d+")
 
+# "- [slug](typed_file.md) — summary". The same line shape bin/memory-note
+# writes and removes; the filename is what identifies the note.
+INDEX_LINE_RE = re.compile(r"^-\s*\[[^\]]*\]\(([^)]+)\)", re.MULTILINE)
+
 # Tokens shorter than this carry no identity. Keeps `a`, `is`, `of` out without
 # maintaining a stopword list that would need an opinion per word — IDF already
 # handles the common words that survive.
@@ -119,10 +123,17 @@ WORD_RE = re.compile(r"[a-z0-9][a-z0-9/_.#-]*")
 # the time. It is a floor on how much to read, not a claim about any pair.
 DEFAULT_MIN_SCORE = 0.40
 
-# Verdicts. Three words, because there are exactly three things a declared pair
-# can be, and the reader should never have to infer a fourth.
-DIVERGENT = "divergent"   # estate holds it locally; the session store shares it
+# Verdicts. Four words. The fourth arrived with the contract's scope migration and is
+# the reason the third sentence of DIVERGENT had to be split: "the session store
+# shares it" was true of every file on disk, because the contract's claim is
+# about the DIRECTORY. What is actually loaded into every session is MEMORY.md,
+# the index — a note file with no line in it is on disk and in nobody's context.
+# So a fact deliberately narrowed to `hub` and unlinked from the index is not a
+# divergence to fix; it is the fix. Reporting every one of those as
+# `divergent` would bury the ones that are real.
+DIVERGENT = "divergent"   # estate holds it locally; the index still loads it
 ALIGNED = "aligned"       # both stores hold it estate-wide; nothing to fix
+SCOPED = "scoped"         # estate holds it locally and the index no longer loads it
 DANGLING = "dangling"     # the file names a memory id the store does not have
 
 
@@ -181,6 +192,7 @@ def load_notes(directory: Path) -> list[dict]:
     notes = []
     if not directory.is_dir():
         return notes
+    listed = indexed_names(directory)
     for path in sorted(directory.glob("*.md")):
         if path.name == INDEX_FILE:
             continue
@@ -188,13 +200,31 @@ def load_notes(directory: Path) -> list[dict]:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             notes.append({"name": path.name, "unreadable": str(exc),
-                          "declares": [], "tokens": set(), "body": ""})
+                          "declares": [], "tokens": set(), "body": "",
+                          "indexed": True})
             continue
         frontmatter, body = split_frontmatter(text)
         notes.append({"name": path.name, "unreadable": None,
                       "declares": declared_ids(frontmatter),
-                      "tokens": tokens(body), "body": body})
+                      "tokens": tokens(body), "body": body,
+                      "indexed": listed is None or path.name in listed})
     return notes
+
+
+def indexed_names(directory: Path) -> set | None:
+    """Every file MEMORY.md lists, or None when the index could not be read.
+
+    None is not an empty set. The index is what Claude Code loads into every
+    session; a note it lists is in everyone's context and a note it does not is
+    on disk only. An index nobody could read answers neither question, and
+    `verdict()` treats None as "assume listed" so an unreadable index can never
+    quietly clear a real divergence.
+    """
+    try:
+        text = (directory / INDEX_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return {m.group(1) for m in INDEX_LINE_RE.finditer(text)}
 
 
 class Weights:
@@ -234,13 +264,25 @@ def resemblance(a: set[str], b: set[str], weights: Weights) -> float:
     return weights.mass(a & b) / lighter
 
 
-def verdict(memory_scope: str) -> str:
+def verdict(memory_scope: str, indexed: bool = True) -> str:
     """What a declared pair is, given where the estate keeps its side.
 
-    One comparison, because the session store's side of every pair is
-    SESSION_SCOPE by construction — there is no per-file scope to read.
+    Still one comparison on scope, because the session store's side of every
+    pair is SESSION_SCOPE by construction. `indexed` decides only what a
+    NARROWER estate scope means: a note MEMORY.md still lists reaches every
+    session in this repository and diverges from its estate row; one nothing
+    lists does not, and is `scoped` — the end state of a deliberate migration
+    rather than a defect.
+
+    `indexed` defaults True, and the default is the load-bearing half: a caller
+    that could not read the index must not get `scoped` for free. An unreadable
+    index is not evidence that nothing is listed in it
+    (docs/absence-contract.md), so the conservative direction — keep reporting
+    the divergence — is what an absent answer produces.
     """
-    return ALIGNED if memory_scope == SESSION_SCOPE else DIVERGENT
+    if memory_scope == SESSION_SCOPE:
+        return ALIGNED
+    return DIVERGENT if indexed else SCOPED
 
 
 def reconcile(memories, notes, *, min_score: float = DEFAULT_MIN_SCORE,
@@ -272,8 +314,9 @@ def reconcile(memories, notes, *, min_score: float = DEFAULT_MIN_SCORE,
                 continue
             findings.append({
                 "note": note["name"], "memory": key,
-                "verdict": verdict(row["scope"]),
+                "verdict": verdict(row["scope"], note.get("indexed", True)),
                 "memory_scope": row["scope"], "memory_status": row["status"],
+                "indexed": note.get("indexed", True),
                 "session_scope": SESSION_SCOPE,
                 "score": round(resemblance(tokens(row["body"]),
                                            note["tokens"], weights), 3),
@@ -293,7 +336,8 @@ def reconcile(memories, notes, *, min_score: float = DEFAULT_MIN_SCORE,
                     "memory_scope": memory["scope"],
                     "memory_status": memory["status"],
                     "session_scope": SESSION_SCOPE,
-                    "would_be": verdict(memory["scope"]),
+                    "would_be": verdict(memory["scope"],
+                                        note.get("indexed", True)),
                     "score": round(score, 3),
                 })
     suspected.sort(key=lambda s: (-s["score"], s["memory"], s["note"]))
@@ -308,6 +352,7 @@ def reconcile(memories, notes, *, min_score: float = DEFAULT_MIN_SCORE,
             "notes": len(notes),
             "divergent": sum(1 for f in findings if f["verdict"] == DIVERGENT),
             "aligned": sum(1 for f in findings if f["verdict"] == ALIGNED),
+            "scoped": sum(1 for f in findings if f["verdict"] == SCOPED),
             "dangling": sum(1 for f in findings if f["verdict"] == DANGLING),
             "unlinked": len(unlinked),
             "unreadable": len(unreadable),

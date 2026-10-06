@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Generate the served dashboard shells: index.html, estate.html, dashboard-v2.html.
+"""Regenerate the served dashboard shells NOW: index.html, estate.html,
+dashboard-v2.html.
 
 Every one of them is a DATA-FREE shell — it fetches state/dashboard.json at
-runtime — so this only has to run when the markup itself changes, and the pages
-stay as fresh as bin/dashboard-refresh keeps that JSON (45s). The snapshot is
-built ONCE and handed to all three renderers: they read only the estate/operator
-names out of it, so a second build would produce identical bytes at extra cost.
+runtime — so the numbers on the pages stay as fresh as bin/dashboard-refresh
+keeps that JSON (45s), whatever this does. What this writes is the MARKUP.
+
+Now that is no longer this script's job alone: every `bin/dashboard`
+run rewrites all three shells, including the `--json` one the dashboard-refresh
+service drives every ~45s. So a merged rendering change reaches the served page
+on its own, and this is the on-demand path — `bin/ops dashboard up`, and a
+person who does not want to wait a cycle. Both call the same
+`dashboard.write_shells`, so there is one renderer list and no second place for
+a fourth page to be forgotten.
+
+The snapshot is built ONCE and handed to all three renderers: they read only
+the estate/operator names out of it, so a second build would produce identical
+bytes at extra cost — and, before this, two builds could disagree about the
+estate they were describing.
 """
 from __future__ import annotations
 
@@ -16,14 +28,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "state" / "index.html"
-ESTATE_OUT = ROOT / "state" / "estate.html"
-V2_OUT = ROOT / "state" / "dashboard-v2.html"
+# The renderers are not imported here any more: `dashboard.write_shells` owns
+# the page list, and importing them a second time would let this file's idea of
+# it drift from the one the refresh cycle actually writes.
 sys.path.insert(0, str(ROOT / "lib"))
-
-import dashboard_primary  # noqa: E402  (lib path is established above)
-import dashboard_estate  # noqa: E402
-import dashboard_v2  # noqa: E402
 
 
 def load_dashboard():
@@ -38,17 +46,14 @@ def load_dashboard():
 
 def main() -> int:
     dashboard = load_dashboard()
-    snapshot = dashboard.build_snapshot()
-    page = dashboard_primary.render(dashboard, snapshot)
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(page, encoding="utf-8")
-    ESTATE_OUT.write_text(dashboard_estate.render(dashboard, snapshot), encoding="utf-8")
-    V2_OUT.write_text(dashboard_v2.render(dashboard, snapshot), encoding="utf-8")
-    print(f"wrote {OUT}  ({len(page):,} bytes, primary live shell)")
+    for path, size in dashboard.write_shells(dashboard.build_snapshot()):
+        print(f"wrote {path}  ({size:,} bytes, live shell)")
     print("  primary: /")
-    print("  estate operations view: /estate.html")
+    print("  estate operations: /estate.html")
     print("  dashboard v2: /dashboard-v2.html")
+    print("  stewards: /stewards.html (select a steward for its own page)")
     return 0
+
 
 
 if __name__ == "__main__":

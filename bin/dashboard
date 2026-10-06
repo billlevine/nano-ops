@@ -7,15 +7,24 @@ it. It NEVER writes to any loop's state — its only outputs (all under state/):
 
     state/dashboard.json       the aggregated data model + pre-rendered section
                                HTML (single source of truth; polled by the shell)
-    state/index.html           the Tier-1 LIVE SHELL, generated separately by
-                               bin/dashboard-index; its only network call
-                               is same-origin dashboard.json
+    state/index.html           the Tier-1 LIVE SHELL; its only network call is
+                               same-origin dashboard.json
+    state/estate.html          the estate-operations page, same shell contract
+    state/dashboard-v2.html    the second daily surface, same shell contract
     state/dashboard.body.html  data-inlined body fragment for the Artifact tool
                                (static snapshot; no fetch)
 
+All three HTML shells are server-rendered from the same snapshot as the JSON
+and are rewritten on EVERY run, including --json. They used to be written only
+by the one-off bin/dashboard-index, so a merged rendering change stayed
+invisible on the served page until somebody remembered to run it by hand.
+The shells being DATA-FREE does not cover this: that keeps the served
+NUMBERS fresh off dashboard.json, and this keeps the served MARKUP current.
+
 Modes:
-    bin/dashboard          (re)write json + static Artifact fragment
-    bin/dashboard --json   write state/dashboard.json ONLY — deterministic and
+    bin/dashboard          (re)write json + all three shells + Artifact fragment
+    bin/dashboard --json   write state/dashboard.json + all three shells, and
+                           skip the Artifact fragment — deterministic and
                            token-free; this is what the local regenerator runs
 
 Serve it (Tier-1):  flox activate --start-services   (`bin/ops dashboard`
@@ -36,11 +45,12 @@ Reads:
                                         from last_tick — proves the wake-on-
                                         activity poller is up even when the
                                         hub itself has been idle a while)
-    agent-deck ls --json                ONE read serving both live per-loop status
-                                        (running/idle/waiting) + model, and the hub
-                                        ephemeral sessions in flight NOW
-                                        (loops.toml [hub].group, title
+    agent-deck ls --json                ONE read serving live per-loop status and
+                                        every live dispatch-session join (the hub's
+                                        workers: loops.toml [hub].group, title
                                         "ephemeral - …")
+    state/hub/dispatches.json           persistent-ask membership and dispatch
+                                        context for the combined sessions panel
     ~/.claude/projects/*/*.jsonl        local Claude Code token usage, current
                                         rolling window (read-only, token-free;
                                         approximate — this host only, NOT the
@@ -74,6 +84,7 @@ from __future__ import annotations
 
 import base64
 import glob
+import gzip
 import hashlib
 import html
 import json
@@ -92,7 +103,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 
 import actors  # noqa: E402  (lib path is established above)
+import transcript_usage  # noqa: E402
 import brief_manifest  # noqa: E402
+import dashboard_panels as panels  # noqa: E402
 import estate_deps  # noqa: E402
 import estate_events  # noqa: E402
 import estate_work  # noqa: E402
@@ -123,6 +136,10 @@ FAVICON = ("data:image/svg+xml;base64,"
 
 # ── generic helpers ──────────────────────────────────────────────────────────
 
+import codex_usage
+import dashboard_stewards
+import dashboard_nav
+import today_list
 def read_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -145,6 +162,23 @@ def parse_interval_seconds(s: str) -> int | None:
     if not m:
         return None
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def loop_interval(name: str, registry_interval: str) -> tuple[str, int | None]:
+    """Return the loop's effective cadence, with the operator's override first.
+
+    `bin/ops health` treats whitespace as insignificant in pace-override and
+    recognizes either an interval token or the literal `dynamic`.  Keep that
+    convention here so the dashboard reports the cadence the loop is actually
+    running, rather than the stale registry value it replaced.
+    """
+    raw = read_text(STATE / name / "pace-override")
+    pace = "".join(raw.split()) if raw is not None else ""
+    if pace == "dynamic":
+        return "dynamic (override)", None
+    if pace:
+        return pace, parse_interval_seconds(pace)
+    return registry_interval, parse_interval_seconds(registry_interval)
 
 
 def freshness(age: float | None, interval: int | None) -> str:
@@ -304,33 +338,58 @@ ESTATE = HUB.get("estate") or "ops"
 # ── agent-deck (live session status) ─────────────────────────────────────────
 
 # The loop sessions live under one agent-deck profile (same as the doorbell's
-# DOORBELL_DECK_PROFILE). Pass it explicitly so the read works regardless of the
-# ambient default profile — in particular under a supervised dashboard-refresh
-# service, whose default profile is `default` and would otherwise see nothing.
-DECK_PROFILE = (os.environ.get("DASHBOARD_DECK_PROFILE")
-                or HUB.get("deck_profile") or "ops")
+# DOORBELL_DECK_PROFILE), declared in loops.toml [hub].deck_profile. Pass it
+# explicitly so the read works regardless of the ambient default profile — in
+# particular under a supervised dashboard-refresh service, whose default
+# profile is `default` and would otherwise see nothing.
+def deck_profile() -> str:
+    """The declared profile. $DASHBOARD_DECK_PROFILE still wins for a one-off.
+
+    Resolved per call rather than at import so a test sees the current
+    environment. The neutral "ops" is the last-resort fallback, as everywhere
+    else in this repo.
+    """
+    return (os.environ.get("DASHBOARD_DECK_PROFILE")
+            or HUB.get("deck_profile") or "ops")
 
 
-def deck_ls() -> list[dict]:
+DECK_PROFILE = deck_profile()
+
+
+def deck_ls() -> tuple[list[dict], str, str | None]:
     """One `agent-deck ls --json` — the single live-session read for the whole
-    snapshot. Read-only; [] on any failure (each lookup then reads as an absent
-    session, exactly as a failed per-title `session show` did). The `status` and
-    `model` fields here are identical to what `session show` printed, so this
-    replaces the former one-`session show`-per-loop sweep with a single call."""
+    snapshot. Read-only. The `status` and `model` fields here are identical to
+    what `session show` printed, so this replaces the former one-`session
+    show`-per-loop sweep with a single call.
+
+    Returns (sessions, outcome, why). It used to return a bare `[]` on every
+    failure, which the Loops panel then rendered as "every session is down" and
+    the Dispatch sessions rendered as "nothing in flight" — a deck that would not
+    answer and a quiet estate were the same page. The outcome travels
+    with the list so both panels can say which one they are looking at.
+    """
     try:
         r = subprocess.run(
-            ["agent-deck", "-p", DECK_PROFILE, "ls", "--json"],
+            ["agent-deck", "-p", deck_profile(), "ls", "--json"],
             capture_output=True, text=True, timeout=12,
         )
-    except (OSError, subprocess.SubprocessError):
-        return []
+    except FileNotFoundError:
+        return [], panels.OUT_NO_TOOL, "agent-deck is not on PATH"
+    except subprocess.TimeoutExpired:
+        return [], panels.OUT_ERROR, "agent-deck ls timed out after 12s"
+    except (OSError, subprocess.SubprocessError) as err:
+        return [], panels.OUT_ERROR, f"agent-deck ls would not run: {err}"
     if r.returncode != 0:
-        return []
+        return [], panels.OUT_ERROR, (
+            f"agent-deck ls exited {r.returncode}: "
+            f"{(r.stderr or '').strip()[:120]}")
     try:
         data = json.loads(r.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return []
-    return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, ValueError) as err:
+        return [], panels.OUT_UNREADABLE, f"agent-deck ls printed non-JSON: {err}"
+    if not isinstance(data, list):
+        return [], panels.OUT_UNREADABLE, "agent-deck ls did not print a list"
+    return data, panels.OUT_OK, None
 
 
 def deck_index(sessions: list[dict]) -> dict:
@@ -355,7 +414,7 @@ def deck_session(title: str, index: dict) -> dict:
     return {"present": True, "status": status, "model": s.get("model") or None}
 
 
-# ── ephemeral queue (hub sessions dispatched RIGHT NOW) ──────────────────────
+# ── dispatch sessions (hub sessions dispatched RIGHT NOW) ──────────────────────
 # What is in flight this moment — distinct from the night-shift queue (which is
 # QUEUED PR/task work). The hub names each dispatched worker "ephemeral - <slug>"
 # under HUB_GROUP; one `agent-deck ls --json` read surfaces them all.
@@ -365,10 +424,36 @@ EPH_PREFIX = "ephemeral - "
 EPH_ORDER = {"running": 0, "waiting": 1, "idle": 2}
 
 
-def build_ephemeral(now: datetime, sessions: list[dict]) -> list[dict]:
-    dispatches = read_json(STATE / "hub" / "dispatches.json")
-    if not isinstance(dispatches, dict):
-        dispatches = {}
+def read_dispatches() -> tuple[dict, str, str | None]:
+    """The hub's dispatch tracker, with its warrant.
+
+    The ephemeral cards render fine without it — a worker still shows its slug,
+    status and age — so an unreadable tracker makes the panel `partial` rather
+    than blind. That is the one case on this page where the modifier is the
+    honest answer instead of a warrant class.
+    """
+    data, outcome, why = panels.read_producer_json(STATE / "hub" / "dispatches.json")
+    if outcome == panels.OUT_OK and not isinstance(data, dict):
+        return {}, panels.OUT_UNREADABLE, "dispatches.json is not an object"
+    return (data if isinstance(data, dict) else {}), outcome, why
+
+
+def _session_age(now: datetime, session: dict) -> float | None:
+    ca = session.get("created_at")
+    if ca:
+        try:
+            return max(0.0, now.timestamp() - datetime.fromisoformat(ca).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def build_dispatch_sessions(now: datetime, sessions: list[dict],
+                            dispatches: dict | None = None, *,
+                            dispatches_known: bool = True) -> list[dict]:
+    if dispatches is None:
+        dispatches, outcome, _ = read_dispatches()
+        dispatches_known = outcome == panels.OUT_OK
     out = []
     for s in sessions:
         if not isinstance(s, dict):
@@ -376,24 +461,47 @@ def build_ephemeral(now: datetime, sessions: list[dict]) -> list[dict]:
         title = s.get("title") or ""
         if s.get("group") != HUB_GROUP or not title.startswith(EPH_PREFIX):
             continue
+        dispatch = dispatches.get(title)
+        # Deck retains stopped sessions after dispatch cleanup. They are not
+        # in flight; an unresolved dispatch still warrants showing the stop.
+        if (dispatches_known and (s.get("status") or "").lower() == "stopped"
+                and (not isinstance(dispatch, dict)
+                     or dispatch.get("status", "open") == "resolved")):
+            continue
         slug = title[len(EPH_PREFIX):].strip() or title
-        ca = s.get("created_at")
-        age = None
-        if ca:
-            try:
-                age = max(0.0, now.timestamp() - datetime.fromisoformat(ca).timestamp())
-            except ValueError:
-                age = None
         item = {
             "slug": slug, "status": (s.get("status") or "").lower(),
-            "substate": s.get("substate"), "age": age,
+            "substate": s.get("substate"), "age": _session_age(now, s),
             "path": s.get("path"), "id": s.get("id"),
+            "session_type": "ephemeral",
         }
         dispatch = dispatches.get(EPH_PREFIX + slug)
         if isinstance(dispatch, dict):
             for field in ("kind", "ref", "task_id"):
                 if dispatch.get(field) is not None:
                     item[field] = dispatch[field]
+        out.append(item)
+    index = deck_index(sessions)
+    for title, dispatch in dispatches.items():
+        if not isinstance(dispatch, dict) or dispatch.get("kind") != "persistent-ask":
+            continue
+        if dispatch.get("status", "open") == "resolved":
+            continue
+        session = index.get(title)
+        item = {
+            "slug": title,
+            "status": ((session.get("status") or "").lower()
+                       if session else "session not found"),
+            "substate": session.get("substate") if session else None,
+            "age": _session_age(now, session) if session else None,
+            "path": session.get("path") if session else dispatch.get("worktree"),
+            "id": session.get("id") if session else None,
+            "session_type": "persistent-ask",
+            "session_found": bool(session),
+        }
+        for field in ("kind", "ref", "task_id"):
+            if dispatch.get(field) is not None:
+                item[field] = dispatch[field]
         out.append(item)
     # running first, then longest-alive first — the ones burning time now on top
     out.sort(key=lambda x: (EPH_ORDER.get(x["status"], 3), -(x["age"] or 0)))
@@ -440,8 +548,7 @@ def build_loops(registry: dict, now: float, index: dict) -> list[dict]:
     # installation's loop set baked into a shared renderer.
     for name, cfg in (registry.get("loops") or {}).items():
         persona = cfg.get("persona", name)
-        interval = cfg.get("interval", "")
-        isec = parse_interval_seconds(interval)
+        interval, isec = loop_interval(name, cfg.get("interval", ""))
         tick, age = heartbeat(name)
         sess = deck_session(f"{persona} ({name})", index)
         loops.append({
@@ -461,6 +568,13 @@ def build_loops(registry: dict, now: float, index: dict) -> list[dict]:
 
 BUCKET_OF = {"me": "waiting_you", "my_review": "my_review",
              "reviewers": "on_reviewers", "forge": "in_progress"}
+
+# The tile each bucket renders as, in the operator's words rather than the internal
+# spelling — the label a full-inventory row carries so its state is readable
+# without cross-referencing the tiles.
+BUCKET_LABEL = {"going_astray": "going astray", "waiting_you": "waiting on you",
+                "my_review": "your review", "on_reviewers": "on reviewers",
+                "in_progress": "in progress"}
 
 # Estate task kinds that mean "a worker is actively reworking this PR". Kept to
 # an explicit list rather than "any task with refs.pr", and that distinction
@@ -483,28 +597,65 @@ def split_note(note: str | None) -> tuple[str | None, str]:
     return None, re.sub(r"\s+", " ", note or "").strip()
 
 
+# Flags pr-tracker derives from the clock alone. `astray` is idle_days past
+# stale_days and `old` is age_days past old_days (track.py derive()), so both
+# arrive and leave with no GitHub or issue-tracker event behind them. See
+# activity_sig() for why hashing them broke acks.
+CLOCK_ONLY_FLAGS = frozenset({"old", "astray"})
+
+
+def _stable_list(values) -> list[str]:
+    """Sorted and string-coerced. GitHub's list order is not stable across
+    scans, and one None in a label list must not raise mid-hash."""
+    return sorted(str(v) for v in (values or []))
+
+
 def activity_sig(entry: dict) -> tuple[str, str | None]:
     """Fingerprint one pr-tracker entry's activity, plus when it last moved.
 
-    Built only from signals pr-tracker already records — GitHub's own
-    ``updatedAt`` (which moves on any commit/comment/review/label), the review
-    and check verdicts, the comment count, the issue tracker's
-    status/``updatedAt``, the operator's manual note, and the tracker's own classification. Deliberately excludes
-    everything time-derived (``idle_days``, ``age_days``, ``last_seen``) and the
-    fields that flap to UNKNOWN between scans (``mergeable``,
-    ``mergeStateStatus``), so a genuinely quiet PR keeps a stable signature for
-    as long as it stays quiet — that stability is what makes an acknowledgment
-    last. Returns (signature, last-activity ISO timestamp or None).
+    Built only from signals pr-tracker already records that a real, discoverable
+    event has to be behind: the PR's state/draft flag, the review and check
+    verdicts, the comment count, its labels and outstanding reviewer requests,
+    the issue tracker's status/``updatedAt``, the operator's manual note, and
+    the tracker's own classification. Deliberately excludes everything
+    time-derived (``idle_days``, ``age_days``, ``last_seen``) and the fields
+    that flap to UNKNOWN between scans (``mergeable``, ``mergeStateStatus``),
+    so a genuinely quiet PR keeps a stable signature for as long as it stays
+    quiet — that stability is what makes an acknowledgment last. Returns
+    (signature, last-activity ISO timestamp or None).
+
+    Two signals are excluded because they move with no real event behind
+    them, which would expire acks on their own:
+
+    * ``old`` and ``astray`` in ``derived.flags``. An acked PR would re-light
+      the day ``age_days`` crossed ``old_days``, with ``old`` entering the flag
+      list as the entire diff. Every other flag stays hashed — those name a
+      real condition.
+    * Raw ``pr.updatedAt``. GitHub bumps it for internal housekeeping with no
+      API trail — the timestamp moves with no comment, review, commit,
+      reviewer, label, timeline or check-run change anywhere behind it. An
+      ``updatedAt`` move now only re-lights a row when one of the
+      corroborating fields above moved with it, which is why ``labels`` and
+      ``reviewRequests`` are in the hash.
+
+    The accepted cost: a force-push that changes no other tracked field and
+    does not disturb ``checks`` no longer re-lights the row. Nothing pr-tracker
+    persists carries a head SHA, so there is no honest commit signal to hash.
+    ``updatedAt`` still feeds the returned timestamp — that is a display of when
+    GitHub last touched the PR, not a claim that something happened.
     """
     pr = entry.get("pr") or {}
     lin = entry.get("linear") or {}
     der = entry.get("derived") or {}
     parts = [
-        pr.get("updatedAt"), pr.get("state"), pr.get("isDraft"),
+        pr.get("state"), pr.get("isDraft"),
         pr.get("reviewDecision"), pr.get("comments"), pr.get("checks"),
+        _stable_list(pr.get("labels")), _stable_list(pr.get("reviewRequests")),
         lin.get("updatedAt"), lin.get("status"),
         (entry.get("manual") or {}).get("note"),
-        der.get("waiting_on"), sorted(der.get("flags") or []),
+        der.get("waiting_on"),
+        [f for f in _stable_list(der.get("flags"))
+         if f not in CLOCK_ONLY_FLAGS],
     ]
     blob = json.dumps(parts, sort_keys=True, default=str)
     sig = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
@@ -566,6 +717,68 @@ def active_pr_work() -> dict:
 
 SPOTTER_UNOBSERVED = "unobserved"
 
+# The one-sentence "why is this row still asking for me" text, imported from
+# the engine that derives the flags it explains rather than rewritten here.
+# Same technique (and the same best-effort contract) as _focus_checklists()
+# uses for the focus engine: the loop owns its own vocabulary, this file
+# renders it, and there is exactly one copy of the branch logic in the estate.
+_TRACK_PY = (ROOT / "loops" / "pr-tracker" / ".claude" / "skills"
+             / "pr-tracker" / "scripts" / "track.py")
+_track_cache: list = []          # [] = not tried yet, [None] = tried and failed
+
+
+def _track_engine():
+    """pr-tracker's track.py as a module, or None if it cannot be loaded.
+
+    Imported once per process and memoized — build_pr_board() asks per row.
+
+    track.py's module scope resolves its state dir and mkdir -p's it, so
+    $PR_TRACKER_STATE_DIR is pinned to the very directory this reader is
+    already reading before the import. A dashboard test pointed at a tmpdir
+    must not reach out and touch the real one (the same pin the
+    probe-escapes-into-live-state lesson asks for), and this file's promise is
+    that it never writes into a loop's state.
+    """
+    if _track_cache:
+        return _track_cache[0]
+    prev = os.environ.get("PR_TRACKER_STATE_DIR")
+    os.environ["PR_TRACKER_STATE_DIR"] = str(STATE / "pr-tracker")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_pr_track", str(_TRACK_PY))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception:  # pragma: no cover - the engine is optional to this view
+        mod = None
+    finally:
+        if prev is None:
+            os.environ.pop("PR_TRACKER_STATE_DIR", None)
+        else:
+            os.environ["PR_TRACKER_STATE_DIR"] = prev
+    _track_cache.append(mod)
+    return mod
+
+
+def pr_why(entry: dict, entries: dict) -> str | None:
+    """Why this PR row is on the board, in the operator's-eye English — or None.
+
+    A row can carry a badge like `pr-merged-issue-open` and still leave the
+    operator asking why a PR they already merged is on the board: nothing on
+    the row said what that rule means. This is the sentence that does.
+
+    `open_threads` is NOT passed: counting unresolved review threads is one
+    `gh` call per PR, and this renderer runs every 45 seconds and touches no
+    network. None says so, and track.py's branches then decline to state any
+    thread fact rather than reporting an uncounted board as a clean one.
+    """
+    mod = _track_engine()
+    if mod is None:
+        return None
+    try:
+        return mod.why_on_board(entry, entries) or None
+    except Exception:  # pragma: no cover - never let a sentence break the board
+        return None
+
 
 def pr_freshness(entry: dict) -> dict:
     """How old this row's numbers are, and whether the spotter is holding it.
@@ -592,8 +805,68 @@ def pr_freshness(entry: dict) -> dict:
     }
 
 
-def build_pr_board() -> dict:
-    st = read_json(STATE / "pr-tracker" / "state.json") or {}
+def annotate_pr_stacks(rows: list[dict]) -> list[dict]:
+    """Annotate tracked open PR chains and return them base-first."""
+    open_rows = [r for r in rows if r.get("pr_state") == "OPEN"]
+    by_head = {(r.get("repo"), r.get("head_ref")): r for r in open_rows
+               if r.get("repo") and r.get("head_ref")}
+    by_id = {r["id"]: r for r in open_rows}
+    parent: dict[str, str] = {}
+    children: dict[str, list[str]] = {}
+    for row in open_rows:
+        base = by_head.get((row.get("repo"), row.get("base_ref")))
+        if base is None or base["id"] == row["id"]:
+            continue
+        parent[row["id"]] = base["id"]
+        children.setdefault(base["id"], []).append(row["id"])
+
+    related = set(parent) | set(children)
+    stacks = []
+    visited: set[str] = set()
+
+    def walk(row_id: str, depth: int, ordered: list, path: set[str]):
+        if row_id in path or row_id in visited:
+            return
+        visited.add(row_id)
+        ordered.append((by_id[row_id], depth))
+        next_path = path | {row_id}
+        for child in sorted(children.get(row_id, []),
+                            key=lambda rid: str(by_id[rid].get("key") or rid)):
+            walk(child, depth + 1, ordered, next_path)
+
+    roots = sorted((rid for rid in related if rid not in parent),
+                   key=lambda rid: str(by_id[rid].get("key") or rid))
+    # Corrupt cached state could contain a cycle and therefore no root. Start
+    # at each remaining member so it remains visible without hanging the page.
+    for root in roots + sorted(related - set(roots)):
+        if root in visited:
+            continue
+        ordered = []
+        walk(root, 0, ordered, set())
+        if len(ordered) < 2:
+            continue
+        stack_id = str(ordered[0][0].get("key") or ordered[0][0]["id"])
+        size = len(ordered)
+        members = []
+        for index, (row, depth) in enumerate(ordered, 1):
+            parent_row = by_id.get(parent.get(row["id"], ""))
+            row.update(stack_id=stack_id, stack_index=index,
+                       stack_depth=depth, stack_size=size,
+                       stack_parent_key=(parent_row or {}).get("key"))
+            members.append(row)
+        stacks.append({"id": stack_id, "rows": members, "size": size})
+    return stacks
+
+
+def build_pr_board(now: float | None = None) -> dict:
+    # `read_json(...) or {}` answered a missing tracker, an unreadable
+    # one and a genuinely clear board with the same empty dict, and the tiles
+    # below rendered all three as `0/0/0/0/0`. The read carries its warrant now.
+    st, outcome, why = panels.read_producer_json(
+        STATE / "pr-tracker" / "state.json")
+    if outcome == panels.OUT_OK and not isinstance(st, dict):
+        st, outcome, why = None, panels.OUT_UNREADABLE, "state.json is not an object"
+    st = st if isinstance(st, dict) else {}
     entries = st.get("entries", {})
     acked = read_acks()
     working = active_pr_work()
@@ -601,6 +874,7 @@ def build_pr_board() -> dict:
                "on_reviewers": 0, "in_progress": 0}
     act_first = []
     notes_other = []
+    all_rows = []
     snoozed = 0
     for eid, e in entries.items():
         der = e.get("derived", {}) or {}
@@ -622,13 +896,23 @@ def build_pr_board() -> dict:
         task = working.get(key) if key else None
         astray = "astray" in flags and not task
         if task:
-            buckets["in_progress"] += 1
+            bucket = "in_progress"
         elif astray:
-            buckets["going_astray"] += 1
-        elif wait in BUCKET_OF:
-            buckets[BUCKET_OF[wait]] += 1
+            bucket = "going_astray"
+        else:
+            # An entry whose `waiting_on` is not one of the four the board
+            # counts lands in no tile at all. That used to make it invisible;
+            # it now still gets a row, labelled for what it is.
+            bucket = BUCKET_OF.get(wait)
+        if bucket:
+            buckets[bucket] += 1
         # The operator's memory-trail note — the last manual action per PR.
         note = (e.get("manual") or {}).get("note") or None
+        # Its auto half: what the spotter last saw HAPPEN to this PR, ranked
+        # (track.py's LAST_ACTIVITY_KINDS) and sticky between events. Passed
+        # through whole — {kind, summary, at} — because the panel renders the
+        # words and dashboard-v2 reads the same rows for its own view.
+        last_activity = e.get("last_activity") or None
         title = pr.get("title") or lin.get("title") or eid
         url = pr.get("url") or lin.get("url") or ""
         repo = pr.get("repo") or (key.split("#")[0] if key else "")
@@ -637,19 +921,35 @@ def build_pr_board() -> dict:
         rec = {
             "id": eid, "key": key, "url": url, "title": title,
             "repo": repo, "number": number, "note": note,
+            "pr_state": (pr.get("state") or "").upper(),
+            "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName"),
+            "last_activity": last_activity,
             "idle_days": der.get("idle_days"), "age_days": der.get("age_days"),
             "comments": pr.get("comments"), "flags": flags,
             "linear_id": lin.get("id"), "project": lin.get("project"),
             "astray": astray, "waiting_on": wait,
+            # The reason this row is here, in words — see pr_why(). Named
+            # `why` and not `reason`, which this file already spends on the
+            # night-shift queue's `queued_reason` (build_night), so a reader
+            # holding one of these dicts never has to ask which reason it is.
+            "why": pr_why(e, entries),
             # waiting_on stays the honest derived value; in_progress is the
             # override the board renders on, with the task id as its evidence.
             "in_progress": bool(task), "estate_task": task,
             # Unseen until the operator has acknowledged *this* signature. One they have
             # never acked reads as unseen, which is the honest default.
             "sig": sig, "activity_at": moved_at, "unseen": acked.get(eid) != sig,
+            # Which tile counted this entry, so a row and the number above it
+            # can be reconciled by reading rather than by arithmetic.
+            "bucket": bucket, "bucket_label": BUCKET_LABEL.get(bucket, "unbucketed"),
             # P-03: on every row, live or held. See pr_freshness().
             **pr_freshness(e),
         }
+        # every non-snoozed tracked entry, whether or not it earns a row
+        # above. Entries in a tile-only bucket used to reach the page as a
+        # tile number and nothing else — not even in the data model, so nothing downstream
+        # could have rendered them either.
+        all_rows.append(rec)
         # act-first = things in *our* court: astray (nudge) + waiting-on-you,
         # minus anything a worker currently owns.
         if task:
@@ -661,6 +961,7 @@ def build_pr_board() -> dict:
             # noted PR that won't get an act-first row — still surface its note
             # so the last action per PR stays visible.
             notes_other.append(rec)
+    stacks = annotate_pr_stacks(all_rows)
     # astray first (idle in someone else's court, most stale), then oldest-idle
     act_first.sort(key=lambda r: (not r["astray"], -(r["idle_days"] or 0)))
     # other noted PRs newest-note first (notes lead with an ISO date)
@@ -684,11 +985,29 @@ def build_pr_board() -> dict:
          for r in (st.get("sources") or {}).values()
          if isinstance(r, dict) and not r.get("ok")),
         key=lambda r: str(r["source"]))
+    # The full inventory, act-first order first so the two lists agree about
+    # what matters, then everything else by how long it has been idle.
+    order = {r["id"]: i for i, r in enumerate(act_first)}
+    all_rows.sort(key=lambda r: (order.get(r["id"], len(order)),
+                                 -(r["idle_days"] or 0), str(r["key"] or r["id"])))
+    # A board the spotter carried forward on a failed fetch is real data that
+    # is only PARTLY re-read, which is `observed` + partial and never a warrant
+    # class of its own (docs/absence-contract.md, "partial — a modifier").
+    reading = panels.envelope(
+        "pr_board", "state/pr-tracker/state.json", outcome, now=now,
+        partial=bool(outcome == panels.OUT_OK and (held or unreadable)),
+        as_of=st.get("last_run"), count=len(all_rows), why=why,
+        detail={"held": len(held),
+                "unreadable_sources": [s["source"] for s in unreadable]})
     return {"buckets": buckets, "act_first": act_first,
             "notes_other": notes_other, "meta": meta, "snoozed": snoozed,
             "in_progress_tasks": working,
+            "stacks": stacks,
             "unobserved": len(held), "unobserved_ids": sorted(held),
-            "unreadable_sources": unreadable}
+            "unreadable_sources": unreadable,
+            # every non-snoozed tracked entry, reachable.
+            "all_rows": all_rows, "tracked": len(all_rows),
+            "reading": reading}
 
 
 # ── night-shift queue + last-night report ────────────────────────────────────
@@ -699,8 +1018,12 @@ STATUS_RANK = {"needs-you": 0, "failed": 1, "queued": 2, "in-progress": 3,
                "running": 3, "done": 4}
 
 
-def build_night() -> dict:
-    q = read_json(STATE / "pr-reviewer" / "queue.json") or {}
+def build_night(now: float | None = None) -> dict:
+    q, outcome, why = panels.read_producer_json(
+        STATE / "pr-reviewer" / "queue.json")
+    if outcome == panels.OUT_OK and not isinstance(q, dict):
+        q, outcome, why = None, panels.OUT_UNREADABLE, "queue.json is not an object"
+    q = q if isinstance(q, dict) else {}
     items = []
     for iid, it in (q.get("items") or {}).items():
         kind = it.get("kind", "pr")
@@ -726,18 +1049,38 @@ def build_night() -> dict:
         found = re.search(rf"\*\*{re.escape(label)}\*\*\s*(\d+)", nr)
         if found:
             report[key] = int(found.group(1))
-    return {"queue": items, "report": report}
+    return {"queue": items, "report": report,
+            "reading": panels.envelope(
+                "night", "state/pr-reviewer/queue.json", outcome, now=now,
+                as_of=q.get("updated_at"), count=len(items), why=why)}
 
 
 # ── focus projects (momentum cards) ──────────────────────────────────────────
 
-def build_focus() -> dict:
+def build_focus(registry: dict | None = None, now: float | None = None) -> dict:
     """Read the focus-projects engine's data model (state/focus/focus.json).
     Pure consumer — the focus engine owns all issue-tracker access + scoring;
-    the dashboard only renders. Absent/empty file => not available."""
-    model = read_json(STATE / "focus" / "focus.json")
+    the dashboard only renders.
+
+    `available: False` used to be the single answer for "the engine has never
+    run", "its file will not parse" and "no loop in this estate produces this
+    panel at all". Those are a hole, a break and a boundary.
+    """
+    model, outcome, why = panels.read_producer_json(STATE / "focus" / "focus.json")
+    if outcome == panels.OUT_OK and not isinstance(model, dict):
+        model, outcome, why = None, panels.OUT_UNREADABLE, "focus.json is not an object"
+    if (outcome == panels.OUT_NO_STATE and registry is not None
+            and "focus-projects" not in (registry.get("loops") or {})):
+        outcome = panels.OUT_NOT_CONFIGURED
+        why = "no focus-projects loop is registered in loops.toml"
+
+    def reading(count):
+        return panels.envelope(
+            "focus", "state/focus/focus.json", outcome, now=now,
+            as_of=(model or {}).get("generated_at"), count=count, why=why)
+
     if not model or not model.get("projects"):
-        return {"available": False, "projects": []}
+        return {"available": False, "projects": [], "reading": reading(0)}
     # The engine's generated model is intentionally focused on momentum data;
     # its small declaration file remains authoritative for project URLs. Join
     # those URLs by stable project key for consumers that want navigation.
@@ -754,7 +1097,7 @@ def build_focus() -> dict:
                 for p in model.get("projects", [])]
     return {"available": True, "generated_at": model.get("generated_at"),
             "batch_cap": model.get("batch_cap"),
-            "projects": projects}
+            "projects": projects, "reading": reading(len(projects))}
 
 
 # ── morning brief (recent reports; latest retained for snapshot consumers) ──
@@ -806,10 +1149,20 @@ def brief_manifest_for(date: str) -> dict:
     return brief_manifest.load(STATE / "morning-brief", date)
 
 
-def build_brief() -> dict:
-    reports = sorted(glob.glob(str(STATE / "morning-brief" / "reports" / "*.md")))
+def build_brief(now: float | None = None) -> dict:
+    report_dir = STATE / "morning-brief" / "reports"
+    reports = sorted(glob.glob(str(report_dir / "*.md")))
     if not reports:
-        return {"available": False, "reports": []}
+        # "the briefer has never written a report" and "its report directory is
+        # gone" both used to render the same friendly first-brief placeholder.
+        outcome = (panels.OUT_NO_STATE if report_dir.is_dir()
+                   else panels.OUT_NO_STATE)
+        why = ("no brief has been written yet" if report_dir.is_dir()
+               else f"{report_dir} does not exist — the briefer has never run here")
+        return {"available": False, "reports": [],
+                "reading": panels.envelope(
+                    "brief", "state/morning-brief/reports/", outcome,
+                    now=now, count=0, why=why)}
     recent = []
     for report in reversed(reports[-5:]):
         path = Path(report)
@@ -820,9 +1173,22 @@ def build_brief() -> dict:
     latest = recent[0]
     snapshot = (latest["manifest"].get("spotter_snapshot") or {}).get("sha256")
     live = spotter_snapshot_now()
+    # The panel's own reading is about the REPORT FILE — whether this page
+    # could read the morning's digest at all. What each of the brief's ten
+    # gatherers saw is a separate, finer question the manifest already answers
+    # and the source strip already renders; the two are not merged, exactly as
+    # P-11's statuses and P-08's verdicts are not merged.
+    latest_path = Path(reports[-1])
+    reading = panels.envelope(
+        "brief", "state/morning-brief/reports/", panels.OUT_OK, now=now,
+        partial=not latest["body"].strip(),
+        as_of=panels.mtime(latest_path), count=len(recent),
+        why=("the latest report file is empty" if not latest["body"].strip()
+             else None))
     return {"available": True, "name": latest["name"],
             "body": latest["body"], "delivery": latest["delivery"],
-            "manifest": latest["manifest"],
+            "manifest": latest["manifest"], "reading": reading,
+            "latest_date": latest["date"],
             # True only when BOTH hashes are known and differ. Unknown is not
             # drift: a legacy manifest and an unreadable board both mean we
             # cannot compare, and saying "the board moved" on that would be
@@ -833,10 +1199,22 @@ def build_brief() -> dict:
 
 # ── mechanic proposals ───────────────────────────────────────────────────────
 
-def build_mechanic() -> dict:
-    md = read_text(STATE / "mechanic" / "REPORT.md")
+def build_mechanic(now: float | None = None) -> dict:
+    report = STATE / "mechanic" / "REPORT.md"
+    md, outcome, why = panels.read_producer_text(report)
+
+    def reading(count, partial=False, note=None):
+        return panels.envelope(
+            "mechanic", "state/mechanic/REPORT.md", outcome, now=now,
+            partial=partial, as_of=panels.mtime(report), count=count,
+            why=note or why)
+
     if md is None:
-        return {"date": None, "proposals": [], "applied": None, "observations": []}
+        # "no proposals tonight" is a real and common answer. "the mechanic's
+        # report is not there" is a different one, and this panel rendered
+        # both as an empty card reading `No pending proposals.`.
+        return {"date": None, "proposals": [], "applied": None,
+                "observations": [], "reading": reading(0)}
     date = None
     dm = re.search(r"night of (.+)", md.splitlines()[0]) if md.splitlines() else None
     if dm:
@@ -890,8 +1268,16 @@ def build_mechanic() -> dict:
     obs = [re.sub(r"^-\s+", "", b) for b in bullets(section("Observations"))]
     applied_lines = [l.strip() for l in section("Applied") if l.strip()]
     applied = " ".join(applied_lines) if applied_lines else None
+    # A report with no "Proposals" heading at all is one this parser could only
+    # partly read: the file answered, and the part that would carry a proposal
+    # is exactly the part it could not find.
+    no_section = not sections or not any(
+        "proposals" in k.lower() for k in sections)
     return {"date": date, "proposals": proposals, "applied": applied,
-            "observations": obs}
+            "observations": obs,
+            "reading": reading(len(proposals), partial=no_section,
+                               note=("the report has no Proposals section"
+                                     if no_section else None))}
 
 
 # ── ledger tail ──────────────────────────────────────────────────────────────
@@ -950,6 +1336,35 @@ def build_ledger(loops: list[str] | None = None) -> list[dict]:
             for r in rows]
 
 
+def ledger_reading(rows: list[dict], now: float | None = None) -> dict:
+    """The Recent-activity panel's warrant.
+
+    `tail_jsonl` returns `[]` for an absent ledger, an unreadable one and a
+    genuinely empty one, and the panel rendered all three as a blank list. The
+    estate's ledger is append-only and never legitimately empty, so this is the
+    panel where the confident zero was least believable and least visible.
+    """
+    path = STATE / "ledger.jsonl"
+    if not path.exists():
+        return panels.envelope("ledger", "state/ledger.jsonl",
+                               panels.OUT_NO_STATE, now=now, count=0,
+                               why="the central ledger does not exist")
+    try:
+        path.open("rb").close()
+    except OSError as err:
+        return panels.envelope("ledger", "state/ledger.jsonl",
+                               panels.OUT_ERROR, now=now, count=0,
+                               why=f"the central ledger could not be read: {err}")
+    # A tail that parsed nothing out of a file with bytes in it is a file this
+    # reader could not use, not a quiet estate.
+    unreadable = bool(not rows and path.stat().st_size > 0)
+    return panels.envelope(
+        "ledger", "state/ledger.jsonl",
+        panels.OUT_UNREADABLE if unreadable else panels.OUT_OK, now=now,
+        as_of=(rows[0].get("ts") if rows else None), count=len(rows),
+        why=("no line in the ledger tail would parse" if unreadable else None))
+
+
 # ── Claude Code usage (local, token-free rolling-window aggregate) ────────────
 # What `/usage` shows — the account-wide %-of-5h-limit — is server-side rate-limit
 # state fetched live from Anthropic; it is NOT persisted anywhere locally. But the
@@ -992,37 +1407,7 @@ def _iter_usage_records(raw: bytes):
     Mirrors the original inline parse exactly (substring prefilter, timestamp +
     non-empty usage requirement); the caller applies the window cutoff so old
     lines can be cached and pruned without changing any total."""
-    for line in raw.decode("utf-8", "ignore").splitlines():
-        if '"usage"' not in line:
-            continue
-        try:
-            d = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        ts = d.get("timestamp")
-        if not ts:
-            continue
-        try:
-            t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-        except (ValueError, AttributeError):
-            continue
-        message = d.get("message") or {}
-        u = message.get("usage") or {}
-        if not u:
-            continue
-        # [t, usage, model, loop, sid] — compact list keeps the cache small.
-        yield [t, u, message.get("model"),
-               _cwd_to_loop(d.get("cwd")), d.get("sessionId") or d.get("session_id")]
-
-
-def _write_cache(path: Path, data: dict) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        pass  # cache is best-effort; a failed write just re-reads next pass
+    yield from transcript_usage.iter_usage_records(raw, _cwd_to_loop)
 
 
 def _scan_records(cutoff_ts: float, byte_cap: int) -> list[list]:
@@ -1030,61 +1415,9 @@ def _scan_records(cutoff_ts: float, byte_cap: int) -> list[list]:
     the transcript tree, reading only bytes appended since the last pass. Applies
     the same mtime pre-filter as before (files last touched before the cutoff hold
     no in-window line) and refreshes the on-disk checkpoint cache."""
-    base = _transcript_base()
-    cache_path = _transcript_cache_path()
-    cached = read_json(cache_path)
-    files_cache = cached.get("files") if isinstance(cached, dict) else None
-    if not isinstance(files_cache, dict):
-        files_cache = {}
-
-    records: list[list] = []
-    new_cache: dict[str, dict] = {}
-    read_bytes = 0
-    for p in sorted(base.glob("*/*.jsonl")):
-        try:
-            stt = p.stat()
-        except OSError:
-            continue
-        if stt.st_mtime < cutoff_ts:
-            continue  # entirely out of window — and dropped from the cache
-        key = str(p)
-        prev = files_cache.get(key)
-        # Reuse the checkpoint only when the file is the same inode and hasn't
-        # shrunk below our offset (rotation/truncation → full reparse from 0).
-        if (isinstance(prev, dict) and prev.get("inode") == stt.st_ino
-                and isinstance(prev.get("offset"), int)
-                and 0 <= prev["offset"] <= stt.st_size):
-            offset = prev["offset"]
-            lines = list(prev.get("lines") or [])
-        else:
-            offset, lines = 0, []
-
-        if offset < stt.st_size and read_bytes < byte_cap:
-            try:
-                with p.open("rb") as f:
-                    f.seek(offset)
-                    chunk = f.read()
-            except OSError:
-                chunk = b""
-            read_bytes += len(chunk)
-            # Only consume through the last complete line; a partial trailing
-            # line (mid-append) stays unconsumed so it is counted once, later.
-            nl = chunk.rfind(b"\n")
-            if nl >= 0:
-                for rec in _iter_usage_records(chunk[:nl + 1]):
-                    lines.append(rec)
-                offset += nl + 1
-
-        # Prune to the window for both the returned set and what we re-cache.
-        kept = [ln for ln in lines if ln[0] >= cutoff_ts]
-        records.extend(kept)
-        new_cache[key] = {"inode": stt.st_ino, "size": stt.st_size,
-                          "mtime": stt.st_mtime, "offset": offset, "lines": kept}
-        if read_bytes >= byte_cap:
-            break  # safety ceiling; steady-state appends never approach it
-
-    _write_cache(cache_path, {"version": 1, "files": new_cache})
-    return records
+    return transcript_usage.scan_records(
+        cutoff_ts, byte_cap, base=_transcript_base(),
+        cache_path=_transcript_cache_path(), cwd_to_actor=_cwd_to_loop)
 
 
 def build_usage(now: datetime, registry: dict) -> dict:
@@ -1119,7 +1452,8 @@ def build_usage(now: datetime, registry: dict) -> dict:
         lambda: {"tokens": 0, "cost_usd": 0.0, "loop": "other"})
     # records are [t, usage, model, loop, sid], already in glob+append order and
     # window-filtered by _scan_records; the accumulation below is unchanged.
-    for t, u, model, loop, sid in records:
+    for record in records:
+        t, u, model, loop, sid = record[:5]
         if t < cutoff_ts:
             continue
         msgs += 1
@@ -1185,18 +1519,110 @@ def build_usage(now: datetime, registry: dict) -> dict:
 def build_cap_signal() -> dict | None:
     return read_json(STATE / "usage" / "budget.json")
 
-def build_estate_activity(registry: dict | None = None) -> dict:
+# ── what the periodic snapshot carries, and what it does not ────────
+#
+# THE SNAPSHOT CARRIES THE COLLAPSED ROW; THE DRILL-DOWN IS FETCHED. Every
+# open browser tab refetches the WHOLE of dashboard.json every 30 seconds, so
+# a byte that only a <details> body renders is a byte re-parsed thousands of
+# times a day to be looked at never. Left eager, `estate_activity` grows to
+# most of dashboard.json, and grows every night with no cap: the bulk of it a
+# full per-task event join over every task ever created, and most of the rest
+# the raw `refs` blob that the followup/proposal/message views on the same row
+# were already derived FROM.
+#
+# THIS IS NOT THE TRUNCATION THAT BROKE THE DRILL-DOWN BEFORE. Read the P-16
+# note inside build_estate_activity: a prior fix answered "what happened to
+# this task" out of the 80-row recent-events tail, which silently emptied the
+# history of every task whose events had scrolled off it. Nothing here answers
+# that question from a smaller set. The question is answered by
+# `GET /estate-detail?task=t-N` (bin/dashboard-server), off the SAME
+# authoritative table through the SAME `estate_events.select` query surface,
+# on the one occasion a person actually opens the row. A bounded eager
+# payload plus a complete on-demand read is a different shape from a bounded
+# answer, and only the second one lies.
+#
+# The client must be able to tell "this snapshot does not carry the history"
+# from "this task has no history", which is docs/absence-contract.md at a
+# rendering boundary — so `task_events_source` says which, and an empty
+# `task_events` map is never on its own an answer.
+
+# Fields only a task's <details> body renders. `refs` is the whole envelope
+# `followup_view`/`proposal_view`/`message_view`/`decision_surface` were
+# already derived from server-side (lib/estate_work.py), so eagerly shipping
+# it is the same bytes twice for a <pre> nobody sees until they click.
+DRILLDOWN_FIELDS = ("refs",)
+
+# What a COLLAPSED row needs: everything `taskRow`'s badges and `haystack`'s
+# search string read (lib/dashboard_estate.py). A task nothing else in this
+# snapshot points at ships this and no more, so the Terminal/All tabs, the
+# by-id lookup and the search box keep working over the whole store
+# while the row's body comes from the endpoint.
+SUMMARY_FIELDS = ("id", "seq", "title", "status", "kind", "stage", "lane",
+                  "intent", "created_at", "updated_at", "closed_at",
+                  "claimed_by", "project_id", "project_title", "is_attention")
+
+
+def snapshot_task_ids(work: dict) -> set[str]:
+    """Every task some OTHER part of this snapshot points AT, by id.
+
+    `attention`, `followups`, `proposals` and `inbox_messages` are ordered
+    lists of ids that index into `tasks` (lib/estate_work.build), and each of
+    those panels renders its rows' bodies without a click — a resolved
+    follow-up behind the History toggle, a rejected proposal behind its stage
+    tab. A real project's rollup names its tasks the same way. Dropping any of
+    those rows to a summary would empty a panel, which is the one failure this
+    change must not cause, so they keep their full row.
+
+    Terminal tasks nothing points at are the residue this bounds, and on a
+    long-lived store they are the majority of rows.
+    """
+    keep = {t["id"] for t in work["tasks"]
+            if (t.get("status") or "") not in estate_work.TERMINAL}
+    for key in ("attention", "followups", "proposals", "inbox_messages"):
+        keep.update(work.get(key) or ())
+    for project in work.get("projects") or ():
+        # The synthetic "unprojected" bucket names EVERY unprojected task and
+        # has no history of its own (see `projectHistory`), so following it
+        # would keep the whole store and bound nothing.
+        if not project.get("unprojected"):
+            keep.update((project.get("rollup") or {}).get("task_ids") or ())
+    return keep
+
+
+def bound_tasks(work: dict) -> list[dict]:
+    """`work["tasks"]` with the drill-down taken out of it.
+
+    Every task still ships a row — the store's task list stays complete and
+    countable — but a row is either the full view minus its drill-down-only
+    fields, or, for a terminal task nothing points at, the collapsed row alone
+    marked `summary_only`. Both are completed by the same endpoint.
+    """
+    keep = snapshot_task_ids(work)
+    rows = []
+    for task in work["tasks"]:
+        if task["id"] in keep:
+            rows.append({k: v for k, v in task.items()
+                         if k not in DRILLDOWN_FIELDS})
+            continue
+        row = {k: task[k] for k in SUMMARY_FIELDS if k in task}
+        row["summary_only"] = True
+        rows.append(row)
+    return rows
+
+
+def build_estate_activity(registry: dict | None = None,
+                          now: float | None = None, *, include_stewards: bool = False) -> dict:
     # Loop names from the live registry, so a loop added to loops.toml is
     # classified as a loop without editing lib/actors.py.
     loop_names = sorted((registry or {}).get("loops", {}))
-    out = {"available": False, "tasks": [], "task_counts": {}, "kind_counts": {}, "stage_counts": {}, "events": [], "task_events": {}, "project_events": {}, "projects": [], "project_counts": {}, "dependencies": [], "dep_counts": {}, "attention": [], "attention_counts": {}, "followups": [], "followup_counts": {}, "proposals": [], "proposal_counts": {}, "inbox_messages": [], "inbox_message_counts": {}, "extractions": {"available": False, "items": [], "counts": {}}, "memories": {"available": False, "items": [], "counts": {}, "phase": "M0 not initialized"}}
+    out = {"available": False, "tasks": [], "task_counts": {}, "kind_counts": {}, "stage_counts": {}, "events": [], "task_events": {}, "task_events_source": "unavailable", "project_events": {}, "projects": [], "project_counts": {}, "dependencies": [], "dep_counts": {}, "attention": [], "attention_counts": {}, "attention_tiers": [], "attention_pairs": {}, "followups": [], "followup_counts": {}, "proposals": [], "proposal_counts": {}, "inbox_messages": [], "inbox_message_counts": {}, "extractions": {"available": False, "items": [], "counts": {}}, "memories": {"available": False, "items": [], "counts": {}, "phase": "M0 not initialized"}}
     db = STATE / "estate.db"
     if db.exists():
         try:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
             conn.row_factory = sqlite3.Row
             # ONE composed read for tasks, projects, edges, attention and
-            # decoded follow-ups (t-135, lib/estate_work.py). Every field it
+            # decoded follow-ups the contract, lib/estate_work.py). Every field it
             # adds is derived on this read and none is stored: `blocked_by`
             # keeps a blocked task at status='ready' because being blocked is a
             # fact about its neighbours (P-18), `due_state` moves with the
@@ -1204,11 +1630,15 @@ def build_estate_activity(registry: dict | None = None) -> dict:
             # counted from the task rows rather than kept in a column that has
             # to be re-written every time a task moves.
             work = estate_work.build(conn)
-            out["tasks"] = work["tasks"]
+            # the contract — bounded to the collapsed row (see THE SNAPSHOT CARRIES
+            # THE COLLAPSED ROW above). Every task still ships; what leaves is
+            # the drill-down.
+            out["tasks"] = bound_tasks(work)
             for key in ("projects", "project_counts", "dependencies",
                         "dep_counts", "attention", "attention_counts",
-                        "followups", "followup_counts", "proposals",
-                        "proposal_counts", "inbox_messages",
+                        "attention_tiers", "attention_pairs",
+                        "followups", "followup_counts",
+                        "proposals", "proposal_counts", "inbox_messages",
                         "inbox_message_counts"):
                 out[key] = work[key]
             out["notice_days"] = work["notice_days"]
@@ -1217,21 +1647,28 @@ def build_estate_activity(registry: dict | None = None) -> dict:
             # above (P-16). The panel's recent-activity list is a tail by
             # design; a task's own history is not, and reading it out of that
             # tail silently emptied the drill-down of every task whose events
-            # had scrolled off. Same query surface `estate events` uses, so the
-            # CLI and the page can never answer this differently. One indexed
-            # lookup per task (idx_events_task).
+            # had scrolled off. That requirement is UNCHANGED and the contract did
+            # not weaken it: the same `estate_events.select` query surface, on
+            # the same authoritative table, still answers it in full — from
+            # `GET /estate-detail` when a person opens the row, rather than for
+            # all 1,452 tasks every 60 seconds whether anyone looks or not.
+            #
+            # `task_events_source` is what keeps that honest. An empty map is
+            # ambiguous — a store with no history and a snapshot that stopped
+            # carrying it look identical — so the snapshot SAYS which
+            # (docs/absence-contract.md), and no reader may conclude "no
+            # events" from the map alone.
             try:
-                out["task_events"] = {
-                    task["id"]: [actors.normalize_row(dict(r), loop_names)
-                                 for r in estate_events.select(conn, {"task": task["id"]})]
-                    for task in out["tasks"]}
+                estate_events.select(conn, {"task": ""}, limit=1)
+                out["task_events_source"] = "on-demand"
             except estate_events.MissingColumn:
                 # A store too old to link events to tasks has no drill-down to
-                # show. Same rule as blocked_by: a derived view must never take
-                # down the panel that carries it.
-                out["task_events"] = {}
+                # show, and the endpoint cannot invent one. Same rule as
+                # blocked_by: a derived view must never take down the panel
+                # that carries it.
+                out["task_events_source"] = "unavailable"
             # A project's OWN history, from the same authoritative table
-            # (§4.9 of t-124's report) — and ONLY the rows no task already
+            # (§4.9 of the contract's report) — and ONLY the rows no task already
             # carries. An event written against a project's task names both
             # ids, so an unfiltered `--project p-1` read would ship every one
             # of those rows a second time; on the live store that was 55kB of
@@ -1282,7 +1719,7 @@ def build_estate_activity(registry: dict | None = None) -> dict:
             except json.JSONDecodeError: continue
             if isinstance(row, dict): ledger_rows.append(actors.normalize_row(row, loop_names))
     # Counted on the canonical actor, so the operator is ONE total rather than a
-    # `hub` total and a hub-persona total, and the ephemeral tail collapses into
+    # `hub` total and a `ops` total, and the ephemeral tail collapses into
     # a single chip instead of ~20 one-row chips. by_class is the coarse read;
     # by_session traces which dispatches wrote the ephemeral rows.
     by_actor, by_kind, by_class = defaultdict(int), defaultdict(int), defaultdict(int)
@@ -1308,6 +1745,25 @@ def build_estate_activity(registry: dict | None = None) -> dict:
                         "body": body or "", "path": str(path),
                         "bytes": len((body or "").encode("utf-8"))})
     out["memories"]["private"] = private
+    # the contract. `available: False` was already here and is honest as far as it
+    # goes, but nothing said WHY — an estate store that has never been created
+    # and one sqlite refused to open produced the same flag, and the proposal
+    # panel on `/` renders entirely from this.
+    if out["available"]:
+        estate_outcome, estate_why = panels.OUT_OK, None
+    elif not db.exists():
+        estate_outcome = panels.OUT_NO_STATE
+        estate_why = "state/estate.db has never been created"
+    else:
+        estate_outcome = panels.OUT_ERROR
+        estate_why = out.get("error") or "state/estate.db could not be opened"
+    out["reading"] = panels.envelope(
+        "estate_activity", "state/estate.db", estate_outcome, now=now,
+        as_of=now, count=len(out["tasks"]), why=estate_why)
+    if include_stewards:
+        # Match full refs before the global snapshot drops drill-down fields.
+        source = {**out, "tasks": work["tasks"]} if out["available"] else out
+        out["stewards"] = dashboard_stewards.gather(STATE, source, now)
     return out
 
 
@@ -1326,17 +1782,62 @@ def build_snapshot() -> dict:
     registry = tomllib.loads(raw)
     dashboard_config = registry.get("dashboard", {})
     # One agent-deck read for the whole snapshot — the per-loop status sweep and
-    # the ephemeral list both index into it (was one `session show` per loop plus
+    # the dispatch-session list both index into it (was one `session show` per loop plus
     # a separate `ls --json`).
-    deck = deck_ls()
+    deck, deck_outcome, deck_why = deck_ls()
     loops = build_loops(registry, now, deck_index(deck))
-    pr_board = build_pr_board()
-    night = build_night()
-    focus = build_focus()
-    mechanic = build_mechanic()
-    ephemeral = build_ephemeral(now_dt, deck)
+    pr_board = build_pr_board(now)
+    night = build_night(now)
+    focus = build_focus(registry, now)
+    today = build_today(now)
+    mechanic = build_mechanic(now)
+    dispatches, disp_outcome, disp_why = read_dispatches()
+    dispatch_sessions = build_dispatch_sessions(
+        now_dt, deck, dispatches, dispatches_known=disp_outcome == panels.OUT_OK)
     usage = build_usage(now_dt, registry)
     usage["cap"] = build_cap_signal()
+    usage["codex"] = build_codex_signal(now_dt)
+    brief = build_brief(now)
+    ledger = build_ledger(sorted(registry.get("loops", {})))
+    estate_activity = build_estate_activity(registry, now, include_stewards=True)
+    stewards = estate_activity.pop("stewards")
+
+    # ── what each panel could see the contract, docs/dashboard-panel-contract.md) ──
+    # One envelope per panel, on the snapshot rather than buried in each
+    # section's own shape, so a renderer that owns a panel — and three of them
+    # do — reads the warrant the same way the shared renderer does.
+    #
+    # Loops and dispatch sessions share the deck component of the latter's
+    # warrant: a deck that will not answer makes every loop look session-down
+    # AND prevents live dispatch joins, from the same `[]`. The dispatch panel
+    # additionally covers the tracker read that supplies persistent membership.
+    deck_detail = {"sessions": len(deck)}
+    panel_readings = {
+        "today": today["reading"],
+        "loops": panels.envelope(
+            "loops", "agent-deck ls --json", deck_outcome, now=now,
+            as_of=now if deck_outcome == panels.OUT_OK else None,
+            count=len(loops), why=deck_why, detail=deck_detail),
+        "dispatch_sessions": panels.envelope(
+            "dispatch_sessions",
+            "agent-deck ls --json + state/hub/dispatches.json",
+            deck_outcome, now=now,
+            partial=bool(deck_outcome == panels.OUT_OK
+                         and disp_outcome != panels.OUT_OK),
+            as_of=now if deck_outcome == panels.OUT_OK else None,
+            count=len(dispatch_sessions),
+            why=(deck_why if deck_outcome != panels.OUT_OK else
+                 (f"the dispatch tracker did not answer ({disp_outcome}): "
+                  f"{disp_why}" if disp_outcome != panels.OUT_OK else None)),
+            detail=deck_detail),
+        "night": night["reading"],
+        "focus": focus["reading"],
+        "pr_board": pr_board["reading"],
+        "mechanic": mechanic["reading"],
+        "brief": brief["reading"],
+        "ledger": ledger_reading(ledger, now),
+        "estate_activity": estate_activity["reading"],
+    }
 
     live = sum(1 for l in loops if l["session_present"]
                and (l["autostart"] or l["is_hub"]))
@@ -1348,21 +1849,23 @@ def build_snapshot() -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "generated_epoch": int(now),
         "host": socket.gethostname(),
-        # Header identity, in the order an install is most likely to have set
-        # it: the dashboard's own labels, else the [hub] identity every other
-        # component already reads, else the neutral default.
         "estate": dashboard_config.get("estate_name") or ESTATE,
         "operator": dashboard_config.get("operator_name") or HUB_PERSONA,
+        "priority_headings": dashboard_config.get("priority_headings") or [],
         "loops": loops,
-        "ephemeral": ephemeral,
+        "dispatch_sessions": dispatch_sessions,
         "usage": usage,
         "pr_board": pr_board,
         "night": night,
         "focus": focus,
-        "brief": build_brief(),
+        "today": today,
+        "brief": brief,
         "mechanic": mechanic,
-        "ledger": build_ledger(sorted(registry.get("loops", {}))),
-        "estate_activity": build_estate_activity(registry),
+        "ledger": ledger,
+        "estate_activity": estate_activity,
+        "stewards": stewards,
+        "panels": panel_readings,
+        "panel_counts": panels.counts(panel_readings),
         "vitals": {
             "loops_live": live,
             "loops_ondemand": ondemand,
@@ -1370,7 +1873,7 @@ def build_snapshot() -> dict:
             "going_astray": pr_board["buckets"]["going_astray"],
             "queue_queued": queued,
             "queue_needs_you": needs_you_q,
-            "proposals": len(mechanic["proposals"]),
+            "proposals": pending_proposal_count(estate_activity),
         },
     }
 
@@ -1453,6 +1956,17 @@ body{
 }
 a{color:inherit;text-decoration:none}
 .wrap{max-width:1240px;margin:0 auto;padding:26px 22px 64px}
+
+/* ── page nav: the same bar, same place, on every served page ── */
+.page-nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  padding-bottom:14px;margin-bottom:18px;border-bottom:1px solid var(--hair)}
+.page-nav .pn-link{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--dim);background:var(--surface);
+  border:1px solid var(--edge);border-radius:20px;padding:7px 13px;text-decoration:none}
+.page-nav .pn-link:hover{color:var(--ink);border-color:var(--accent)}
+.page-nav .pn-link.on{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+.page-nav .pn-grow{flex:1 1 20px}
+.page-nav .themebtn{align-self:center}
 
 /* ── header ─────────────────────────────── */
 .masthead{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 26px;
@@ -1582,6 +2096,20 @@ a{color:inherit;text-decoration:none}
 .prttl{font-size:13px;color:var(--ink);flex:1;min-width:0;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .prrow:hover .prttl{white-space:normal}
+.prstacks{margin:10px 0 12px;border:1px solid var(--edge);border-radius:9px;
+  overflow:hidden;background:var(--surface-2)}
+.prstacks-head{padding:7px 10px;font-size:9.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--faint);border-bottom:1px solid var(--hair)}
+.prstack{padding:7px 9px;background:var(--surface)}
+.prstack+.prstack{border-top:1px solid var(--edge)}
+.prstack-row{display:grid;grid-template-columns:28px minmax(0,1fr) auto;
+  gap:7px;align-items:baseline;padding:5px 4px 5px calc(4px + var(--stack-depth)*14px)}
+.prstack-row+.prstack-row{border-top:1px solid var(--hair)}
+.prstack-step{font-size:9px;color:var(--accent);font-family:var(--mono)}
+.prstack-link{min-width:0;color:var(--ink);font-size:11.5px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.prstack-link:hover{color:var(--accent)}
+.prstack-base{font-size:9px;color:var(--faint);white-space:nowrap}
 .r2{display:flex;align-items:center;gap:8px;margin-top:5px;flex-wrap:wrap;
   font-size:10.5px;color:var(--faint)}
 .tag{font-size:9.5px;letter-spacing:.04em;padding:2px 6px;border-radius:5px;
@@ -1600,6 +2128,15 @@ a{color:inherit;text-decoration:none}
   margin:0 2px 8px;line-height:1.45}
 .idle-d{font-variant-numeric:tabular-nums}
 .idle-d.hot{color:var(--crit)} .idle-d.warm{color:var(--warn)}
+/* Why the row is here at all — the rule the badges above it are shorthand for.
+   Sits between the tags and the note on purpose: the tags say what state the
+   PR is in, this says what that means for the operator, and the note says what he last
+   did about it. Brighter than .prnote (--ink, not --dim) because it is the
+   line that answers the question the row provokes. */
+.prwhy{font-size:11.5px;color:var(--ink);margin-top:6px;line-height:1.45;
+  padding-left:16px;position:relative;font-family:var(--sans);white-space:normal}
+.prwhy::before{content:"→";position:absolute;left:0;top:0;color:var(--warn);
+  font-family:var(--mono)}
 /* the operator's manual last-action note (memory trail) */
 .prnote{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.45;
   padding-left:16px;position:relative;font-family:var(--sans);white-space:normal}
@@ -1607,6 +2144,17 @@ a{color:inherit;text-decoration:none}
   font-family:var(--mono)}
 .pn-date{color:var(--faint);font-variant-numeric:tabular-nums;font-family:var(--mono);
   font-size:10.5px}
+/* The spotter's auto line — what last HAPPENED to the PR. Same shape as the
+   manual note above it, different glyph and a dimmer rule, so the two are
+   never read as one field. */
+.practivity{font-size:11px;color:var(--faint);margin-top:4px;line-height:1.45;
+  padding-left:16px;position:relative;font-family:var(--sans);white-space:normal}
+.practivity::before{content:"◷";position:absolute;left:0;top:0;color:var(--dim);
+  font-family:var(--mono)}
+.practivity.ready{color:var(--dim)}
+.practivity.ready::before{color:var(--good)}
+.pa-when{color:var(--faint);font-variant-numeric:tabular-nums;
+  font-family:var(--mono);font-size:10px}
 .pno-wrap{margin-top:12px;padding-top:11px;border-top:1px solid var(--hair)}
 .pno-head{font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
   color:var(--faint);margin:0 2px 8px}
@@ -1703,6 +2251,53 @@ a{color:inherit;text-decoration:none}
 .srccut{font-size:10px;color:var(--faint);margin:0 0 8px;
   font-variant-numeric:tabular-nums}
 
+/* ── t-390: every panel's own three states ──
+   The chip above carries them on one axis each (status dot, freshness age);
+   these two banners are the states that must be impossible to scroll past. A
+   panel that could not be read is louder than a stale one on purpose: stale
+   numbers are true about an earlier estate, missing ones are true about
+   nothing. `current and empty` gets no banner at all — the chip is the mark,
+   and a fourth line under every healthy panel is a line nobody reads. */
+.pstate{margin-bottom:6px}
+.pabsent{font-size:11px;color:var(--crit);background:var(--crit-soft);
+  border:1px solid rgba(242,89,76,.45);border-left:3px solid var(--crit);
+  border-radius:7px;padding:8px 10px;margin:0 0 9px;line-height:1.5}
+.pstale,.ppartial{font-size:10.5px;color:var(--warn);background:var(--warn-soft);
+  border:1px solid rgba(226,169,60,.35);border-radius:7px;padding:6px 9px;
+  margin:0 0 9px;line-height:1.45}
+.pnote{font-size:10.5px;color:var(--warn);background:var(--warn-soft);
+  border:1px solid rgba(226,169,60,.35);border-radius:7px;padding:6px 9px;
+  margin:0 0 8px;line-height:1.45}
+
+/* ── t-390: the full tracked inventory ──
+   Every non-snoozed entry gets a row here, including the ones the act-first
+   list caps off and the ones that only ever reached the page as a tile
+   number. Collapsed by default: it is an index, not a feed. */
+.prall{margin-top:10px;border-top:1px solid var(--hair);padding-top:8px}
+.prall>summary{cursor:pointer;list-style:none;font-size:10.5px;color:var(--faint);
+  letter-spacing:.04em;padding:4px 2px}
+.prall>summary::-webkit-details-marker{display:none}
+.prall>summary::before{content:'›';display:inline-block;margin-right:6px;
+  color:var(--faint);transition:transform .12s}
+.prall[open]>summary::before{transform:rotate(90deg)}
+.prall>summary:hover{color:var(--ink)}
+.pall{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:baseline;
+  padding:6px 4px;border-bottom:1px solid var(--hair);font-size:11.5px;color:var(--dim)}
+.pall:last-child{border-bottom:0}
+.pall .pk{color:var(--ink);font-size:11.5px}
+.pall .pt{color:var(--dim)}
+.pall .pst{font-size:9.5px;letter-spacing:.05em;white-space:nowrap;
+  border:1px solid var(--edge);border-radius:5px;padding:1px 6px;color:var(--dim)}
+.pall .pst.waiting-on-you{color:var(--warn);border-color:rgba(242,171,53,.45)}
+.pall .pst.going-astray{color:var(--crit);border-color:rgba(242,89,76,.45)}
+.pall .pobs{grid-column:1/-1;font-size:10px;color:var(--faint);
+  font-variant-numeric:tabular-nums}
+/* The inventory's own copy of the auto activity line — full width under the
+   row, so an item that earns no act-first row and carries no note still says
+   what last happened to it. */
+.pall .pact{grid-column:1/-1;font-size:10.5px;color:var(--dim);line-height:1.4}
+.pall .pact.ready{color:var(--ink)}
+
 /* ── ledger ───────────────────────────────── */
 .led{display:grid;grid-template-columns:auto auto 1fr;gap:9px 12px;align-items:baseline;
   font-size:12px;padding:7px 2px;border-bottom:1px solid var(--hair)}
@@ -1715,7 +2310,7 @@ a{color:inherit;text-decoration:none}
 .led .s{color:var(--dim);line-height:1.45;min-width:0}
 .led.error .s{color:var(--crit)} .led.correction .s{color:var(--warn)}
 
-/* ── ephemeral queue (in-flight fleet strip) ── */
+/* ── dispatch sessions (in-flight fleet strip) ── */
 .ephstrip{display:flex;flex-wrap:wrap;gap:10px}
 .ephcard{display:flex;align-items:center;gap:11px;background:var(--surface-2);
   border:1px solid var(--edge);border-radius:11px;padding:10px 13px;min-width:0;
@@ -1746,6 +2341,23 @@ a{color:inherit;text-decoration:none}
 .usage .pace.good{color:var(--good)}
 .usage .pace.warn{color:var(--warn)}
 .usage .pace.crit{color:var(--crit)}
+/* Claude and Codex budget rows: one grid, so the weekly cells line up. */
+.budget{display:grid;grid-template-columns:max-content max-content minmax(0,1fr);
+  gap:6px 12px;align-items:center;flex-basis:100%}
+.budget .brow{display:contents}
+.budget .ul{text-align:center}
+.budget .bw{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.budget .bd{display:flex;flex-wrap:wrap;align-items:center;gap:0 7px;color:var(--faint);min-width:0}
+.meter{position:relative;display:inline-block;width:84px;height:6px;border-radius:3px;
+  background:var(--surface-2);border:1px solid var(--edge);overflow:visible}
+.meter .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--accent)}
+.meter.good .fill{background:var(--good)} .meter.warn .fill{background:var(--warn)}
+.meter.crit .fill{background:var(--crit)}
+.meter .mark{position:absolute;top:-3px;bottom:-3px;width:2px;margin-left:-1px;
+  background:var(--ink);opacity:.7;border-radius:1px}
+.bloops{display:flex;flex-wrap:wrap;align-items:center;gap:6px;flex-basis:100%}
+@media (max-width:600px){.budget{grid-template-columns:max-content minmax(0,1fr)}
+  .budget .bd{grid-column:2}}
 .usage.na{color:var(--faint)}
 
 .foot{margin-top:26px;padding-top:16px;border-top:1px solid var(--edge);
@@ -1843,7 +2455,7 @@ SHELL_JS = r"""
     var cur=root.getAttribute('data-theme')||'dark',next=cur==='dark'?'light':'dark';
     applyTheme(next);try{localStorage.setItem(KEY,next);}catch(e){}});
 
-  var SEC=window.OPS_DASH_SECTIONS||{loops:'sec-loops',ephemeral:'sec-ephemeral',night:'sec-night',
+  var SEC=window.OPS_DASH_SECTIONS||{loops:'sec-loops',dispatch_sessions:'sec-dispatch-sessions',night:'sec-night',
            focus:'sec-focus',pr_board:'sec-pr',mechanic:'sec-mech',
            brief:'sec-brief',ledger:'sec-ledger'};
   var cache={}, genEpoch=0, lastOk=0, everOk=false;
@@ -1863,7 +2475,7 @@ SHELL_JS = r"""
     var secs=d.sections||{};
     for(var k in SEC){put(SEC[k],secs[k]);}
     setText('mech-date',(d.mechanic&&d.mechanic.date)||'—');
-    setText('eph-count',String((d.ephemeral||[]).length));
+    setText('dispatch-session-count',String((d.dispatch_sessions||[]).length));
     setText('led-count',String((d.ledger||[]).length));
     /* The brief section may have just been swapped in with server-rendered
        freshness classes as of the LAST regeneration — re-tick them from the
@@ -1884,7 +2496,7 @@ SHELL_JS = r"""
   }
 
   function refresh(){
-    fetch('dashboard.json?t='+Math.floor(Date.now()/1000),{cache:'no-store'})
+    fetch('dashboard.json')
       .then(function(r){if(!r.ok)throw 0;return r.json();})
       .then(function(d){lastOk=Date.now();everOk=true;apply(d);tick();})
       .catch(function(){tick();});
@@ -2019,7 +2631,11 @@ def status_class(loop: dict) -> tuple[str, str]:
     return "run", st or "up"
 
 
-def render_loops(loops: list[dict]) -> str:
+def render_loops(loops: list[dict], reading: dict | None = None) -> str:
+    # The lamp on every row is derived from one `agent-deck ls`. When that read
+    # fails the old code handed this function an empty session index and every
+    # loop rendered `stopped` — a whole rack of confident red saying something
+    # nobody had actually observed.
     rows = []
     for l in loops:
         lamp, label = status_class(l)
@@ -2055,7 +2671,7 @@ def render_loops(loops: list[dict]) -> str:
           {hb_html}
         </div>
       </div>''')
-    return "".join(rows)
+    return render_panel_state(reading or {}) + "".join(rows)
 
 
 def render_note(note: str | None, inline: bool = False) -> str:
@@ -2066,6 +2682,31 @@ def render_note(note: str | None, inline: bool = False) -> str:
     dspan = f'<span class="pn-date">{E(d)}</span> ' if d else ""
     cls = "pno-note" if inline else "prnote"
     return f'<div class="{cls}">{dspan}{E(body)}</div>'
+
+
+def render_activity(r: dict) -> str:
+    """The spotter's auto "last observed activity" line for one PR row.
+
+    Rendered beside the operator's manual note, never instead of it: the note
+    says what they last did, this says what last happened to the PR. `ready`
+    gets its own class because it is the signal worth finding — a draft
+    becoming a real PR — and
+    it must stay findable in a column of comment counts.
+    """
+    la = r.get("last_activity") or {}
+    summary = la.get("summary")
+    if not summary:
+        return ""
+    cls = "practivity ready" if la.get("kind") == "ready-for-review" else "practivity"
+    when = str(la.get("at") or "")[:16].replace("T", " ")
+    stamp = f' <span class="pa-when">{E(when)} UTC</span>' if when else ""
+    return f'<div class="{cls}">{E(summary)}{stamp}</div>'
+
+
+def render_why(why: str | None) -> str:
+    """The row's reason line. Empty when the engine could not be asked — an
+    absent sentence is better than a made-up one."""
+    return f'<div class="prwhy">{E(why)}</div>' if why else ""
 
 
 def render_ack(r: dict) -> tuple[str, str]:
@@ -2105,6 +2746,96 @@ def render_held(r: dict) -> tuple[str, str]:
     return f' title="{E(title)}"', '<span class="tag held">held</span>'
 
 
+# The one sentence that says the live board and this morning's digest
+# are looking at different boards. It lives here, as a constant, because THREE
+# renderers have to be able to say it — the shared section renderer, the
+# primary page's own digest panel, and v2's blindness line — and a sentence
+# written out three times is three sentences waiting to disagree.
+BOARD_MOVED_NOTE = ("the PR board above has changed since this brief read it "
+                    "— the panel is live, the digest is this morning's snapshot")
+
+# What each of the three panel states says, in the reader's terms. `completed`
+# gets no sentence: the chip alone is the mark, and a banner on a panel where
+# nothing is wrong is a banner the reader stops seeing.
+PANEL_STATE_TITLE = {
+    panels.COMPLETED: "read successfully — an empty panel here is real",
+    panels.FAILED: "FAILED — an empty panel here means nobody could look",
+    panels.UNAVAILABLE: "unavailable — this read never happened",
+}
+
+
+def render_panel_state(env: dict, notes: tuple = ()) -> str:
+    """The provenance line above one panel: what it read, and whether it may
+    be believed (docs/dashboard-panel-contract.md).
+
+    Three states, and they are visibly different rather than merely different
+    in the data model:
+
+      * read and current — one chip, `s-completed f-current`, with the age.
+      * read but old     — the same chip goes `f-stale` (the browser re-ticks
+                           it from `data-asof`/`data-maxage` without a
+                           regeneration) plus one amber line saying the numbers
+                           describe an earlier estate.
+      * not read at all  — the chip goes `s-failed`/`s-unavailable` AND a red
+                           banner says the panel is blank because nobody
+                           looked. This is the state the PR board rendered as
+                           `0/0/0/0/0` with no mark of any kind.
+
+    The chip is on EVERY panel, not only the broken ones — P-03's rule about
+    `last_successful_observation_at`, for the same reason: a mark that appears
+    only when something is wrong is a mark the reader never learns to read.
+    """
+    if not isinstance(env, dict) or not env.get("panel"):
+        return ""
+    status = str(env.get("status") or "")
+    stale = env.get("staleness") or {}
+    as_of = stale.get("as_of") or ""
+    max_age = stale.get("max_age_seconds") or 0
+    fresh = stale.get("state") or panels.UNKNOWN
+    age = (human_age(stale.get("age_seconds"))
+           if stale.get("age_seconds") is not None else "—")
+    partial = " deg" if env.get("partial") else ""
+    tip = PANEL_STATE_TITLE.get(status, status)
+    if env.get("partial"):
+        tip += " · partly read"
+    if env.get("why"):
+        tip += f" · {env['why']}"
+    count = env.get("count")
+    n = "" if count is None else f'<span class="srcn">{E(str(count))}</span>'
+    chip = (f'<span class="srcchip s-{E(status)} f-{E(fresh)}{partial}" '
+            f'title="{E(tip)}" data-asof="{E(as_of)}" '
+            f'data-maxage="{E(str(max_age))}"><span class="srcdot"></span>'
+            f'<span class="srcname">{E(str(env.get("source") or ""))}</span>'
+            f'{n}<span class="srcage">{E(age)}</span></span>')
+    label = str(env.get("label") or env["panel"])
+    why = f' · {E(str(env["why"]))}' if env.get("why") else ""
+    lines = [f'<div class="pstate srcstrip">{chip}</div>']
+    if env.get("warrant") != panels.O.OBSERVED:
+        # The load-bearing line. It names the outcome, because "gh is not
+        # installed" and "GitHub refused" are different mornings, and it says
+        # in words that the numbers below are missing rather than zero.
+        lines.append(
+            f'<div class="pabsent">⛔ {E(label)} could not be read '
+            f'({E(str(env.get("outcome")))}{why}). The numbers below are '
+            f'MISSING, not zero. Nothing here is evidence that this panel is '
+            f'empty.</div>')
+    elif env.get("partial"):
+        # Read, and only partly. Amber rather than red because what it DID see
+        # is real work — the part nobody read is just where an absence would
+        # hide (docs/absence-contract.md, "partial — a modifier").
+        lines.append(
+            f'<div class="ppartial">◐ {E(label)} was only partly read'
+            f'{why}. What is below is real. What is missing from it is not '
+            f'evidence of anything.</div>')
+    elif panels.is_stale(env):
+        lines.append(
+            f'<div class="pstale">⏳ read {E(age)} ago, past its '
+            f'{E(human_age(max_age))} budget — these numbers are real but they '
+            f'describe an earlier estate, not this moment.</div>')
+    lines += [f'<div class="pnote">{E(str(note))}</div>' for note in notes if note]
+    return "".join(lines)
+
+
 def render_pr_board(board: dict) -> str:
     b = board["buckets"]
     meta = board["meta"]
@@ -2118,6 +2849,27 @@ def render_pr_board(board: dict) -> str:
     tile_html = "".join(
         f'<div class="tile {c}"><div class="n">{n}</div><div class="l">{E(lbl)}</div></div>'
         for c, n, lbl in tiles)
+
+    stack_html = ""
+    stacks = board.get("stacks") or []
+    if stacks:
+        groups = []
+        for stack in stacks:
+            members = []
+            for r in stack["rows"]:
+                href = (f' href="{E(r["url"])}" target="_blank" rel="noopener"'
+                        if r["url"] else "")
+                relation = ("base" if not r.get("stack_parent_key") else
+                            f'on {r["stack_parent_key"]}')
+                members.append(
+                    f'<div class="prstack-row" style="--stack-depth:{r["stack_depth"]}">'
+                    f'<span class="prstack-step">{r["stack_index"]}/{r["stack_size"]}</span>'
+                    f'<a class="prstack-link"{href}>{E(str(r["key"] or r["id"]))} · '
+                    f'{E(r["title"])}</a><span class="prstack-base">{E(relation)}</span></div>')
+            groups.append(f'<div class="prstack">{"".join(members)}</div>')
+        stack_html = (f'<div class="prstacks"><div class="prstacks-head">'
+                      f'{len(stacks)} PR stack(s) · merge base first</div>'
+                      f'{"".join(groups)}</div>')
 
     rows = []
     shown = board["act_first"][:ACTFIRST_CAP]
@@ -2151,12 +2903,14 @@ def render_pr_board(board: dict) -> str:
           <span class="idle-d {idle_cls}">{E(idle_txt)}</span>
           {comments}{proj}
         </div>
-        {render_note(r.get("note"))}
+        {render_why(r.get("why"))}
+        {render_note(r.get("note"))}{render_activity(r)}
       </a>''')
     more = len(board["act_first"]) - len(shown)
     if more > 0:
         rows.append(f'<div style="padding:10px;font-size:11px;color:var(--faint)">'
-                    f'+{more} more in your court</div>')
+                    f'+{more} more in your court — every one of them is in the '
+                    f'full list below</div>')
 
     # noted PRs that have no act-first row — surface last action per PR anyway
     other = board.get("notes_other") or []
@@ -2178,7 +2932,7 @@ def render_pr_board(board: dict) -> str:
           {ack_mark}<span class="prkey">{E(str(key))}</span>
           <span class="prttl">{E(r["title"])}</span>{work_tag}{held_tag}
         </div>
-        {render_note(r.get("note"), inline=True)}
+        {render_note(r.get("note"), inline=True)}{render_activity(r)}
       </a>''')
         other_html = (f'<div class="pno-wrap"><div class="pno-head">last action · '
                       f'other tracked PRs</div>{"".join(lines)}</div>')
@@ -2208,12 +2962,60 @@ def render_pr_board(board: dict) -> str:
                    + (f' (could not read {E(srcs)})' if srcs else "")
                    + '. Their rows are the last real observation, not live '
                      'state. Nothing was archived on a failed fetch.</div>')
+
+    # Every non-snoozed tracked entry gets a row here carrying
+    # its state and its last successful observation, including the ones no
+    # other list on this panel would ever render: the act-first overflow past
+    # ACTFIRST_CAP, and every entry sitting quietly in a bucket that is only a
+    # tile number — which is where most of a quiet board sits.
+    all_rows = board.get("all_rows") or []
+    inventory = ""
+    if all_rows:
+        lines = []
+        for r in all_rows:
+            key = r["key"] or (r["linear_id"] or r["id"])
+            label = r.get("bucket_label") or "unbucketed"
+            href = f' href="{E(r["url"])}"' if r["url"] else ""
+            target = ' target="_blank" rel="noopener"' if r["url"] else ""
+            link = (f'<a class="pk"{href}{target}>{E(str(key))}</a>'
+                    if r["url"] else f'<span class="pk">{E(str(key))}</span>')
+            stamp = str(r.get("last_successful_observation_at") or "")
+            when = stamp[:16].replace("T", " ") if stamp else ""
+            obs = (f'last observed {E(when)} UTC' if when
+                   else 'no recorded observation time')
+            if r.get("unobserved"):
+                obs += " · held, the spotter could not re-read it"
+            # Every tracked item's last observed activity, including
+            # the ones that earn no act-first row and carry no manual note —
+            # the group where a draft going ready-for-review was invisible on
+            # every surface the estate has.
+            la = r.get("last_activity") or {}
+            act = ""
+            if la.get("summary"):
+                acls = "pact ready" if la.get("kind") == "ready-for-review" else "pact"
+                when = str(la.get("at") or "")[:16].replace("T", " ")
+                act = (f'<span class="{acls}">◷ {E(la["summary"])}'
+                       + (f' · {E(when)} UTC' if when else "") + '</span>')
+            lines.append(
+                f'<div class="pall">'
+                f'<span>{link} <span class="pt">{E(r["title"])}</span></span>'
+                f'<span class="pst {E(label.replace(" ", "-"))}">{E(label)}</span>'
+                f'{act}<span class="pobs">{obs}</span></div>')
+        # The count in the summary is the tracked total, so "N tracked" and
+        # N rows are checkable against each other without arithmetic.
+        snz = (f' · {board["snoozed"]} snoozed and deliberately not listed'
+               if board.get("snoozed") else "")
+        inventory = (
+            f'<details class="prall"><summary>all {len(all_rows)} tracked '
+            f'item(s) · state and last observation{snz}</summary>'
+            f'{"".join(lines)}</details>')
     return f'''
+    {render_panel_state(board.get("reading") or {})}
     <div class="tiles">{tile_html}</div>
     <div style="font-size:10.5px;color:var(--faint);margin:2px 2px 8px">
       {E(sub)}{" · scanning " + E(scan) if scan else ""}</div>
-    {heldbar}{ackbar}
-    {"".join(rows)}{other_html}'''
+    {heldbar}{ackbar}{stack_html}
+    {"".join(rows)}{other_html}{inventory}'''
 
 
 def _focus_issue_lis(ids: list, titles: dict) -> str:
@@ -2287,9 +3089,17 @@ def render_focus(focus: dict) -> str:
     """Layout A — one momentum card per focus project: progress + target, the
     single highest-leverage batch (▶ headline), the runner-up (then), and a
     compact issue/flag meta line. Inline styles reuse the dashboard CSS vars."""
+    state = render_panel_state(focus.get("reading") or {})
     if not focus.get("available"):
-        return ('<div class="empty"><div class="sm">No focus projects yet — '
-                'run <code>focus_projects.py refresh</code>.</div></div>')
+        # "run focus_projects.py refresh" is advice for a producer that has not
+        # run. It is the wrong advice when the file is there and unreadable, so
+        # it is only offered when the read actually reached that conclusion.
+        return state + (
+            '<div class="empty"><div class="sm">No focus projects yet — '
+            'run <code>focus_projects.py refresh</code>.</div></div>'
+            if panels.empty_is_evidence(focus.get("reading") or {})
+            else '<div class="empty"><div class="sm">No focus data to show — '
+                 'see above.</div></div>')
     checklists = _focus_checklists(focus)
     cards = []
     for idx, p in enumerate(focus["projects"]):
@@ -2362,13 +3172,13 @@ def render_focus(focus: dict) -> str:
         {hl}{then_html}
         <div style="font-size:10.5px;color:var(--faint)">{E(meta)}</div>
       </div>''')
-    return "".join(cards)
+    return state + "".join(cards)
 
 
 def render_night(night: dict) -> str:
     rep = night["report"]
     rep_line = ""
-    if rep["done"] is not None:
+    if any(rep.get(key) is not None for key in ("done", "failed", "needs_you")):
         # `failed` shows only when there were failures — a standing "0 failed"
         # is noise, and a night that failed nothing should not look like one
         # that was never checked.
@@ -2376,7 +3186,7 @@ def render_night(night: dict) -> str:
                   if rep.get("failed") else "")
         rep_line = (f'<div style="font-size:11px;color:var(--faint);margin:0 2px 10px">'
                     f'last night ({E(rep["date"] or "")}) · '
-                    f'<span style="color:var(--good)">{rep["done"]} done</span>{failed} · '
+                    f'<span style="color:var(--good)">{rep["done"] or 0} done</span>{failed} · '
                     f'<span style="color:var(--crit)">{rep["needs_you"] or 0} '
                     f'needs you</span></div>')
     rows = []
@@ -2400,8 +3210,14 @@ def render_night(night: dict) -> str:
         <span class="status {st_cls}">{E(st)}</span>
       </div>''')
     if not rows:
-        rows.append('<div class="empty"><div class="sm">Queue is empty.</div></div>')
-    return rep_line + "".join(rows)
+        # "Queue is empty" is a claim about the night shift's workload. It is
+        # only true when the queue was read the contract.
+        rows.append('<div class="empty"><div class="sm">Queue is empty.</div></div>'
+                    if panels.empty_is_evidence(night.get("reading") or {})
+                    else '<div class="empty"><div class="sm">No queue to '
+                         'show — see above.</div></div>')
+    return (render_panel_state(night.get("reading") or {})
+            + rep_line + "".join(rows))
 
 
 def render_mechanic(mech: dict) -> str:
@@ -2415,7 +3231,10 @@ def render_mechanic(mech: dict) -> str:
         {body}
       </div>''')
     if not props:
-        props.append('<div class="empty"><div class="sm">No pending proposals.</div></div>')
+        props.append('<div class="empty"><div class="sm">No pending proposals.</div></div>'
+                     if panels.empty_is_evidence(mech.get("reading") or {})
+                     else '<div class="empty"><div class="sm">No proposals to '
+                          'show — see above.</div></div>')
     obs = ""
     if mech["observations"]:
         items = "".join(f"<li>{E(o)}</li>" for o in mech["observations"])
@@ -2426,7 +3245,8 @@ def render_mechanic(mech: dict) -> str:
     if mech["applied"] and "none" not in mech["applied"].lower():
         applied = (f'<div style="font-size:11px;color:var(--good);margin-top:10px">'
                    f'applied autonomously: {E(mech["applied"])}</div>')
-    return "".join(props) + applied + obs
+    return (render_panel_state(mech.get("reading") or {})
+            + "".join(props) + applied + obs)
 
 
 _BRIEF_BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*|\*([^*\n]+)\*")
@@ -2540,11 +3360,12 @@ def render_brief_sources(brief: dict) -> str:
             f'themselves — an empty section below is not evidence of a quiet '
             f'morning: {E(names)}</div>')
     cut = manifest.get("ledger_cutoff") or {}
-    if brief.get("board_moved"):
-        lines.append(
-            '<div class="srcwarn">the PR board above has changed since this '
-            'brief read it — the panel is live, the digest is this morning\'s '
-            'snapshot</div>')
+    # `board_moved` used to be said here and ONLY here, which put it on a
+    # section the primary page does not render: `/` owns its own digest panel
+    # and drops `sections.brief` on the floor, so the divergence was computed,
+    # was True in the live artifact, and appeared on no page anybody opens
+    #. It is said in the panel-state block now — one constant, injected
+    # into all three renderers.
     seq = cut.get("seq")
     if seq is not None:
         lines.append(f'<div class="srccut">ledger cutoff · event {E(str(seq))}'
@@ -2552,11 +3373,20 @@ def render_brief_sources(brief: dict) -> str:
     return "".join(lines)
 
 
+def brief_panel_state(brief: dict) -> str:
+    """The digest panel's own provenance block — its warrant, plus the
+    live-board divergence. Assembled once so every surface that renders the
+    digest says the same two things."""
+    notes = [BOARD_MOVED_NOTE] if brief.get("board_moved") else []
+    return render_panel_state(brief.get("reading") or {}, tuple(notes))
+
+
 def render_brief(brief: dict, loops: list[dict]) -> str:
     if brief.get("available"):
         note = brief_delivery_note(brief.get("delivery"))
         tail = f' · {E(note)}' if note else ""
-        return (f'<div style="font-size:10.5px;color:var(--faint);margin-bottom:8px">'
+        return (f'{brief_panel_state(brief)}'
+                f'<div style="font-size:10.5px;color:var(--faint);margin-bottom:8px">'
                 f'{E(brief["name"])}{tail}</div>'
                 f'{render_brief_sources(brief)}'
                 f'<div class="brief-body scroll">'
@@ -2565,6 +3395,7 @@ def render_brief(brief: dict, loops: list[dict]) -> str:
     armed = briefer and briefer["session_present"]
     state = ("armed & heartbeating" if armed else "session down")
     return f'''
+    {brief_panel_state(brief)}
     <div class="empty">
       <div class="big">First brief lands tomorrow morning</div>
       <div class="sm">The briefer composes one digest per day inside the
@@ -2574,7 +3405,7 @@ def render_brief(brief: dict, loops: list[dict]) -> str:
     </div>'''
 
 
-def render_ledger(rows: list[dict]) -> str:
+def render_ledger(rows: list[dict], reading: dict | None = None) -> str:
     out = []
     for r in rows:
         ts = r.get("ts", "")
@@ -2600,24 +3431,34 @@ def render_ledger(rows: list[dict]) -> str:
         <span class="a {acls}">{E(short)}</span>
         <span class="s">{E(r.get("summary",""))}</span>
       </div>''')
-    return "".join(out)
+    return render_panel_state(reading or {}) + "".join(out)
 
 
-def render_ephemeral(items: list[dict]) -> str:
+def render_dispatch_sessions(items: list[dict], reading: dict | None = None) -> str:
+    state = render_panel_state(reading or {})
     if not items:
-        return ('<div class="empty"><div class="sm">No ephemeral sessions in '
-                'flight. Dispatched workers appear here the moment the hub spins '
-                'them up.</div></div>')
+        # "nothing is in flight" is a claim about the fleet. A deck that would
+        # not answer produces the same empty list and must not make it.
+        return state + (
+            '<div class="empty"><div class="sm">No dispatch sessions in '
+            'flight. Dispatches appear here the moment the hub sends them.'
+            '</div></div>'
+            if panels.empty_is_evidence(reading or {})
+            else '<div class="empty"><div class="sm">No fleet to show — see '
+                 'above.</div></div>')
     cards = []
     for it in items:
         st = it["status"] or "?"
         lamp = {"running": "run beat", "waiting": "wait", "idle": "idle"}.get(st, "run")
-        st_cls = st.replace("-", "").replace("_", "")
+        st_cls = re.sub(r"[^a-z0-9]", "", st)
         age = human_age(it["age"]) if it["age"] is not None else "—"
+        age_label = "alive" if st in EPH_ORDER else "since creation"
         ref = (f'<div class="es-ref">{E(str(it["ref"]))}</div>'
                if it.get("ref") else "")
+        session_type_raw = str(it.get("session_type") or "ephemeral")
+        session_type = E(session_type_raw)
         kind = (f'<span class="es-kind">{E(str(it["kind"]))}</span>'
-                if it.get("kind") else "")
+                if it.get("kind") and str(it["kind"]) != session_type_raw else "")
         cards.append(f'''
       <div class="ephcard">
         <span class="lamp {lamp}" title="{E(st)}"></span>
@@ -2626,17 +3467,24 @@ def render_ephemeral(items: list[dict]) -> str:
           {ref}
           <div class="es-meta">
             <span class="status {st_cls}">{E(st)}</span>
+            <span class="es-kind">{session_type}</span>
             {kind}
-            <span class="es-age">{E(age)} alive</span>
+            <span class="es-age">{E(age)} {age_label}</span>
           </div>
         </div>
       </div>''')
-    return f'<div class="ephstrip">{"".join(cards)}</div>'
+    return state + f'<div class="ephstrip">{"".join(cards)}</div>'
 
 
 def cap_pace(pct: float, resets_at: str, *, hours: float,
-             reserve_pct: float = 0, now: datetime | None = None) -> tuple[int, str] | None:
-    """Expected linear consumption and severity for a bounded usage window."""
+             reserve_pct: float = 0, now: datetime | None = None,
+             weekend_start_hour: float = 120.0) -> tuple[int, str] | None:
+    """Expected linear consumption and severity for a bounded usage window.
+
+    With a reserve on a 168h window, ``100 - reserve_pct`` is spread over the
+    120 weekday hours and ``reserve_pct`` over the 48 weekend hours, which
+    start ``weekend_start_hour`` hours into the window (the default puts them
+    last, and may wrap across the window's ends)."""
     try:
         reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
@@ -2647,57 +3495,65 @@ def cap_pace(pct: float, resets_at: str, *, hours: float,
     start = reset - timedelta(hours=hours)
     elapsed = max(0.0, min(hours, (current - start).total_seconds() / 3600))
     if reserve_pct and hours == 168:
-        weekday_hours = 120.0
-        if elapsed <= weekday_hours:
-            expected = elapsed / weekday_hours * (100 - reserve_pct)
-        else:
-            expected = ((100 - reserve_pct) +
-                        (elapsed - weekday_hours) / 48.0 * reserve_pct)
+        weekend = sum(max(0.0, min(elapsed, w + 48) - max(0.0, w))
+                      for w in (weekend_start_hour - 168, weekend_start_hour,
+                                weekend_start_hour + 168))
+        expected = ((elapsed - weekend) / 120.0 * (100 - reserve_pct) +
+                    weekend / 48.0 * reserve_pct)
     else:
         expected = elapsed / hours * 100
     severity = "good" if pct < expected - 3 else ("crit" if pct > expected + 3 else "warn")
     return round(expected), severity
 
 
-def render_cap(cap: dict | None) -> str:
-    """Account-wide usage cap %/spend status from state/usage/budget.json —
-    the SAME signal review.py's budget guard gates on. "account" when
-    bin/usage-fetch's authenticated call worked, "local proxy" when it fell
-    back to the token estimate, absent entirely if usage-fetch hasn't run."""
+def render_cap(cap: dict | None) -> tuple[str, list[str]]:
+    """Account-wide usage cap from state/usage/budget.json — the SAME signal
+    review.py's budget guard gates on — as (weekly cell, detail parts).
+
+    The weekly %-of-limit is featured because it is the one figure Codex can
+    show too. The session cap stays, demoted to a plain
+    detail part, with its pace in the tooltip: it is still real signal when a
+    5h window is nearly spent, so it turns red then rather than disappearing.
+    "account" when bin/usage-fetch's authenticated call worked, "local proxy"
+    when it fell back to the token estimate."""
     if not cap:
-        return ('<span class="sep">·</span><span class="est">cap: not '
-                'populated — run bin/usage-fetch</span>')
+        return ('<span class="bw est">cap: not populated — run '
+                'bin/usage-fetch</span>', [])
     source = cap.get("source", "?")
-    parts = []
-    for key, label in (("session_pct", "session"), ("weekly_pct", "weekly"),
-                        ("spend_pct", "spend")):
-        v = cap.get(key)
-        if isinstance(v, (int, float)):
-            pace = None
-            if key == "weekly_pct":
-                pace = cap_pace(v, cap.get("weekly_resets_at"), hours=168,
-                                reserve_pct=10)
-            elif key == "session_pct":
-                pace = cap_pace(v, cap.get("session_resets_at"), hours=5)
-            if pace:
-                expected, severity = pace
-                parts.append(f'<span class="pace {severity}">{label} {v:g}% '
-                             f'(pace {expected}%)</span>')
-            else:
-                parts.append(f"{label} {v:g}%")
-    if cap.get("spend_blocked"):
-        parts.append("SPEND BLOCKED")
-    body = " · ".join(parts) if parts else "no signal"
     src_label = {"api": "account", "local_estimate": "local proxy",
                  "unavailable": "unavailable", "absent": "absent",
                  "error": "unreadable"}.get(source, source)
-    return (f'<span class="sep">·</span><span class="pct" '
-            f'title="account usage cap — source: {E(src_label)}">'
-            f'cap {body} ({E(src_label)})</span>')
+    weekly_v = cap.get("weekly_pct")
+    if isinstance(weekly_v, (int, float)):
+        pace = cap_pace(weekly_v, cap.get("weekly_resets_at"), hours=168,
+                        reserve_pct=WEEKEND_RESERVE_PCT)
+        weekly = render_weekly(
+            weekly_v, pace, f'Claude account weekly limit — source: {src_label}; '
+            f'resets {cap.get("weekly_resets_at")}')
+    else:
+        weekly = '<span class="bw est">weekly: no reading</span>'
+    detail = []
+    session_v = cap.get("session_pct")
+    if isinstance(session_v, (int, float)):
+        pace = cap_pace(session_v, cap.get("session_resets_at"), hours=5)
+        cls = ' class="pace crit"' if pace and pace[1] == "crit" else ""
+        tip = (f'5h session cap {session_v:g}%'
+               + (f', pace {pace[0]}%' if pace else "")
+               + f'; resets {cap.get("session_resets_at")}')
+        detail.append(f'<span{cls} title="{E(tip)}">session {session_v:g}%</span>')
+    spend_v = cap.get("spend_pct")
+    if isinstance(spend_v, (int, float)):
+        detail.append(f'spend {spend_v:g}%'
+                      + (' blocked' if cap.get("spend_blocked") else ""))
+    elif cap.get("spend_blocked"):
+        detail.append("spend blocked")
+    detail.append(f'<span title="account usage cap — source: {E(src_label)}">'
+                  f'{E(src_label)}</span>')
+    return weekly, detail
 
 
 def render_loop_costs(rows: list[dict] | None) -> str:
-    """Per-loop cost chips under the header usage line — top 4 by spend this
+    """Per-loop cost chips under the budget rows — top 4 by spend this
     window. Full per-loop and per-session breakdowns are always in the JSON
     payload (usage.cost_by_loop / usage.top_sessions) even when not all of
     it is rendered here."""
@@ -2709,19 +3565,22 @@ def render_loop_costs(rows: list[dict] | None) -> str:
         for r in rows[:4] if r["cost_usd"] > 0)
     if not chips:
         return ""
-    return (f'<div style="flex-basis:100%;height:0"></div>'
-            f'<span class="ul" style="margin-top:4px">by loop</span>{chips}')
+    return f'<div class="bloops"><span class="ul">by loop</span>{chips}</div>'
 
 
 def render_usage(u: dict) -> str:
-    """Compact header line — LOCAL rolling-window token+cost estimate, plus
-    the account-wide cap % (state/usage/budget.json, see render_cap)."""
-    cap_html = render_cap((u or {}).get("cap"))
+    """The header budget block: a Claude row and a Codex row of the same
+    shape — label, weekly %-of-limit with its pace, then dim detail — in one
+    grid so the weekly figures line up. Claude's detail carries the LOCAL
+    rolling-window token+cost estimate and the demoted session cap
+    (state/usage/budget.json, see render_cap)."""
+    weekly, detail = render_cap((u or {}).get("cap"))
+    codex_html = render_codex_cap((u or {}).get("codex"))
     if not u or not u.get("available"):
         reason = (u or {}).get("reason") or "no local usage data"
-        return ('<span class="ul">Claude usage</span>'
-                f'<span class="est">unavailable — {E(reason)}</span>'
-                f'{cap_html}')
+        local = [f'<span class="est">local usage unavailable — {E(reason)}</span>']
+        claude = render_budget_row("Claude", weekly, local + detail)
+        return f'<div class="budget">{claude}{codex_html}</div>'
     h = u["window_hours"]
     hlabel = f"{h:g}h"
     title = (f'Local Claude Code usage, last {hlabel} (this host only). '
@@ -2729,28 +3588,22 @@ def render_usage(u: dict) -> str:
              f'cache-create {u["cache_creation"]:,} · cache-read {u["cache_read"]:,} · '
              f'{u["messages"]:,} messages across {u["sessions"]} sessions. '
              f'{u["note"]}. {u.get("pricing_note", "")}')
-    pct = ""
-    if u.get("pct_of_budget") is not None:
-        pct = (f'<span class="sep">·</span><span class="pct">{u["pct_of_budget"]}% '
-               f'of budget</span>')
-    cost = ""
+    local = [f'<span title="{E(title)}"><b>{E(human_tokens(u["total"]))}</b> '
+             f'tokens last {E(hlabel)} <span class="est">local est.</span></span>',
+             f'{u["sessions"]} sessions']
     if u.get("cost_usd") is not None:
-        cost = f'<span class="sep">·</span><b>${u["cost_usd"]:.2f}</b> est.'
-    return (
-        f'<span class="ul" title="{E(title)}">Claude · last {E(hlabel)}</span>'
-        f'<b>{E(human_tokens(u["output"]))}</b> out'
-        f'<span class="sep">·</span><b>{E(human_tokens(u["total"]))}</b> total'
-        f'{cost}'
-        f'<span class="sep">·</span>{u["sessions"]} sessions'
-        f'{pct}'
-        f'<span class="sep">·</span><span class="est">local est.</span>'
-        f'{cap_html}'
-        f'{render_loop_costs(u.get("cost_by_loop"))}')
+        local.append(f'<b>${u["cost_usd"]:.2f}</b> est.')
+    if u.get("pct_of_budget") is not None:
+        local.append(f'{u["pct_of_budget"]}% of budget')
+    claude = render_budget_row("Claude", weekly, local + detail)
+    return (f'<div class="budget">{claude}{codex_html}</div>'
+            f'{render_loop_costs(u.get("cost_by_loop"))}')
 
 
 def render_vitals(s: dict) -> str:
     """Inner HTML of the .vitals row — shared by the live shell and fragment."""
     v = s["vitals"]
+    proposals = v["proposals"] if v["proposals"] is not None else "?"
     live_total = sum(1 for l in s["loops"] if l["autostart"] or l["is_hub"])
     needs_cls = "alert" if v["needs_you"] else ""
     astray_cls = "alert" if v["going_astray"] else "calm"
@@ -2764,12 +3617,13 @@ def render_vitals(s: dict) -> str:
         f'<div class="l">going astray</div></div>'
         f'<div class="vital warn"><div class="n">{v["queue_queued"]}</div>'
         f'<div class="l">queued</div></div>'
-        f'<div class="vital"><div class="n">{v["proposals"]}</div>'
+        f'<div class="vital"><div class="n">{proposals}</div>'
         f'<div class="l">proposals</div></div>')
 
 
 def render_body(s: dict) -> str:
     gen_dt = s["generated_at"].replace("+00:00", "Z")
+    sec = render_sections(s)
 
     return f'''
   <div class="wrap">
@@ -2792,49 +3646,55 @@ def render_body(s: dict) -> str:
     </header>
 
     <div class="grid">
+      <section class="panel col-12">
+        <div class="phead"><span class="k">Today</span><span class="grow"></span>
+          <span class="tick">bin/today · ranked · 📌 pinned</span></div>
+        <div class="pbody tight">{sec["today"]}</div>
+      </section>
+
       <section class="panel col-7">
         <div class="phead"><span class="k">Loops</span><span class="grow"></span>
           <span class="tick">persona · model · interval · heartbeat</span></div>
-        <div class="pbody tight">{render_loops(s["loops"])}</div>
-        <div class="panel-subhead"><span class="k">Ephemeral queue</span><span class="grow"></span>
-          <span class="tick">in flight now · {len(s["ephemeral"])} dispatched</span></div>
-        <div class="pbody tight ephemeral-body">{render_ephemeral(s["ephemeral"])}</div>
+        <div class="pbody tight">{sec["loops"]}</div>
+        <div class="panel-subhead"><span class="k">Dispatch sessions</span><span class="grow"></span>
+          <span class="tick">in flight now · {len(s["dispatch_sessions"])} dispatched</span></div>
+        <div class="pbody tight ephemeral-body">{sec["dispatch_sessions"]}</div>
       </section>
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Night-shift queue</span><span class="grow"></span>
           <span class="tick">the night shift</span></div>
-        <div class="pbody tight scroll">{render_night(s["night"])}</div>
+        <div class="pbody tight scroll">{sec["night"]}</div>
       </section>
 
       <section class="panel col-12">
         <div class="phead"><span class="k">Focus projects</span><span class="grow"></span>
           <span class="tick">momentum · the spotter</span></div>
-        <div class="pbody">{render_focus(s["focus"])}</div>
+        <div class="pbody">{sec["focus"]}</div>
       </section>
 
       <section class="panel col-7">
         <div class="phead"><span class="k">PR board</span><span class="grow"></span>
           <span class="tick">the spotter · your court first</span></div>
-        <div class="pbody">{render_pr_board(s["pr_board"])}</div>
+        <div class="pbody">{sec["pr_board"]}</div>
       </section>
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Mechanic proposals</span><span class="grow"></span>
           <span class="tick">night of {E(s["mechanic"]["date"] or "—")}</span></div>
-        <div class="pbody">{render_mechanic(s["mechanic"])}</div>
+        <div class="pbody">{sec["mechanic"]}</div>
       </section>
 
       <section class="panel col-5">
         <div class="phead"><span class="k">Daily digest</span><span class="grow"></span>
           <span class="tick">the briefer</span></div>
-        <div class="pbody">{render_brief(s["brief"], s["loops"])}</div>
+        <div class="pbody">{sec["brief"]}</div>
       </section>
 
       <section class="panel col-7">
         <div class="phead"><span class="k">Recent activity</span><span class="grow"></span>
           <span class="tick">ledger · last {len(s["ledger"])}</span></div>
-        <div class="pbody tight scroll">{render_ledger(s["ledger"])}</div>
+        <div class="pbody tight scroll">{sec["ledger"]}</div>
       </section>
     </div>
 
@@ -2854,6 +3714,7 @@ def render_body(s: dict) -> str:
 def render_shell_body(s: dict, *, brief_tick: str = "the briefer") -> str:
     return f'''
   <div class="wrap">
+    {dashboard_nav.render("dashboard")}
     <header class="masthead">
       <div class="brand">
         <div class="eyebrow">Autonomous operations estate</div>
@@ -2869,17 +3730,22 @@ def render_shell_body(s: dict, *, brief_tick: str = "the briefer") -> str:
       </div>
       <span class="spacer"></span>
       <div class="vitals" id="vitals"></div>
-      <button class="themebtn" id="themebtn" type="button" aria-label="Toggle theme">☾ Night shift</button>
     </header>
 
     <div class="grid">
+      <section class="panel col-12">
+        <div class="phead"><span class="k">Today</span><span class="grow"></span>
+          <span class="tick">bin/today · ranked · 📌 pinned</span></div>
+        <div class="pbody tight" id="sec-today"></div>
+      </section>
+
       <section class="panel col-7">
         <div class="phead"><span class="k">Loops</span><span class="grow"></span>
           <span class="tick">persona · model · interval · heartbeat</span></div>
         <div class="pbody tight" id="sec-loops"></div>
-        <div class="panel-subhead"><span class="k">Ephemeral queue</span><span class="grow"></span>
-          <span class="tick">in flight now · <span id="eph-count">0</span> dispatched</span></div>
-        <div class="pbody tight ephemeral-body" id="sec-ephemeral"></div>
+        <div class="panel-subhead"><span class="k">Dispatch sessions</span><span class="grow"></span>
+          <span class="tick">in flight now · <span id="dispatch-session-count">0</span> dispatched</span></div>
+        <div class="pbody tight ephemeral-body" id="sec-dispatch-sessions"></div>
       </section>
 
       <section class="panel col-5">
@@ -2928,8 +3794,9 @@ def render_shell_body(s: dict, *, brief_tick: str = "the briefer") -> str:
 
 
 SHELL_SECTIONS = {
+    "today": "sec-today",
     "loops": "sec-loops",
-    "ephemeral": "sec-ephemeral",
+    "dispatch_sessions": "sec-dispatch-sessions",
     "night": "sec-night",
     "focus": "sec-focus",
     "pr_board": "sec-pr",
@@ -2976,26 +3843,141 @@ def render_fragment(s: dict) -> str:
 
 # ── payload assembly ─────────────────────────────────────────────────────────
 
+def render_sections(s: dict) -> dict:
+    """Every panel's HTML, from one snapshot. Shared by the live payload and
+    the static Artifact fragment so the two can never diverge."""
+    p = s.get("panels") or {}
+    return {
+        "today": render_today(s.get("today") or {}),
+        "loops": render_loops(s["loops"], p.get("loops")),
+        "dispatch_sessions": render_dispatch_sessions(
+            s["dispatch_sessions"], p.get("dispatch_sessions")),
+        "night": render_night(s["night"]),
+        "focus": render_focus(s["focus"]),
+        "pr_board": render_pr_board(s["pr_board"]),
+        "mechanic": render_mechanic(s["mechanic"]),
+        "brief": render_brief(s["brief"], s["loops"]),
+        "ledger": render_ledger(s["ledger"], p.get("ledger")),
+    }
+
+
 def build_payload(s: dict) -> dict:
     """The dashboard.json body: the full data model PLUS the pre-rendered
     section/vitals HTML the live shell drops into the DOM. Same render_*
     functions feed the Artifact fragment, so the two never diverge."""
     return {
-        **s,
+        **{k: v for k, v in s.items() if k != "stewards"},
         "tier": 1,
         "vitals_html": render_vitals(s),
         "usage_html": render_usage(s["usage"]),
-        "sections": {
-            "loops": render_loops(s["loops"]),
-            "ephemeral": render_ephemeral(s["ephemeral"]),
-            "night": render_night(s["night"]),
-            "focus": render_focus(s["focus"]),
-            "pr_board": render_pr_board(s["pr_board"]),
-            "mechanic": render_mechanic(s["mechanic"]),
-            "brief": render_brief(s["brief"], s["loops"]),
-            "ledger": render_ledger(s["ledger"]),
+        "sections": render_sections(s),
+        # the contract. Three panels on the served pages are rendered by a client that
+        # owns them and never touches `sections` — the primary page's digest
+        # and proposal-review panels, and v2's whole layout. Handing them the
+        # PRE-RENDERED state block rather than the envelope means they show the
+        # same bytes the shared renderer shows, so there is no second
+        # implementation of the banner to drift.
+        "panel_state_html": {
+            **{panel: render_panel_state(env)
+               for panel, env in (s.get("panels") or {}).items()},
+            "brief": brief_panel_state(s["brief"]),
         },
     }
+
+
+# ── server-rendered shells ───────────────────────────────────────────────────
+
+class _SelfModule:
+    """A module-like view of this file's globals.
+
+    Each of the three ``render`` functions takes the dashboard module as its
+    first argument, and this file needs to hand them
+    itself. ``sys.modules[__name__]`` is not reliable: bin/dashboard is
+    extensionless and every caller loads it through ``SourceFileLoader``, which
+    executes it without registering it. Reading ``globals()`` on each access
+    also keeps a test's monkeypatched attribute visible to the renderers.
+    """
+
+    def __getattr__(self, name: str):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def write_atomic(path: Path, content: str | bytes) -> int:
+    """Write text or bytes through a temp file in the same directory + rename.
+
+    The shells are rewritten every refresh cycle under a running HTTP server,
+    so a reader must never be able to catch one half-written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return len(data)
+
+
+def write_dashboard_json(payload: dict) -> tuple[Path, int, int]:
+    """Atomically publish identity, gzip, then their validator sidecar.
+
+    The sidecar is published last so the server can cheaply prove that both
+    representations belong to this generation without hashing the JSON on
+    every conditional request.
+    """
+    path = STATE / "dashboard.json"
+    data = json.dumps(payload, indent=2).encode("utf-8")
+    compressed = gzip.compress(data, compresslevel=6, mtime=0)
+    write_atomic(path, data)
+    gzip_path = path.with_name(path.name + ".gz")
+    write_atomic(gzip_path, compressed)
+    identity_stat = path.stat()
+    gzip_stat = gzip_path.stat()
+    validators = {
+        "identity": {"etag": f'"{hashlib.sha256(data).hexdigest()}"',
+                     "size": identity_stat.st_size,
+                     "mtime_ns": identity_stat.st_mtime_ns},
+        "gzip": {"etag": f'"{hashlib.sha256(compressed).hexdigest()}"',
+                 "size": gzip_stat.st_size,
+                 "mtime_ns": gzip_stat.st_mtime_ns},
+    }
+    write_atomic(path.with_name(path.name + ".validators.json"),
+                 json.dumps(validators, separators=(",", ":")) + "\n")
+    return path, len(data), len(compressed)
+
+
+def write_shells(snap: dict) -> list[tuple[Path, int]]:
+    """(Re)write all served shells and the steward payload from one snapshot.
+
+    Called on every run — the shells are part of the regenerator's output, not
+    a separate manual step the contract. Rendering is pure: it adds no read, no
+    subprocess and no token cost on top of the snapshot already built for the
+    JSON. Imported lazily so the presentation layer stays a consumer of this
+    module rather than an import-time dependency of it.
+
+    The shells are DATA-FREE — every number a reader sees arrives from
+    dashboard.json at runtime — so this is not what keeps the served numbers
+    fresh. It is what keeps the served MARKUP current: a merged rendering
+    change used to sit invisible on the page until somebody remembered to run
+    bin/dashboard-index by hand, and that is unchanged by the pages having
+    stopped baking numbers in.
+    """
+    import dashboard_estate   # (lib path is established at import time)
+    import dashboard_primary
+    import dashboard_v2
+
+    me = _SelfModule()
+    pages = ((STATE / "index.html", dashboard_primary.render(me, snap)),
+             (STATE / "estate.html", dashboard_estate.render(me, snap)),
+             (STATE / "dashboard-v2.html", dashboard_v2.render(me, snap)),
+             (STATE / "stewards.html", dashboard_stewards.render(me, snap)),
+             (STATE / "stewards.json", json.dumps(dashboard_stewards.payload(me, snap))))
+    return [(path, write_atomic(path, page)) for path, page in pages]
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -3003,22 +3985,27 @@ def build_payload(s: dict) -> dict:
 def main() -> int:
     snap = build_snapshot()
     payload = build_payload(snap)
-    json_out = STATE / "dashboard.json"
-    json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    json_out, json_size, gzip_size = write_dashboard_json(payload)
+    shells = write_shells(snap)
 
     if "--json" in sys.argv:
-        # Regenerator path: data model only. Deterministic + token-free — this
-        # is what the local dashboard-refresh service runs every ~45s. It NEVER
-        # rewrites the shell or fragment and never touches any loop's state.
-        print(f"wrote {json_out}  ({json_out.stat().st_size:,} bytes, --json)")
+        # Regenerator path: data model + all three shells, from one snapshot.
+        # Deterministic + token-free — this is what the local dashboard-refresh
+        # service runs every ~45s. It skips the Artifact fragment and never
+        # touches any loop's state.
+        print(f"wrote {json_out}  ({json_size:,} bytes, --json; "
+              f"{gzip_size:,} bytes gzip)")
+        for path, size in shells:
+            print(f"wrote {path}  ({size:,} bytes, live shell)")
         return 0
 
-    # Default: also (re)write the data-inlined Artifact fragment. The primary
-    # live shell is generated by bin/dashboard-index.
+    # Default: also (re)write the data-inlined Artifact fragment.
     frag_out = STATE / "dashboard.body.html"
     fragment = render_fragment(snap)
     frag_out.write_text(fragment, encoding="utf-8")
     print(f"wrote {json_out}  ({json_out.stat().st_size:,} bytes, data model)")
+    for path, size in shells:
+        print(f"wrote {path}  ({size:,} bytes, live shell)")
     print(f"wrote {frag_out}  ({len(fragment):,} bytes, Artifact fragment)")
     v = snap["vitals"]
     print(f"  loops {v['loops_live']} live / {v['loops_ondemand']} on-demand · "
@@ -3027,6 +4014,191 @@ def main() -> int:
     print("  serve locally:  flox activate --start-services  ·  url: bin/ops dashboard")
     return 0
 
+
+
+def build_today(now: float | None = None) -> dict:
+    """the operator's ranked Today list, read-only from the estate store.
+
+    Through lib/today_list, the same read model bin/today prints from, so the
+    panel and `bin/today list` cannot disagree about order, pins or overdue.
+    An empty list is only reported as empty when the store was actually read:
+    a missing or unreadable store is `no_state`/`error`, never a clean zero
+    (docs/absence-contract.md).
+    """
+    now = now if now is not None else datetime.now(timezone.utc).timestamp()
+    source = "state/estate.db (bin/today)"
+    db = STATE / "estate.db"
+    items, outcome, why = [], panels.OUT_OK, None
+    if not db.exists():
+        outcome, why = panels.OUT_NO_STATE, "estate.db has never been written"
+    else:
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            try:
+                conn.row_factory = sqlite3.Row
+                items = today_list.items(
+                    conn, datetime.fromtimestamp(now, tz=timezone.utc))
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            items, outcome, why = [], panels.OUT_ERROR, f"estate.db: {exc}"
+    return {"items": items, "cap": today_list.cap(),
+            "reading": panels.envelope(
+                "today", source, outcome, now=now,
+                as_of=now if outcome == panels.OUT_OK else None,
+                count=len(items) if outcome == panels.OUT_OK else None,
+                why=why)}
+
+CODEX_SESSIONS = Path(os.environ.get("DASHBOARD_CODEX_DIR")
+                      or Path.home() / ".codex" / "sessions")
+
+def build_codex_signal(now: datetime) -> dict:
+    try:
+        return codex_usage.budget_signal(CODEX_SESSIONS, now)
+    except Exception as err:  # a reader bug must not take the page down
+        return {"source": "error", "weekly_pct": None, "tokens": None,
+                "why": f"{type(err).__name__}: {err}",
+                "tokens_error": "not read — the Codex reader raised"}
+
+def render_today(today: dict) -> str:
+    """The Today list: ranked, pinned 📌, overdue flagged. An empty list says
+    so only when the read earned it; otherwise the state block above says the
+    list is MISSING, and nothing below claims it is empty."""
+    reading = today.get("reading") or {}
+    state = render_panel_state(reading)
+    items = today.get("items") or []
+    if not items:
+        if panels.empty_is_evidence(reading):
+            return state + ('<div class="empty"><div class="sm">Nothing on '
+                            'the Today list — add one with <code>today: '
+                            '&lt;text&gt;</code> in the DM.</div></div>')
+        return state + ('<div class="empty"><div class="sm">The Today list '
+                        'could not be read — see above.</div></div>')
+    rows = []
+    for i in items:
+        marks = ""
+        if i.get("pinned"):
+            marks += '<span title="pinned: never demoted">📌</span> '
+        if i.get("overdue"):
+            marks += ('<span style="color:var(--crit);font-size:11px">'
+                      'overdue</span> ')
+        due = (f'<span style="color:var(--faint);font-size:11px">due '
+               f'{E(str(i["due_at"])[:10])}</span>' if i.get("due_at") else "")
+        ref = (f'<span style="color:var(--faint);font-size:11px">'
+               f'{E(str(i["ref"]))}</span>' if i.get("ref") else "")
+        rows.append(
+            f'<div style="display:flex;gap:8px;align-items:baseline;'
+            f'padding:4px 2px;border-bottom:1px solid var(--hair)">'
+            f'<span style="color:var(--faint);font-family:var(--mono);'
+            f'font-size:11px">{i["rank"]}</span>'
+            f'<span style="flex:1;color:var(--ink)">{marks}{E(i["text"])}'
+            f'</span>{ref}{due}<span style="color:var(--faint);'
+            f'font-family:var(--mono);font-size:10.5px">{E(i["id"])}</span>'
+            f'</div>')
+    return state + "".join(rows)
+
+WEEKEND_RESERVE_PCT = 10
+
+def calendar_weekend_start(resets_at: str, tz=None) -> float | None:
+    """Hours into a 168h window at which the calendar weekend (Saturday
+    00:00, local time unless ``tz``) begins. May be negative when the window
+    opens mid-weekend. Claude's week resets Monday 09:00 UTC, so its last 48h
+    already ARE the weekend and it keeps cap_pace's default; Codex's resets
+    whenever its first turn of the week happened (a Thursday on this account)
+    and needs this."""
+    try:
+        reset = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if reset.tzinfo is None:
+        reset = reset.replace(tzinfo=timezone.utc)
+    start = (reset - timedelta(hours=168)).astimezone(tz)
+    saturday = (start - timedelta(days=(start.weekday() - 5) % 7)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    offset = (saturday - start).total_seconds() / 3600
+    return offset + 168 if offset + 48 <= 0 else offset
+
+def render_meter(pct: float, pace: tuple[int, str] | None) -> str:
+    """A small bar for a weekly %-of-limit, with the pace as a tick on it —
+    the one shape both budget rows share, so the two weeks compare at a
+    glance. Only ever drawn for a percent that was actually read."""
+    fill = max(0.0, min(100.0, float(pct)))
+    sev = pace[1] if pace else "none"
+    mark = (f'<span class="mark" style="left:{max(0, min(100, pace[0]))}%">'
+            f'</span>' if pace else "")
+    return (f'<span class="meter {sev}" aria-hidden="true"><span class="fill" '
+            f'style="width:{fill:g}%"></span>{mark}</span>')
+
+def render_weekly(pct: float, pace: tuple[int, str] | None, title: str) -> str:
+    """The featured weekly cell: meter, then `weekly N% (pace M%)`."""
+    text = (f'<span class="pace {pace[1]}">weekly {pct:g}% (pace {pace[0]}%)</span>'
+            if pace else f'<span class="pct">weekly {pct:g}%</span>')
+    return f'<span class="bw" title="{E(title)}">{render_meter(pct, pace)}{text}</span>'
+
+def render_budget_row(label: str, weekly: str, detail: list[str]) -> str:
+    """One budget row: label · weekly cell · dim detail. The rows sit in one
+    grid (.budget), so Claude's and Codex's weekly cells line up."""
+    sep = '<span class="sep">·</span>'
+    return (f'<div class="brow"><span class="ul">{E(label)}</span>{weekly}'
+            f'<span class="bd">{sep.join(p for p in detail if p)}</span></div>')
+
+CODEX_SOURCE_LABELS = {
+    "no_weekly_window": "no weekly window in rate_limits",
+    "window_ended": "last reading is from a week that has reset",
+    "absent": "no rate_limits reading",
+    "error": "unreadable",
+}
+
+def render_codex_cap(c: dict | None, now: datetime | None = None) -> str:
+    """Codex's row under Claude's, the same shape: the weekly %-of-limit paced
+    with the same weekend reserve, then tokens this limit window. Every part
+    that could not be read says so in words; none of them renders as 0."""
+    if not c:
+        return render_budget_row(
+            "Codex", '<span class="bw est">not read this snapshot</span>', [])
+    current = now or datetime.now(timezone.utc)
+    detail = []
+    tokens = c.get("tokens")
+    if isinstance(tokens, dict):
+        span = "this week" if c.get("source") == "rollout" else "last 7d"
+        tok_title = (f'Codex on this host since {c.get("tokens_since")}: '
+                     f'in {tokens["input_tokens"]:,} (cached '
+                     f'{tokens["cached_input_tokens"]:,}) · out '
+                     f'{tokens["output_tokens"]:,} (reasoning '
+                     f'{tokens["reasoning_output_tokens"]:,}) · '
+                     f'{tokens["sessions"]} sessions')
+        detail.append(f'<span title="{E(tok_title)}"><b>'
+                      f'{E(human_tokens(tokens["total_tokens"]))}</b> tokens '
+                      f'{span}</span>')
+        detail.append(f'{tokens["sessions"]} sessions')
+    else:
+        detail.append(f'<span class="est">tokens: could not read — '
+                      f'{E(str(c.get("tokens_error") or "no reading"))}</span>')
+    pct = c.get("weekly_pct")
+    if c.get("source") == "rollout" and isinstance(pct, (int, float)):
+        weekend = calendar_weekend_start(c.get("weekly_resets_at") or "")
+        pace = cap_pace(pct, c.get("weekly_resets_at"), hours=168,
+                        reserve_pct=WEEKEND_RESERVE_PCT, now=current,
+                        weekend_start_hour=120.0 if weekend is None else weekend)
+        observed = panels.parse_stamp(c.get("observed_at"))
+        age = (human_age(current.timestamp() - observed)
+               if observed is not None else "—")
+        title = (f'Codex account weekly limit (plan {c.get("plan_type")}), '
+                 f'read off the newest rollout rate_limits row, {age} old; '
+                 f'resets {c.get("weekly_resets_at")}')
+        weekly = render_weekly(pct, pace, title)
+        detail.append(f'rollout, {E(age)} old')
+    else:
+        label = CODEX_SOURCE_LABELS.get(c.get("source"), str(c.get("source")))
+        weekly = (f'<span class="bw est" title="{E(str(c.get("why") or ""))}">'
+                  f'weekly limit: could not read — {E(label)}</span>')
+    return render_budget_row("Codex", weekly, detail)
+
+def pending_proposal_count(estate_activity: dict) -> int | None:
+    """Use the same staged review inventory as the primary proposals panel."""
+    if not estate_activity.get("available"):
+        return None
+    return estate_activity["proposal_counts"].get("pending-review", 0)
 
 if __name__ == "__main__":
     raise SystemExit(main())

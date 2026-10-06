@@ -112,7 +112,7 @@ interval = "20m"              # or "on-demand"
 autostart = true              # false for on-demand
 persona = "the <name>"        # display name; also the agent-deck session
                               # title, as "<persona> (<name>)"
-model = "claude-sonnet-5"     # right-size it, and say why in a comment
+model = "your-model"     # right-size it, and say why in a comment
 ```
 
 Every field is load-bearing:
@@ -192,9 +192,12 @@ Two shapes already exist — reuse one instead of inventing a third:
   authoritative, never merged or truncated.
 - **A standing-item store** — `{items.json, ledger.jsonl}`: a JSON source of
   truth plus an append-only audit trail, with a `$<NAME>_STATE_DIR` env
-  override so tests run against a tempdir. `bin/followups` is the reference
-  implementation; add a status machine on top of it if the items have a
-  lifecycle rather than just open/resolved.
+  override so tests run against a tempdir. `bin/followups` began as the
+  reference implementation, and its frozen original is kept as
+  `tests/_fixtures/followups_legacy_oracle.py`. If the items have a lifecycle
+  rather than just open/resolved, due dates, or need to be visible to other
+  loops, do not grow a status machine on a JSON file: file them in `bin/estate`,
+  which is where `bin/followups` itself now lives.
 
 Anything a human must eventually resolve goes in a **store**, not in a report
 — a report is overwritten next run, and a thing that only ever lived in one

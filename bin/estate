@@ -24,7 +24,7 @@ SUBCOMMANDS
                 [--limit N] [--detail] [--json]
   estate runs [--subsystem S] [--days N] [--attention] [--all] [--json]
   estate release | block | needs-owner | done | reopen | drop
-  estate verified <id> "<evidence>" --actor A   (needs-owner -> done, t-1063)
+  estate verified <id> "<evidence>" --actor A   (needs-owner -> done, the contract
   estate dep add|list ... | orphans [--sweep] | stale [--days N]
   estate due [--within N] [--kind K] [--json]
   estate attention [--notice N] [--state S] [--kind K] [--json] [--counts] [--no-collapse]
@@ -36,7 +36,7 @@ SUBCOMMANDS
   estate store [--json] [--path]
   estate export | backup | doctor | json
 
-THE STORE'S LOCATION (t-393). `$ESTATE_STATE_DIR` names it outright and may be
+THE STORE'S LOCATION the contract. `$ESTATE_STATE_DIR` names it outright and may be
 created on first use; otherwise it is derived, and a linked worktree derives the
 MAIN checkout's `state/` rather than one of its own. A derived path with no
 database on it REFUSES (exit 3) and names the file it expected instead of minting
@@ -74,12 +74,12 @@ import estate_memory  # noqa: E402
 import estate_reconcile  # noqa: E402
 import estate_runs  # noqa: E402
 import estate_store  # noqa: E402
-# t-476: `awaiting` reads the same decision-surface rule the dashboard renders
+# the contract: `awaiting` reads the same decision-surface rule the dashboard renders
 # from, so the CLI and the page cannot disagree about which stored field is the
 # question. Nothing else here uses the read model.
 import estate_work  # noqa: E402
 
-# Which store this run uses, and whether it is allowed to create one (t-393,
+# Which store this run uses, and whether it is allowed to create one the contract,
 # gap audit Q-10). The rules live in lib/estate_store.py: $ESTATE_STATE_DIR wins
 # and may be created on first use, a linked worktree resolves to the MAIN
 # checkout's state/ rather than minting its own, and a derived path that holds no
@@ -101,14 +101,14 @@ TRANSITIONS = {
     "claimed": {"done": "done", "block": "blocked", "needs-owner": "needs-owner",
                 "release": "ready", "drop": "dropped"},
     # `verified` is the third exit, and it is deliberately NOT spelled `done`
-    # (t-1063). See THE VERIFIED EXIT below for why the name is the gate.
+    # the contract. See THE VERIFIED EXIT below for why the name is the gate.
     "needs-owner": {"reopen": "ready", "drop": "dropped", "verified": "done"},
     "blocked": {"reopen": "ready", "drop": "dropped"},
     "done": {"reopen": "ready"},
     "dropped": {},
 }
 DEP_KINDS = ("blocks", "parent", "related", "discovered-from")
-# Kinds the POOL queries skip unless a caller asks for them by name (t-296).
+# Kinds the POOL queries skip unless a caller asks for them by name the contract.
 #
 # `inbox-message` is the hub mirroring the owner's own inbox traffic, one task per
 # message, so "was that message ever answered" is a query instead of a cursor's
@@ -190,7 +190,7 @@ FINGERPRINT_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 # would be fabrication, not migration.
 CONDITION_KEY = "condition"
 REVIEW_FIELDS = (CONDITION_KEY, "desired_outcome", "completion_check")
-# t-475, the decision-classification schema. Same envelope, same doctrine: the
+# the contract, the decision-classification schema. Same envelope, same doctrine: the
 # keys ride in refs beside the review fields and `proposal show` renders them.
 #
 # The store ACCEPTS and does not REQUIRE a classification, for exactly the two
@@ -205,12 +205,12 @@ DECISION_FIELDS = estate_decisions.ALL_KEYS
 TTL_RE = re.compile(r"^(\d+)([smhd])$")
 # A task in one of these is finished; everything else is still someone's to do.
 TERMINAL = ("done", "dropped")
-# t-163, auto-promote-on-unblock. `blocked_by` is a derived view (P-18,
+# the contract, auto-promote-on-unblock. `blocked_by` is a derived view (P-18,
 # lib/estate_deps.py) and stays one: nothing here stores blocked-ness. What was
 # missing is the ACT. A dependent filed with `dep add A blocks B` is created at
 # `open`, and `estate ready` wants BOTH status=ready and no unresolved blocker
 # — so when A finished, nothing moved B, and a human had to notice and run
-# `ready` by hand (p-2/AI-509: t-154 needed exactly that backfill).
+# `ready` by hand (p-2/AI-509: the contract needed exactly that backfill).
 #
 # OPT-IN, DEFAULT OFF, and that is the load-bearing property. An unflagged
 # dependent behaves precisely as it did before this existed — it stays `open`
@@ -443,7 +443,7 @@ def connect(*, create: bool = False) -> sqlite3.Connection:
     `create=True` is `estate init` and nothing else. Every other entry point
     goes through `require()`, which lets an existing store — or one the caller
     named through $ESTATE_STATE_DIR — through, and refuses a derived path with
-    no database on it rather than letting sqlite3 conjure one (t-393).
+    no database on it rather than letting sqlite3 conjure one the contract.
     """
     if not create:
         estate_store.require(STORE)
@@ -854,7 +854,7 @@ def cmd_task_add(args) -> int:
 def cmd_task_set_due(args) -> int:
     """Retrofit (or clear) a deadline on an existing task.
 
-    Needed because the store predates due dates: everything in t-1..t-57 was
+    Needed because the store predates due dates: everything in the contract..the contract was
     filed with the date, if any, buried in free `title` text. `--clear` exists
     so a wrong date can be taken back without inventing a replacement.
     """
@@ -1291,7 +1291,7 @@ def apply_status(conn, row, nxt: str, who: str, note="", *, clear=False):
               phase=estate_ledger.OUTCOME if nxt in TERMINAL else estate_ledger.TRANSITION,
               source="estate.tasks", key=key, ts=NOW.isoformat(),
               event=f"{old}->{nxt}"))
-    # t-163. A task reaching a terminal status is the one moment an edge out of
+    # the contract. A task reaching a terminal status is the one moment an edge out of
     # it stops blocking, so it is the one moment anything waiting on it can
     # become startable. Hooked HERE rather than in transition() so the proposal
     # lifecycle's own close (drive_task_status, which deliberately bypasses the
@@ -1302,7 +1302,7 @@ def apply_status(conn, row, nxt: str, who: str, note="", *, clear=False):
 
 
 # --------------------------------------------------------------------------- #
-# auto-promote on unblock (t-163)
+# auto-promote on unblock the contract
 # --------------------------------------------------------------------------- #
 # See AUTO_PROMOTE_KEY above for the doctrine. This is the mechanism.
 #
@@ -1429,7 +1429,7 @@ def report_auto_promotions() -> None:
             landed = {row["id"] for row in conn.execute(
                 "SELECT id FROM tasks WHERE status='ready'")}
     except (sqlite3.Error, estate_store.StoreMissing):
-        # StoreMissing joined connect()'s surface (t-393) after this was
+        # StoreMissing joined connect()'s surface the contract after this was
         # written, and a re-read that cannot open the store is exactly the case
         # this already declines to guess about: report nothing rather than
         # print a promotion the store has not confirmed.
@@ -1449,10 +1449,10 @@ def report_auto_promotions() -> None:
 
 
 def cmd_task_auto_promote(args) -> int:
-    """Turn auto-promote-on-unblock on or off for one existing task (t-163).
+    """Turn auto-promote-on-unblock on or off for one existing task the contract.
 
     The retrofit path, and the reason there is one: the tasks that provoked
-    this — p-2's t-156/t-157/t-159 — already exist, and a flag reachable only
+    this — p-2's the contract — already exist, and a flag reachable only
     through `task add --refs` could not be applied to any of them. `--clear`
     removes the key entirely, which is not the same as `--off`: cleared falls
     back to the project's default, off overrides it.
@@ -1615,7 +1615,7 @@ def cmd_extend(args) -> int:
 
 # A `pr-action` task is closed on the strength of a worker's report — the
 # worker says it pushed the fix and replied on the review threads, and the
-# collector relays that and closes the row. A report is not evidence (t-147):
+# collector relays that and closes the row. A report is not evidence the contract:
 # the same class of failure the hub's Peer-review defaults item 7 already
 # guards for panel reviews, where a clobbered session reported success for a
 # review that never existed. The thread replies are the ONLY thing that tells
@@ -1634,16 +1634,16 @@ def cmd_extend(args) -> int:
 VERIFIED_KINDS = ("pr-action",)
 
 
-# THE LANDING CLAIM (t-712 panel P1, docs/landed-reconciliation-contract.md).
+# THE LANDING CLAIM the contract panel P1, docs/landed-reconciliation-contract.md).
 # Three RECOGNIZED keys in the completion envelope, and recognized is the whole
 # design: they are never required, nothing is refused for their absence, and
 # `done` derives nothing from them. Most completions land nothing gitty, and a
 # check placed here would fire on the unattended 3am path with nobody awake to
 # unblock it.
 #
-# What they replace is not a missing field but three spellings of one. t-704
-# wrote `{"branch": …, "commits": "ed35605..aaf7ccb"}`, t-102 wrote
-# `artifacts: ["branch p25-… @ d062ad6…"]`, t-147 wrote the branch and sha as
+# What they replace is not a missing field but three spellings of one. the contract
+# wrote `{"branch": …, "commits": "0123456..89abcde"}`, the contract wrote
+# `artifacts: ["branch example-branch @ 0123456"]`, the contract wrote the branch and sha as
 # one string with an `@` in it — all three true, none of them queryable, and
 # the citation in the first was to a range that does not contain the work it
 # claimed. Structured keys make the claim a column instead of a sentence, which
@@ -1713,7 +1713,7 @@ def cmd_done(args) -> int:
     print(f"{key}: {old} -> {nxt}"); return 0
 
 
-# THE VERIFIED EXIT (t-1063).
+# THE VERIFIED EXIT the contract.
 #
 # `needs-owner` had exactly two exits, `reopen` and `drop`, and a triage of the
 # attention set will find rows that neither one fits: those whose underlying
@@ -1802,7 +1802,7 @@ def cmd_verified(args) -> int:
     print(f"{key}: {old} -> {nxt}"); return 0
 
 
-# THE RE-EVIDENCE VERB (t-1505).
+# THE RE-EVIDENCE VERB the contract.
 #
 # A landing claim is written once, at the close, and until now nothing could
 # ever correct it. That is fine while the claim is true and a permanent lie
@@ -1854,7 +1854,7 @@ def cmd_verified(args) -> int:
 #
 # THE CORRECTED CLAIM IS WHAT THIS CALL SUPPLIES, and old landing keys that are
 # not re-supplied are dropped rather than carried forward. A new sha beside the
-# old branch would be a record nobody asserted — t-1330's original branch never
+# old branch would be a record nobody asserted — the contract's original branch never
 # merged and its real landing came from somewhere else entirely — and the old
 # values are preserved in the correction event either way.
 #
@@ -1866,8 +1866,8 @@ def cmd_verified(args) -> int:
 # Contract: docs/landed-reconciliation-contract.md, THE WRITE SIDE.
 #
 # The keys a landing claim can hide in — the three first-class ones plus the
-# legacy spellings `extract_claim` still parses (t-704's `commits`/`branch`,
-# t-102's `artifacts`). Recorded as the PREVIOUS claim so the correction says
+# legacy spellings `extract_claim` still parses the contract's `commits`/`branch`,
+# the contract's `artifacts`). Recorded as the PREVIOUS claim so the correction says
 # what it superseded in whatever shape the original caller wrote it.
 PRIOR_CLAIM_KEYS = LANDED_KEYS + ("branch", "commits", "artifacts")
 
@@ -1907,7 +1907,7 @@ def claim_line(claim: dict) -> str:
 
 
 def cmd_re_land(args) -> int:
-    """Correct the landing claim on a task already closed `done` (t-1505)."""
+    """Correct the landing claim on a task already closed `done` the contract."""
     init_db(); key = ident(args.id, "t")
     reason = (args.reason or "").strip()
     if not reason:
@@ -2064,7 +2064,7 @@ def review_fields(args) -> dict:
 
 
 def decision_fields(args, extra: dict) -> dict:
-    """The t-475 classification this invocation carries, validated as a set.
+    """The the contract classification this invocation carries, validated as a set.
 
     Two sources, because a proposal arrives here two ways: the flags a person
     types, and the refs JSON a loop engine builds after `estate decision check`
@@ -2113,7 +2113,7 @@ def fill_review_fields(conn, row, supplied: dict) -> list[str]:
 
 
 def cmd_decision_check(args) -> int:
-    """Validate one classification payload and print it back normalized (t-475).
+    """Validate one classification payload and print it back normalized the contract.
 
     The door a LOOP ENGINE uses. Loop engines do not import lib/ — they run
     against a fabricated repo root in their own tests — so the mechanic
@@ -2157,7 +2157,7 @@ def cmd_proposal_show(args) -> int:
             """SELECT ts FROM events WHERE task_id=? AND kind='note'
                AND summary LIKE 'condition observed again%' ORDER BY seq""",
             (key,)))
-        # t-1794. The branch this proposal's approval took, read back out of
+        # the contract. The branch this proposal's approval took, read back out of
         # the event that recorded it. A captured record nobody can read is not
         # captured — the same argument that put the classification keys on this
         # view in the first place — and reading it HERE rather than from the
@@ -2184,7 +2184,7 @@ def cmd_proposal_show(args) -> int:
         # complete one, which is the defect P-09 is about.
         label = field.replace("_", " ")
         print(f"  {label:<17} {value or '(not recorded)'}")
-    # t-475. What kind of thing this is, and — when it is a decision — the
+    # the contract. What kind of thing this is, and — when it is a decision — the
     # choice itself: the question, the alternatives with their consequences,
     # the recommendation, and what waiting costs. A reviewer should not have
     # to mine that out of a desired-outcome paragraph.
@@ -2221,7 +2221,7 @@ def pinned_recurrence(conn, args, observed: str):
     """The proposal row `--recurrence-of` names. `observed` is the identity
     this filing would have had on its own.
 
-    t-310. Recurrence identity is DERIVED from condition prose, which works
+    the contract. Recurrence identity is DERIVED from condition prose, which works
     until the prose carries an instance value. "four ported files changed
     since the 2026-07-29 sync" and "six ported files changed since the
     2026-08-06 sync" are one condition and two fingerprints, so the second
@@ -2244,7 +2244,7 @@ def pinned_recurrence(conn, args, observed: str):
     if not row_get(row, "stage"):
         # A recurrence is a fact about a PROPOSAL. Recorded on a task outside
         # the review lifecycle it would not reach `proposal show`, and the
-        # recurrence history t-310 is about would be written where nobody
+        # recurrence history the contract is about would be written where nobody
         # counts it.
         raise LookupError(
             f"{pin} is not in the proposal review lifecycle; file it with "
@@ -2282,7 +2282,7 @@ def cmd_proposal_add(args) -> int:
       adopted     --adopt-task named an existing task; it gains the stage and
                   the fingerprint in place, keeping its own kind and history
 
-    `--recurrence-of t-N` (t-310) reaches the recurrence outcome by assertion
+    `--recurrence-of t-N` the contract reaches the recurrence outcome by assertion
     rather than by hash: the observation lands on the named proposal even when
     its wording carries a count, a date or a hash that moved since the last
     sighting. The derived path is untouched — a caller that pins nothing is
@@ -2406,9 +2406,9 @@ def cmd_proposal_add(args) -> int:
 
 
 def cmd_proposal_amend(args) -> int:
-    """Attach or replace the decision classification on a filed proposal (t-657).
+    """Attach or replace the decision classification on a filed proposal the contract.
 
-    t-475 is a FILING-TIME schema, and until this existed it was only ever a
+    the contract is a FILING-TIME schema, and until this existed it was only ever a
     filing-time one. Re-running `proposal add` is no way round that: the same
     condition fingerprints to a recurrence, and the one thing a recurrence may
     do is fill a BLANK (see fill_review_fields). That rule is right for a sweep
@@ -2594,7 +2594,7 @@ def apply_proposal_stage(key: str, target: str, note: str, who: str,
     the CLI deliberately omits it and retains its historical behavior.
 
     ``chosen`` is the 1-based position of the alternative that was picked
-    (t-1794).  Approving a proposal classified ``decision`` REQUIRES it, and
+    the contract.  Approving a proposal classified ``decision`` REQUIRES it, and
     the gate is here rather than at either caller for the reason
     docs/decision-classification-contract.md already gives about its own
     validator: one copy, reached by both doors, cannot drift.  The record
@@ -2652,7 +2652,7 @@ def apply_proposal_stage(key: str, target: str, note: str, who: str,
             raise ProposalStageError(
                 f"{key} is '{was}'; cannot move to '{target}'. Allowed from here: "
                 f"{', '.join(STAGE_TRANSITIONS.get(was, ())) or '(none)'}")
-        # t-1794. The choice is resolved against the alternatives as they stand
+        # the contract. The choice is resolved against the alternatives as they stand
         # at this instant and frozen onto the event, INSIDE the same
         # transaction as the stage write — a decision that recorded the move
         # and not the branch is exactly the state this exists to make
@@ -2757,7 +2757,7 @@ def cmd_ready(args) -> int:
         clauses.append(f"t.kind NOT IN ({','.join('?' * len(UNPOOLED_KINDS))})")
         params.extend(UNPOOLED_KINDS)
     if args.actor: clauses.append("t.created_by=?"); params.append(args.actor)
-    # t-163. "Promoted by the store, not yet picked up by anything" — the one
+    # the contract. "Promoted by the store, not yet picked up by anything" — the one
     # query the hub's health pass runs to find a push-kind task that unblocked
     # itself overnight and is still sitting there. `> the last claim` is what
     # keeps it from re-reporting a task that was auto-promoted, worked, and
@@ -2776,7 +2776,7 @@ def cmd_ready(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# t-1794. Decided, and then what?
+# the contract. Decided, and then what?
 # --------------------------------------------------------------------------- #
 
 APPROVAL_FILED_SUMMARY = f"proposal filed ({APPROVED})"
@@ -2812,7 +2812,7 @@ def pickup_signals(conn, key: str, since_seq: int):
 
     Everything is read out of the events table in ONE pass, and only the three
     shapes estate_pickup documents count. A `note` is deliberately not one of
-    them — t-777 and t-1329 carry nineteen mechanic notes between them since
+    them — the contract and the contract carry nineteen mechanic notes between them since
     their approvals and are the two most stuck rows in the store.
     """
     records, queued, claimed = [], False, False
@@ -2877,7 +2877,7 @@ def decided_line(row: dict) -> str:
 
 
 def cmd_decided_not_acted(args) -> int:
-    """Approved decisions, and whether anything ever picked them up (t-1794).
+    """Approved decisions, and whether anything ever picked them up the contract.
 
     The half `bin/estate ready` cannot answer. `ready` says a row is
     CLAIMABLE; this says whether the decision that made it claimable has been
@@ -2909,7 +2909,7 @@ def cmd_decided_not_acted(args) -> int:
 
 
 def cmd_pickup(args) -> int:
-    """Record that something took an approved decision on (t-1794).
+    """Record that something took an approved decision on the contract.
 
     One event, one route, one sentence. This is the signal `decided-not-acted`
     reads and the signal the hub's SKILL.md step 3 skip check was reaching for
@@ -3266,7 +3266,7 @@ def promotion_refs(provenance, move) -> str | None:
 def cmd_memory_promote(args) -> int:
     """Make a fact reach further. Always attributed to MEMORY_ACTOR (P-19).
 
-    Two lawful transitions, one verb — `candidate -> active` and, since t-389,
+    Two lawful transitions, one verb — `candidate -> active` and, since the contract,
     `local -> shared` for a fact that is already active. lib/estate_memory.py's
     promotion() owns which one applies and why the rest are refused; this
     function does the writing.
@@ -3441,7 +3441,7 @@ def cmd_memory_seen(args) -> int:
 
 
 def cmd_memory_reconcile(args) -> int:
-    """Name every fact this estate holds at two scopes at once (t-389, Q-06).
+    """Name every fact this estate holds at two scopes at once the contract, Q-06).
 
     A READ, over both stores, that writes to neither. The estate side comes
     from the `memories` table; the session side is the auto-memory directory
@@ -3488,7 +3488,7 @@ def cmd_memory_reconcile(args) -> int:
     counts = report["counts"]
     print(f"session store: {directory}")
     print(f"session scope: {report['session_scope']} "
-          f"(every file reaches every session in this repo)")
+          f"(every file MEMORY.md lists reaches every session in this repo)")
     print(f"{counts['memories']} live memories x {counts['notes']} fact files")
     print()
     if report["findings"]:
@@ -3496,12 +3496,21 @@ def cmd_memory_reconcile(args) -> int:
         for f in report["findings"]:
             where = (f"{f['memory_scope']} vs {f['session_scope']}"
                      if f["memory_scope"] else "no such memory")
+            if f["memory_scope"] and not f.get("indexed", True):
+                where = f"{f['memory_scope']}, not in the index"
             status = f" [{f['memory_status']}]" if f["memory_status"] else ""
             print(f"  {f['verdict']:<10} {f['memory']:>6}{status:<13} {where:<24} "
                   f"{f['note']}")
         print()
     print(f"{counts['divergent']} divergent, {counts['aligned']} aligned, "
-          f"{counts['dangling']} dangling")
+          f"{counts.get('scoped', 0)} scoped, {counts['dangling']} dangling")
+    if counts.get("scoped"):
+        # Not a defect and not a to-do: the estate holds the fact at a narrower
+        # scope AND MEMORY.md no longer lists the note, so it is out of every
+        # other session's context. That is the end state of a scope migration
+        # the contract, and calling it `divergent` would bury the ones that are.
+        print(f"  `scoped` is the resolved state, not an open one: the estate "
+              f"holds it locally and MEMORY.md does not load it.")
     if counts["unlinked"]:
         # Said out loud and not as a footnote: this is the number that decides
         # how much the line above is worth.
@@ -4088,10 +4097,10 @@ def attention_rows(conn, notice: float, states=(), kind=None):
     return out
 
 
-# t-1061 — THE PAIR IS ONE QUESTION, SO IT IS ONE ROW.
+# the contract — THE PAIR IS ONE QUESTION, SO IT IS ONE ROW.
 #
 # The collapse happens HERE and not in `attention_rows`, and that placement is
-# the same one t-476 chose for the same reason: `awaiting` reads
+# the same one the contract chose for the same reason: `awaiting` reads
 # `attention_rows` too, and a rendering decision that reached into the shared
 # selector would change a caller that never asked for it. The selector still
 # returns every row; this command decides what to print.
@@ -4163,13 +4172,13 @@ def cmd_attention(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# t-476: everything awaiting the owner, grouped by the question each group answers
+# the contract: everything awaiting the owner, grouped by the question each group answers
 # --------------------------------------------------------------------------- #
 #
 # WHY A NEW COMMAND AND NOT A FLAG ON THE OLD ONES
 #
 # `proposal list` and `stale` are read by scripts and by the night shift every
-# night, and t-476's own acceptance check is that both stay BYTE-IDENTICAL for
+# night, and the contract's own acceptance check is that both stay BYTE-IDENTICAL for
 # any caller that did not ask for this. A verbosity flag on either one is a
 # promise that the terse path never drifts, kept by discipline; a separate verb
 # keeps it by construction. Neither of those functions is touched.
@@ -4323,14 +4332,14 @@ def awaiting_defer(item, index: int, total: int) -> str:
     return " · ".join(parts)
 
 
-# t-1742. THE PRE-PRESENTATION FILTER, AND WHY IT ONLY EVER SUBTRACTS
+# the contract. THE PRE-PRESENTATION FILTER, AND WHY IT ONLY EVER SUBTRACTS
 #
 # A proposal-body audit recommended "a pre-presentation readiness filter (real
 # recommendation, current context, nonterminal task)" and nothing derived one:
 # every row awaiting the owner arrived looking alike, whether it was
 # decidable in ten seconds or waiting on somebody to finish thinking. The rule
 # is `lib/estate_work.readiness` — ONE implementation, shared with
-# /estate.html's badge, for the same reason the t-721 clamps live there.
+# /estate.html's badge, for the same reason the the contract clamps live there.
 #
 # It removes rows and never reorders them: the groups are already ordered by
 # the question each answers, and a filter that also re-sorted would make two
@@ -4345,7 +4354,7 @@ def awaiting_filter(groups: dict, ready_only: bool):
     """(groups to render, {group: how many this filter removed}).
 
     Off, it is the identity: `--ready-only` absent must leave every existing
-    caller byte-identical, which is the same promise t-476 made when it built
+    caller byte-identical, which is the same promise the contract made when it built
     this verb rather than adding a flag to `proposal list`.
     """
     if not ready_only:
@@ -4414,7 +4423,7 @@ def cmd_awaiting(args) -> int:
         for n, item in enumerate(items, 1):
             row, surface = item["row"], item["surface"]
             held = blockers.get(row["id"], ())
-            # t-1742 — the same three words the dashboard badges, on every
+            # the contract — the same three words the dashboard badges, on every
             # row and not only the filtered view, so a reader can see WHY a
             # row would or would not survive `--ready-only` without rerunning
             # the command with it.
@@ -4838,7 +4847,7 @@ def main(argv=None) -> int:
     p = task.add_parser("set-due"); p.add_argument("id"); p.add_argument("due", nargs="?")
     p.add_argument("--clear", action="store_true", help="remove the deadline")
     p.add_argument("--note"); p.add_argument("--actor"); p.set_defaults(func=cmd_task_set_due)
-    # t-163. Opt in (or explicitly out) after the fact — see
+    # the contract. Opt in (or explicitly out) after the fact — see
     # cmd_task_auto_promote for why `--off` and `--clear` are different.
     p = task.add_parser("auto-promote",
                         help="promote this task open -> ready by itself when "
@@ -4872,10 +4881,10 @@ def main(argv=None) -> int:
     p.add_argument("--stage", choices=PROPOSAL_STAGES, help=f"default {PENDING}")
     p.add_argument("--intent"); p.add_argument("--project"); p.add_argument("--refs")
     p.add_argument("--note"); p.add_argument("--actor")
-    # t-475. Optional here and required at the writers — see DECISION_FIELDS.
+    # the contract. Optional here and required at the writers — see DECISION_FIELDS.
     estate_decisions.add_arguments(p)
     p.set_defaults(func=cmd_proposal_add)
-    # t-657. The same five flags, against a proposal already on file. Required
+    # the contract. The same five flags, against a proposal already on file. Required
     # here, because an amend that supplied nothing would be a no-op wearing a
     # command; `proposal add` accepts their absence because it has a proposal
     # to file either way.
@@ -4895,7 +4904,7 @@ def main(argv=None) -> int:
     p = proposal.add_parser("stage", help="record a review decision")
     p.add_argument("id"); p.add_argument("stage", choices=PROPOSAL_STAGES)
     p.add_argument("note", nargs="?", default=""); p.add_argument("--actor")
-    # t-1794. Required to APPROVE a proposal classified `decision`, refused on
+    # the contract. Required to APPROVE a proposal classified `decision`, refused on
     # every other move and on every other classification. The record lands on
     # the transition event, with the alternatives as they stood.
     p.add_argument("--chosen", type=int, default=None, metavar="N",
@@ -4907,7 +4916,7 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_proposal_classify)
     p = proposal.add_parser("fingerprint"); p.add_argument("text")
     p.set_defaults(func=cmd_proposal_fingerprint)
-    # t-475. The classification validator, exposed so a loop engine that may
+    # the contract. The classification validator, exposed so a loop engine that may
     # not import lib/ can still be held to the one copy of the rule.
     decision = sub.add_parser(
         "decision", help="the filing-time decision-classification schema"
@@ -4970,7 +4979,7 @@ def main(argv=None) -> int:
     p.add_argument("--all", action="store_true",
                    help="list every run, not just the ones needing a person")
     p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_runs)
-    # t-1794. The half `ready` cannot answer: `ready` says a row is claimable,
+    # the contract. The half `ready` cannot answer: `ready` says a row is claimable,
     # these two say whether the decision that made it claimable was acted on.
     p = sub.add_parser(
         "decided-not-acted",
@@ -5037,7 +5046,7 @@ def main(argv=None) -> int:
                    help="the checkout that sha lives in, when it is not this "
                         "estate's own repo. Recorded as `landed_repo`")
     p.set_defaults(func=cmd_done)
-    # t-1063, the third exit from `needs-owner`. See THE VERIFIED EXIT for why
+    # the contract, the third exit from `needs-owner`. See THE VERIFIED EXIT for why
     # the verb is not `done`, why the evidence is a required positional, and
     # why no actor is privileged here.
     p = sub.add_parser("verified",
@@ -5066,7 +5075,7 @@ def main(argv=None) -> int:
                    help="the checkout that sha lives in, when it is not this "
                         "estate's own repo")
     p.set_defaults(func=cmd_verified)
-    # t-1505, the correction path for a landing claim that turned out false.
+    # the contract, the correction path for a landing claim that turned out false.
     # See THE RE-EVIDENCE VERB for the three gates and why it writes two events
     # rather than editing a field.
     p = sub.add_parser("re-land",
@@ -5119,7 +5128,7 @@ def main(argv=None) -> int:
     p.add_argument("--counts", action="store_true",
                    help="one JSON object of per-state counts instead of rows")
     p.set_defaults(func=cmd_attention)
-    # t-476. NOT a fifth sibling — a composed read OVER three of them, grouped
+    # the contract. NOT a fifth sibling — a composed read OVER three of them, grouped
     # by the question each answers, with the decision itself in the block so
     # nobody runs `proposal show` fifteen times to review fifteen proposals.
     # A separate verb on purpose: `proposal list` and `stale` are read by
@@ -5139,9 +5148,9 @@ def main(argv=None) -> int:
     p.add_argument("--full", action="store_true",
                    help="every line of every field; same as --lines 0")
     p.add_argument("--width", type=int, default=RENDER_WIDTH)
-    # t-1742. OPTIONAL, AND NEVER THE DEFAULT. The predicate judges the SHAPE
+    # the contract. OPTIONAL, AND NEVER THE DEFAULT. The predicate judges the SHAPE
     # of a record — a real recommendation, a situation sentence, a live row —
-    # and says nothing about whether the work matters. t-721 refused a hard cap
+    # and says nothing about whether the work matters. the contract refused a hard cap
     # on this same set because it would have hidden nearly all of it; a shape
     # test promoted to the default view would hide them on a judgment
     # it is not making. The header says how many it left out, always.
@@ -5195,7 +5204,7 @@ def main(argv=None) -> int:
     p.add_argument("--protected", action="store_true"); p.set_defaults(func=cmd_memory_query, all=True)
     p = memory.add_parser("show"); p.add_argument("id"); p.set_defaults(func=cmd_memory_show)
     p = memory.add_parser("log"); p.add_argument("id"); p.set_defaults(func=cmd_memory_log)
-    # t-389. One verb, two widenings: `candidate -> active`, and `local ->
+    # the contract. One verb, two widenings: `candidate -> active`, and `local ->
     # shared` for a fact that is already active. `--scope shared` is what asks
     # for the second, and it has to be asked for — an active row with no
     # --scope is refused rather than quietly re-promoted.
@@ -5206,7 +5215,7 @@ def main(argv=None) -> int:
                                    "active local fact estate-wide")
     p.add_argument("--source-refs"); p.add_argument("--actor")
     p.set_defaults(func=cmd_memory_promote)
-    # t-389. The cross-store read. Both stores, writes to neither.
+    # the contract. The cross-store read. Both stores, writes to neither.
     p = memory.add_parser("reconcile",
                           help="facts held at two scopes across the estate "
                                "store and the session auto-memory store")
@@ -5280,7 +5289,7 @@ def main(argv=None) -> int:
             # there is deliberately no report on this path.
             print(str(exc), file=sys.stderr)
             return 3
-        # t-163: after the command's own transaction has closed, so what is
+        # the contract: after the command's own transaction has closed, so what is
         # printed is what the store actually holds.
         report_auto_promotions()
         return code

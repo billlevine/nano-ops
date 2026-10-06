@@ -1,4 +1,4 @@
-"""Dashboard v2 — one page, two doors (t-414).
+"""Dashboard v2 — one page, two doors the contract.
 
 An ADDITIVE second presentation of the SAME snapshot the primary page renders.
 It fetches `dashboard.json` and nothing else, so every number here is the one
@@ -37,6 +37,7 @@ decision box live on the pages that already own them.
 from __future__ import annotations
 
 import html
+import json
 
 
 CSS = r"""
@@ -103,6 +104,13 @@ CSS = r"""
 .it .ittl a{border-bottom:1px solid transparent}
 .it:hover .ittl a{border-bottom-color:var(--edge)}
 .it .iage{font-size:10.5px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}
+/* Optional second line: why the row is here at all, spanning the title and age
+   columns under the title. Only the PR rows carry one today (the board's `why`,
+   written by pr-tracker's engine); every other item kind omits it and the row
+   stays exactly one line tall. */
+.it .iwhy{grid-column:2/4;font-size:11px;color:var(--dim);line-height:1.4;
+  margin-top:3px;padding-left:14px;position:relative}
+.it .iwhy::before{content:"→";position:absolute;left:0;top:0;color:var(--warn)}
 .tagx{font-size:9px;letter-spacing:.05em;padding:1px 5px;margin-left:6px;border-radius:4px;
   border:1px solid var(--edge);color:var(--dim);white-space:nowrap;text-transform:lowercase}
 .tagx.hot{color:var(--crit);border-color:rgba(242,89,76,.45);background:var(--crit-soft)}
@@ -226,6 +234,7 @@ function stopped(){
         +tag(r.waiting_on==='my_review'?'your review':'waiting on you','act')
         +(r.unobserved?tag('held','act'):'')+(r.unseen?tag('new activity','on'):''),
       age:(r.idle_days==null?'—':r.idle_days.toFixed(1)+'d idle'),
+      why:r.why||'',
       when:r.key+' · last observed '+(r.last_successful_observation_at||'unknown')});
   });
   return out;
@@ -252,7 +261,7 @@ function asked(){
       tags:tag(t.status,t.status==='needs-owner'?'hot':'on')+tag(m.inbox)+(m.threaded?tag('thread'):''),
       age:ago(t.created_at),when:'asked '+(t.created_at||'unknown')});
   });
-  (D.ephemeral||[]).forEach(function(w){
+  (D.dispatch_sessions||[]).forEach(function(w){
     var t=w.task_id?TASK[w.task_id]:null;
     if(w.task_id)claim(w.task_id);
     out.push({id:w.task_id||w.slug,title:(t&&t.title)||w.ref||w.slug,
@@ -278,7 +287,8 @@ function row(o){
   var title=o.url?'<a href="'+e(o.url)+'" target="_blank" rel="noopener">'+e(o.title)+'</a>':e(o.title);
   return '<div class="it"><span class="iid" title="'+e(o.id)+'">'+e(o.id)+'</span>'+
     '<span class="ittl">'+title+(o.tags||'')+'</span>'+
-    '<span class="iage" title="'+e(o.when||'')+'">'+e(o.age)+'</span></div>';
+    '<span class="iage" title="'+e(o.when||'')+'">'+e(o.age)+'</span>'+
+    (o.why?'<span class="iwhy">'+e(o.why)+'</span>':'')+'</div>';
 }
 /* C's discipline inside B: show a few, SAY how many were withheld, and put
    the rest one click down rather than behind a page. */
@@ -303,6 +313,21 @@ function blindness(){
   var snap=genEpoch?(Date.now()/1000-genEpoch):null;
   if(snap!=null&&snap>120)
     bad.push('this page is '+human(snap)+' old — the regenerator is not keeping up');
+  /* Every panel now records what it could see, so this line is driven
+     by the warrants rather than by a hand-written list of the four inputs
+     somebody remembered. A panel that could not be read is named here even
+     when its counts below read as a confident zero — that zero is exactly the
+     thing this line exists to contradict. */
+  var P=D.panels||{};
+  Object.keys(P).forEach(function(k){
+    var e=P[k]||{},st=e.staleness||{};
+    if(e.empty_is_evidence===false)
+      bad.push((e.label||k)+' could not be read ('+(e.outcome||'?')+
+        (e.why?' · '+e.why:'')+') — its numbers below are missing, not zero');
+    else if(st.state==='stale')
+      bad.push((e.label||k)+' was read '+(st.age_seconds==null?'—':human(st.age_seconds))+
+        ' ago, past its budget — real numbers, earlier estate');
+  });
   (D.loops||[]).forEach(function(l){
     if(!(l.autostart||l.is_hub)||l.freshness!=='stale')return;
     bad.push(l.name+' last ticked '+(l.heartbeat_age==null?'never':human(l.heartbeat_age)+' ago')+
@@ -319,6 +344,9 @@ function blindness(){
     bad.push("the latest brief is '"+del.status+"' ("+(del.generation||'?')+
       (del.reason?' · '+del.reason:'')+') — it was not delivered');
   if(man.legacy)bad.push('the latest brief carries no source manifest — an empty section in it is not evidence');
+  /* The same sentence the primary page's digest panel carries, injected from
+     the one constant in bin/dashboard rather than written out again here. */
+  if(b.board_moved&&window.OPS_BOARD_MOVED_NOTE)bad.push(window.OPS_BOARD_MOVED_NOTE);
   var src=man.sources||{},sick=[];
   Object.keys(src).forEach(function(k){
     var s=src[k];if(s.status!=='completed'||s.degraded)sick.push(k+' ('+(s.outcome||s.status)+')');
@@ -370,7 +398,7 @@ function machine(){
     mrow('on-demand',String((D.loops||[]).filter(function(l){return !l.autostart&&!l.is_hub}).length),'mute')+
     mrow('stale heartbeat',String(stale),stale?'warn':'mute')));
 
-  var eph=D.ephemeral||[];
+  var eph=D.dispatch_sessions||[];
   cards.push(mcard('Dispatched workers',
     mrow('in flight',String(eph.length),eph.length?'ok':'mute')+
     eph.slice(0,4).map(function(w){
@@ -521,6 +549,15 @@ refresh();setInterval(refresh,30000);setInterval(tick,1000);
 """
 
 
+import dashboard_nav
+def board_moved_config(dashboard) -> str:
+    """The live-board-versus-digest sentence, handed to the client rather than
+    restated. Same discipline as `dashboard_primary.source_config`:
+    three surfaces say this, and one constant is what keeps them agreeing."""
+    return ("window.OPS_BOARD_MOVED_NOTE="
+            + json.dumps(dashboard.BOARD_MOVED_NOTE) + ";\n")
+
+
 def render(dashboard, snapshot: dict) -> str:
     """The v2 shell: static HTML, every dynamic region filled from dashboard.json.
 
@@ -532,6 +569,7 @@ def render(dashboard, snapshot: dict) -> str:
     name = f'{snapshot["estate"]} / {snapshot["operator"]}'
     body = (
         '<div class="wrap v2">'
+        + dashboard_nav.render("v2") +
         '<header class="masthead">'
         '<div class="brand">'
         '<div class="eyebrow">Autonomous operations estate · v2</div>'
@@ -546,10 +584,6 @@ def render(dashboard, snapshot: dict) -> str:
         '<div class="v2-nav">'
         '<button type="button" class="v2-link on" data-jump="today">Today</button>'
         '<button type="button" class="v2-link" data-jump="machine">Machine room</button>'
-        '<a class="v2-link" href="/">Dashboard v1</a>'
-        '<a class="v2-link" href="/estate.html">Estate detail</a>'
-        '<button class="themebtn" id="themebtn" type="button" '
-        'aria-label="Toggle theme">☾ Night shift</button>'
         '</div>'
         '</header>'
 
@@ -589,4 +623,5 @@ def render(dashboard, snapshot: dict) -> str:
             f'<link rel="icon" href="{dashboard.FAVICON}">'
             f'<title>{e(name)} — dashboard v2</title>'
             f'<style>{dashboard.CSS}\n{CSS}</style></head>'
-            f'<body>{body}<script>{dashboard.JS}\n{JS}</script></body></html>\n')
+            f'<body>{body}<script>{board_moved_config(dashboard)}'
+            f'{dashboard.JS}\n{JS}</script></body></html>\n')
