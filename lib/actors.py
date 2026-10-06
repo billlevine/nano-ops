@@ -29,6 +29,7 @@ from typing import Iterable, NamedTuple
 
 OPERATOR = "hub"          # the long-lived orchestration session
 EPHEMERAL = "ephemeral"   # any dispatched worker session; identity lives in session_id
+STEWARD = "steward"
 UNKNOWN = "unknown"       # actor field missing or blank
 
 # ── classes ──────────────────────────────────────────────────────────────────
@@ -75,7 +76,7 @@ GARAGE_SESSIONS = frozenset({"garage"})
 # recorded under its own name rather than under whoever invoked the CLI. It is
 # a subsystem writing on its own behalf, not a loop with a state dir, so it
 # classifies here and not as `loop`.
-TOOLS = frozenset({"ops", "cli", "estate", "doorbell", "memory"})
+TOOLS = frozenset({"ops", "cli", "estate", "doorbell", "memory", "today"})
 
 # Fallback for callers with no loops.toml in hand: the loops this repo actually
 # ships. `normalize(loops=...)` takes the live registry when there is one, so an
@@ -88,7 +89,7 @@ KNOWN_LOOPS = frozenset({"example", "mechanic"})
 #
 # EMPTY BY DEFAULT, for the same reason ALIASES is: which sessions an
 # installation keeps standing outside its registry is one of its own facts.
-# An installation adds its own — `STANDING_SESSIONS = frozenset({"<name>"})`.
+# An installation may add its own long-lived actors here.
 #
 # Deliberately NOT the same thing as adding the name to KNOWN_LOOPS, which is
 # a FALLBACK the live registry replaces: a caller passing `loops=` read from
@@ -98,8 +99,9 @@ KNOWN_LOOPS = frozenset({"example", "mechanic"})
 # registry lookup for exactly that reason. The class is `loop` because a
 # renderer's question is "is this a standing identity with its own state",
 # and the answer is yes.
-STANDING_SESSIONS: frozenset[str] = frozenset()
+STANDING_SESSIONS = frozenset({STEWARD})
 
+STEWARD_PREFIX = "steward-"
 EPHEMERAL_PREFIX = "ephemeral-"
 
 
@@ -118,7 +120,8 @@ class Actor(NamedTuple):
     @property
     def short(self) -> str:
         """Narrow display name for the ledger strip, e.g. `eph:dashboard-prototype`."""
-        return f"eph:{self.session_id}" if self.session_id else self.actor
+        return (f"{'eph' if self.actor == EPHEMERAL else self.actor}:{self.session_id}"
+                if self.session_id else self.actor)
 
 
 def normalize(actor, session_id: str | None = None,
@@ -140,6 +143,11 @@ def normalize(actor, session_id: str | None = None,
                      CLASS_EPHEMERAL)
     if raw in LEGACY_DISPATCHES:
         return Actor(EPHEMERAL, session_id or raw, CLASS_EPHEMERAL)
+    if raw == STEWARD:
+        return Actor(STEWARD, session_id or None, CLASS_LOOP)
+    if raw.startswith(STEWARD_PREFIX):
+        return Actor(STEWARD, session_id or raw[len(STEWARD_PREFIX):] or None,
+                     CLASS_LOOP)
 
     canonical = ALIASES.get(raw, raw)
     return Actor(canonical, session_id or None, classify(canonical, loops))
